@@ -1,0 +1,5 @@
+# pg_squeeze extension
+comment = 'A tool to remove unused space from a relation.'
+default_version = '1.0'
+module_pathname = '$libdir/pg_squeeze'
+relocatable = true

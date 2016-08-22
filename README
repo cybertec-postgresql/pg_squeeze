@@ -1,0 +1,52 @@
+pg_squeeze is an extension that removes unused space from a table and
+optionally sorts tuples according to particular index (as if CLUSTER [2]
+command was executed concurrently with regular reads / writes). In fact we try
+to replace pg_repack [1] extension.
+
+While providing very similar functionality, pg_squeeze takes a different
+approach as it
+
+      1. Implements the functionality purely on server side.
+
+      2. Utilizes recent improvements of PostgreSQL database server.
+
+While 1) makes both configuration and use simpler (compared to [1] which uses
+both server and client side code), it also allows for rather smooth
+implementation of unattended processing using background workers [3].
+
+As for 2), one important difference (besides the use of background workers) is
+that we use logical decoding [4] instead of triggers to capture concurrent
+changes.
+
+
+Setup
+-----
+
+1. Set PG_CONFIG envoirnment variable to point to pg_config command of your
+   PostgreSQL installation.
+
+2. make
+
+3. sudo make install
+
+4. Apply the following settings to postgresql.conf:
+
+   wal_level = logical
+   max_replication_slots = 1 # ... or add 1 to the current value.
+
+5. Start the PG cluster.
+
+6. As a superuser, run
+
+   CREATE EXTENSION pg_squeeze;
+
+References
+----------
+
+[1] http://reorg.github.com/pg_repack
+
+[2] https://www.postgresql.org/docs/9.6/static/sql-cluster.html
+
+[3] https://www.postgresql.org/docs/9.6/static/bgworker.html
+
+[4] https://www.postgresql.org/docs/9.6/static/logicaldecoding.html
