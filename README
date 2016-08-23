@@ -40,6 +40,18 @@ Setup
 
    CREATE EXTENSION pg_squeeze;
 
+
+Concurrency
+-----------
+
+Like [1], pg_squeeze holds exclusive table lock only for the (supposedly
+short) final stage of processing. The price user pays for it is that s/he
+can encounter MVCC-unsafe behavior described in [5].
+
+Note that [1] has the same issue - see comments regarding AccessExclusiveLock
+in pg_squeeze.c.
+
+
 References
 ----------
 
@@ -50,3 +62,5 @@ References
 [3] https://www.postgresql.org/docs/9.6/static/bgworker.html
 
 [4] https://www.postgresql.org/docs/9.6/static/logicaldecoding.html
+
+[5] https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html

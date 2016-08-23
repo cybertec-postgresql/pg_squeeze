@@ -561,6 +561,27 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * CommandCounterIncrement below) are delivered safely before any other
 	 * backend can acquire this lock after us, we never unlock the relation
 	 * explicitly. Instead, xact.c will do so when committing our transaction.
+	 *
+	 * On pg_repack: before taking the exclusive lock, pg_repack extension is
+	 * more restrictive in waiting for other transactions to complete. That
+	 * might reduce the likelihood of MVCC-unsafe behavior that PG core admits
+	 * in some cases
+	 * (https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html) but
+	 * can't completely avoid it anyway. On the other hand, pg_squeeze only
+	 * waits for completion of transactions which performed write (i.e. do
+	 * have XID assigned) - this is a side effect of bringing our replication
+	 * slot into consistent state.
+	 *
+	 * As pg_repack shows, extra effort makes little sense here, because some
+	 * other transactions still can start before the exclusive lock on the
+	 * source relation is acquired. In particular, if transaction A starts in
+	 * this period and commits a change, transaction B can miss it if the next
+	 * steps are as follows: 1. transaction B took a snapshot (e.g. it has
+	 * REPEATABLE READ isolation level), 2. pg_repack took the exclusive
+	 * relation lock and finished its work, 3. transaction B acquired shared
+	 * lock and performed its scan. (And of course, waiting for transactions
+	 * A, B, ... to complete while holding the exclusive lock can cause
+	 * deadlocks.)
 	 */
 	/*
 	 * TODO As the index build could have taken long time, consider flushing
