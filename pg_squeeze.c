@@ -254,12 +254,14 @@ squeeze_table(PG_FUNCTION_ARGS)
 				 (errmsg("\"user_catalog_table\" option not set"))));
 
 	/*
-	 * Since the final check follows initialization of the replication slot,
-	 * the relation shouldn't be locked between the checks. Otherwise another
+	 * The relation shouldn't be locked during slot setup. Otherwise another
 	 * transaction could write XLOG records before the slots' data.restart_lsn
 	 * and we'd have to wait for it to finish. If such a transaction requested
 	 * exclusive lock on our relation (e.g. ALTER TABLE), it'd result in a
 	 * deadlock.
+	 *
+	 * We can't keep the lock till the end of transaction anyway - that's why
+	 * check_catalog_changes() exists.
 	 */
 	relation_close(rel_src, AccessShareLock);
 
@@ -367,25 +369,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/*
 	 * Now that the plan exists, the source table is locked. We need at least
-	 * to know whether the catalog option was never changed, but the other
-	 * checks are important too.
+	 * to know whether the catalog option was never changed, and that no DDL
+	 * took place that allows for data inconsistency. That includes removal of
+	 * the "user_catalog_table" option.
 	 *
 	 * XXX If replacing SPI with low level code (e.g. "relation rewrite") and
 	 * if this call of check_catalog_changes() appears to be the last one,
-	 * make sure the (share) lock on the source relation is also kept till the
-	 * end of the transaction). Otherwise we'd ought to call
-	 * check_catalog_changes() before any set of changes is applied below, and
-	 * preferrably before any costly operation (e.g. index creation) is
-	 * started. That brings special deadlock concern (catalog tables vs. user
-	 * tables lock order) when calling check_catalog_changes() after having
-	 * acquired exclusive lock on the source table.
-	 *
-	 * TODO Investigate if next call of this function is needed. The ALTER
-	 * statements affecting pg_class should be blocked now because of the
-	 * SELECT plan. Is there any other kind of DDL that breaks our work, but
-	 * does not change pg_class? For example, a transaction that adds one
-	 * column and drops another one does not change pg_class(relnatts). Does
-	 * it still change pg_class(xmin)? And how about FK, CHECK or UNIQUE?
+	 * adjust (simplify) the code responsible for unlocking relid_src.
 	 */
 	check_catalog_changes(cat_state);
 
@@ -557,12 +547,33 @@ squeeze_table(PG_FUNCTION_ARGS)
 	tuplestore_clear(dstate->metadata.tupstore);
 
 	/*
-	 * Lock the source table exclusively last time, to finalize the work.
+	 * Before we request exclusive lock, release the shared one acquired by
+	 * SPI (to perform the initial load) above. Otherwise we risk a deadlock
+	 * if some other transaction holds shared lock and tries to get exclusive
+	 * one at the moment.
 	 *
-	 * Note: To ensure that the invalidation messages (see the comment on
-	 * CommandCounterIncrement below) are delivered safely before any other
-	 * backend can acquire this lock after us, we never unlock the relation
-	 * explicitly. Instead, xact.c will do so when committing our transaction.
+	 * As we haven't changed the catalog entry yet, there's no need to send
+	 * invalidation messages.
+	 *
+	 * There are supposedly 3 locks: one acquired by SPI_prepared() (see
+	 * transformTableEntry())and two by SPI_cursor_open() (see PortalStart()
+	 * and ScanQueryForLocks()) - the expected lock mode is always
+	 * AccessShareLock.
+	 */
+	UnlockRelationOid(relid_src, AccessShareLock);
+	UnlockRelationOid(relid_src, AccessShareLock);
+	/*
+	 * The last one should have been re-assigned to the top transaction by
+	 * SPI_cursor_close(). (All this unlocking stuff is ugly, but I have no
+	 * better idea right now.)
+	 */
+	resowner_old = CurrentResourceOwner;
+	CurrentResourceOwner = TopTransactionResourceOwner;
+	UnlockRelationOid(relid_src, AccessShareLock);
+	CurrentResourceOwner = resowner_old;
+
+	/*
+	 * Lock the source table exclusively last time, to finalize the work.
 	 *
 	 * On pg_repack: before taking the exclusive lock, pg_repack extension is
 	 * more restrictive in waiting for other transactions to complete. That
