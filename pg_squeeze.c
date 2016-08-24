@@ -514,12 +514,14 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Create indexes on the temporary table - that might take a
 	 * while. (Unlike the concurrent changes, which we insert into existing
 	 * indexes.)
+	 *
+	 * The lock acquired for the initial load should still be effective, so
+	 * don't request any additional lock.
 	 */
-	rel_src = relation_open(relid_src, AccessShareLock);
+	rel_src = relation_open(relid_src, NoLock);
 	build_transient_indexes(rel_dst, rel_src, &indexes_src, &indexes_dst,
 							&nindexes);
-
-	relation_close(rel_src, AccessShareLock);
+	relation_close(rel_src, NoLock);
 
 	/* Find "identity index" of the transient relation. */
 	ident_idx_dst = InvalidOid;
