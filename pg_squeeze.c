@@ -56,6 +56,18 @@ typedef struct CatalogState
 	/* Has the source relation the "user_catalog_table" option set? */
 	bool		is_catalog;
 
+	/* pg_class(relnatts) */
+	int16		relnatts;
+
+	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
+	TransactionId	*attr_xmins;
+
+	/* Number of indexes. */
+	int		relninds;
+
+	/* Array of pg_attribute(xmin). */
+	TransactionId	*index_xmins;
+
 	/*
 	 * xmin of the pg_class tuple of the source relation during the initial
 	 * check.
@@ -65,7 +77,16 @@ typedef struct CatalogState
 
 static LogicalDecodingContext *setup_decoding(void);
 static CatalogState *get_catalog_state(Oid relid);
-static void check_catalog_changes(CatalogState *state);
+static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
+										  Snapshot snapshot);
+static TransactionId *get_index_xmins(Oid relid, int *relninds,
+									  Snapshot snapshot);
+static void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
+static void check_attribute_changes(Oid relid, TransactionId	*attrs, int relnatts);
+static void check_index_changes(Oid relid, TransactionId *inds, int relninds);
+static void free_catalog_state(CatalogState *state);
+static void check_pg_class_changes(Oid relid, TransactionId xmin,
+								   LOCKMODE lock_held);
 static char *get_column_list(SPITupleTable *cat_data, bool create);
 static void switch_snapshot(Snapshot snap_hist);
 static void decode_concurrent_changes(LogicalDecodingContext *ctx,
@@ -248,10 +269,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/* Get ready for the subsequent calls of check_catalog_changes(). */
 	cat_state = get_catalog_state(relid_src);
-	if (!cat_state->is_catalog)
+	if (cat_state == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 (errmsg("\"user_catalog_table\" option not set"))));
+	Assert(cat_state->is_catalog);
 
 	/*
 	 * The relation shouldn't be locked during slot setup. Otherwise another
@@ -373,11 +395,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * took place that allows for data inconsistency. That includes removal of
 	 * the "user_catalog_table" option.
 	 *
+	 * The relation was unlock for some time since last check, so pass NoLock.
+	 *
 	 * XXX If replacing SPI with low level code (e.g. "relation rewrite") and
 	 * if this call of check_catalog_changes() appears to be the last one,
 	 * adjust (simplify) the code responsible for unlocking relid_src.
 	 */
-	check_catalog_changes(cat_state);
+	check_catalog_changes(cat_state, NoLock);
 
 	/*
 	 * TODO Check in similar way that there's no change in pg_attribute. That
@@ -498,7 +522,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Indexes can take quite some effort to build and we don't want to waste
 	 * it.
 	 */
-	check_catalog_changes(cat_state);
+	check_catalog_changes(cat_state, AccessShareLock);
 
 	/*
 	 * Create indexes on the temporary table - that might take a
@@ -538,7 +562,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * after the decoding had completed, but that breaks the whole procedure
 	 * anyway. We'll check when needed again.)
 	 */
-	check_catalog_changes(cat_state);
+	check_catalog_changes(cat_state, AccessShareLock);
 
 	/* Process the first batch of concurrent changes. */
 	process_concurrent_changes(dstate, rel_dst, key, nkeys, indexes_dst,
@@ -604,8 +628,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	LockRelationOid(relid_src, AccessExclusiveLock);
 
 	/*
-	 * Check the source relation for DDLs once again. If this check passes,
-	 * no DDL can break the process anymore.
+	 * Check the source relation for DDLs once again. If this check passes, no
+	 * DDL can break the process anymore. NoLock must be passed because the
+	 * relation was really unlocked for some period since the last check.
 	 */
 	/*
 	 * TODO Consider if this special case requires locking the relevant
@@ -613,9 +638,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * lock / unlock code into separate functions. If lock on catalog relation
 	 * is kept while accessing user relation, deadlock can occur.
 	 */
-	check_catalog_changes(cat_state);
+	check_catalog_changes(cat_state, NoLock);
 	/* This was the last check. */
-	pfree(cat_state);
+	free_catalog_state(cat_state);
 
 	/*
 	 * Flush anything we see in WAL, to make sure that all changes committed
@@ -765,65 +790,195 @@ setup_decoding(void)
 
 
 /*
- * Retrieve the catalog state to be passed later to check_catalog_changes.
+ * Retrieve the catalog state to be passed later to check_catalog_changes. If
+ * the "is_catalog" attribute should be returned, do not construct the state
+ * at all and return NULL.
  *
  * Caller is supposed to hold (at least) AccessShareLock on the relation.
  */
 static CatalogState *
 get_catalog_state(Oid relid)
 {
-	HeapTuple	pg_class_tuple = NULL;
-	Relation	pg_class_rel;
-	TupleDesc	pg_class_desc;
-	SysScanDesc pg_class_scan;
+	HeapTuple	tuple = NULL;
+	Form_pg_class	form_class;
+	Relation	rel;
+	TupleDesc	desc;
+	SysScanDesc scan;
 	ScanKeyData key[1];
 	Snapshot	snapshot;
 	StdRdOptions *options;
-	CatalogState		*result;
+	CatalogState	*result;
 
 	/*
 	 * ScanPgRelation.c would do most of the work below, but relcache.c does
 	 * not export it.
 	 */
-	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(relid));
-	pg_class_rel = heap_open(RelationRelationId, AccessShareLock);
-	pg_class_desc = CreateTupleDescCopy(RelationGetDescr(pg_class_rel));
+	rel = heap_open(RelationRelationId, AccessShareLock);
+	desc = CreateTupleDescCopy(RelationGetDescr(rel));
 
 	/*
 	 * The relation is not a real catalog relation, but GetCatalogSnapshot()
 	 * does exactly what we need, i.e. retrieves the most recent snapshot. If
 	 * changing this, make sure that isolation level has no impact on the
 	 * snapshot "freshness".
+	 *
+	 * The same snapshot is used for all the catalog scans in this function,
+	 * but it's not critical. If someone managed to change attribute or index
+	 * concurrently (shouldn't happen because AccessShareLock should be held
+	 * on the source relation now), new snapshot could see the change(s), but
+	 * snapshot builder should also include them into the first historic
+	 * snapshot (by waiting for the writing transaction(s) to commit). The
+	 * point is that only DDLs on the top of the first historic snapshot are
+	 * worth attention.
 	 */
 	snapshot = GetCatalogSnapshot(relid);
 
-	pg_class_scan = systable_beginscan(pg_class_rel, ClassOidIndexId,
-									   true, snapshot, 1, key);
-	pg_class_tuple = systable_getnext(pg_class_scan);
+	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, ClassOidIndexId, true, snapshot, 1, key);
+	tuple = systable_getnext(scan);
 
 	/*
 	 * The relation should be locked by caller, so it must not have
 	 * disappeared.
 	 */
-	Assert(HeapTupleIsValid(pg_class_tuple));
+	Assert(HeapTupleIsValid(tuple));
+
+	/* Invalid relfilenode indicates mapped relation. */
+	form_class = (Form_pg_class) GETSTRUCT(tuple);
+	if (form_class->relfilenode == InvalidOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 (errmsg("Mapped relation cannot be squeezed"))));
+
+	/* The "user_catalog_option" is essential. */
+	options = (StdRdOptions *) extractRelOptions(tuple, desc, NULL);
+	if (options == NULL || !options->user_catalog_table)
+		return NULL;
 
 	result = (CatalogState *) palloc0(sizeof(CatalogState));
 	result->relid = relid;
+	result->is_catalog = true;
+	result->relnatts = form_class->relnatts;
+	if (result->relnatts > 0)
+		result->attr_xmins = get_attribute_xmins(relid, result->relnatts,
+												 snapshot);
+	if (form_class->relhasindex)
+	{
+		result->index_xmins = get_index_xmins(relid, &result->relninds,
+											 snapshot);
+		Assert(result->relninds > 0);
+	}
 
-	/* The "user_catalog_option" is essential. */
-	options = (StdRdOptions *) extractRelOptions(pg_class_tuple,
-												 pg_class_desc, NULL);
-	if (options != NULL && options->user_catalog_table)
-		result->is_catalog = true;
 
-	/* Many DDLs do affect pg_class_xmin. */
-	result->pg_class_xmin = HeapTupleHeaderGetXmin(pg_class_tuple->t_data);
+	/*
+	 * pg_class(xmin) helps to ensure that the "user_catalog_option" wasn't
+	 * turned off and on. On the other hand it might restrict some concurrent
+	 * DDLs that would be safe as such.
+	 */
+	result->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 
 	/* Cleanup. */
-	systable_endscan(pg_class_scan);
-	heap_close(pg_class_rel, AccessShareLock);
-	pfree(pg_class_desc);
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
+	pfree(desc);
+
+	return result;
+}
+
+/*
+ * Retrieve array of pg_attribute(xmin) values for given relation, ordered by
+ * attnum. (The ordering is not essential but lets us do some extra sanity
+ * checks.)
+ */
+static TransactionId *
+get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
+{
+	Relation	rel;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	TransactionId	*result;
+	int	n = 0;
+
+	rel = heap_open(AttributeRelationId, AccessShareLock);
+	if (snapshot == NULL)
+		snapshot = GetCatalogSnapshot(relid);
+	ScanKeyInit(&key[0], 1, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, AttributeRelidNumIndexId, true, snapshot,
+							  1, key);
+	result = (TransactionId *) palloc(relnatts * sizeof(TransactionId));
+	while ((tuple = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_attribute	form;
+		int	i;
+
+		Assert(HeapTupleIsValid(tuple));
+		form = (Form_pg_attribute) GETSTRUCT(tuple);
+		/* System attributes shouldn't change anyway. */
+		if (form->attnum < 1)
+			continue;
+
+		/* AttributeRelidNumIndexId index ensures ordering. */
+		i = form->attnum - 1;
+		Assert(i == n);
+
+		result[i] = HeapTupleHeaderGetXmin(tuple->t_data);
+		n++;
+	}
+	Assert(relnatts == n);
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
+	return result;
+}
+
+/*
+ * Retrieve array of pg_index(xmin) values for given relation. The result is
+ * not ordered, but it shouldn't be a problem. It's hard to imagine that
+ * someone changes the order. False alarm about concurrent change is the worst
+ * case.
+ */
+static TransactionId *
+get_index_xmins(Oid relid, int *relninds, Snapshot snapshot)
+{
+	Relation	rel;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	TransactionId	*result;
+	int	n = 0;
+	int	relninds_max = 4;
+
+	rel = heap_open(IndexRelationId, AccessShareLock);
+	if (snapshot == NULL)
+		snapshot = GetCatalogSnapshot(relid);
+	/* indrelid is the 2nd column of pg_index. */
+	ScanKeyInit(&key[0], 2, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, IndexIndrelidIndexId, true, snapshot,
+							  1, key);
+
+	result = (TransactionId *) palloc(relninds_max * sizeof(TransactionId));
+	while ((tuple = systable_getnext(scan)) != NULL)
+	{
+		Assert(HeapTupleIsValid(tuple));
+		result[n++] = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		/*
+		 * Unlike get_attribute_xmins(), we can't receive the expected number
+		 * of entries from caller.
+		 */
+		if (n == relninds_max)
+		{
+			relninds_max *= 2;
+			result = (TransactionId *)
+				repalloc(result, relninds_max * sizeof(TransactionId));
+		}
+	}
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
+	*relninds = n;
 	return result;
 }
 
@@ -833,54 +988,184 @@ get_catalog_state(Oid relid)
  * recent catalog snapshot. Perform the cheapest checks first, the trickier
  * ones later.
  *
- * Note that it makes no sense to check state->is_catalog here. Even true
- * value does not tell whether "user_catalog_option" was never changed back
- * and forth. pg_class(xmin) will reveal any change of the storage option.
+ * lock_held is the *least* mode of the lock held by caller on stat->relid
+ * relation since the last check. This information helps to avoid unnecessary
+ * checks.
+ *
+ * We check neither constraint nor trigger related DDLs. Since all the
+ * concurrent changes we receive from replication slot must have been subject
+ * to those constraints / triggers, the transient relation does not need them,
+ * and therefore no incompatibility can arise. We only need to make sure that
+ * the storage is "compatible", i.e. no column and no index was added /
+ * altered/ dropped, and no heap rewriting took place.
+ *
+ * Unlike get_catalog_state(), we fresh catalog snapshot is used for each
+ * catalog scan. That might increase the chance a little bit that concurrent
+ * change will be detected in the current call, instead of the following one.
  *
  * (As long as we use xmin columns of the catalog tables to detect changes, we
  * can't use syscache here.)
  *
- * Unlike get_catalog_state(), this function requires no lock on the relation
- * being checked, except for the last check. (If the absence of a lock allows
- * for concurrent changes, the next call will reveal those.)
+ * XXX It's worth checking AlterTableGetLockLevel() each time we adopt a new
+ * version of PG core.
  */
 static void
-check_catalog_changes(CatalogState *state)
+check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 {
+	/*
+	 * No DDL should be compatible with this lock mode. (Not sure if this
+	 * condition will ever fire.)
+	 */
+	if (lock_held == AccessExclusiveLock)
+		return;
+
+	/*
+	 * Only AccessExclusiveLock guarantees that the pg_class entry hasn't
+	 * changed. By lowering this threshold we'd perhaps skip unnecessary check
+	 * sometimes (e.g. change of pg_class(relhastriggers) is unimportant), but
+	 * we could also miss the check when necessary. It's simply too fragile to
+	 * deduce the kind of DDL from lock level, so do this check
+	 * unconditionally.
+	 */
+	check_pg_class_changes(state->relid, state->pg_class_xmin, lock_held);
+
+	/*
+	 * Attribute and index changes should really need AccessExclusiveLock, so
+	 * also call them unconditionally.
+	 */
+	check_attribute_changes(state->relid, state->attr_xmins, state->relnatts);
+	check_index_changes(state->relid, state->index_xmins, state->relninds);
+}
+
+static void
+check_pg_class_changes(Oid relid, TransactionId xmin, LOCKMODE lock_held)
+{
+	Snapshot	snapshot;
+	ScanKeyData key[1];
 	HeapTuple	pg_class_tuple = NULL;
 	Relation	pg_class_rel;
 	TupleDesc	pg_class_desc;
 	SysScanDesc pg_class_scan;
-	ScanKeyData key[1];
-	Snapshot	snapshot;
 	TransactionId		pg_class_xmin;
 
 	/* This part is identical to the beginning of get_catalog_state(). */
 	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(state->relid));
+				F_OIDEQ, ObjectIdGetDatum(relid));
 	pg_class_rel = heap_open(RelationRelationId, AccessShareLock);
 	pg_class_desc = CreateTupleDescCopy(RelationGetDescr(pg_class_rel));
-	snapshot = GetCatalogSnapshot(state->relid);
+	snapshot = GetCatalogSnapshot(relid);
 	pg_class_scan = systable_beginscan(pg_class_rel, ClassOidIndexId,
 									   true, snapshot, 1, key);
 	pg_class_tuple = systable_getnext(pg_class_scan);
 
 	/* As the relation might not be locked, it could have disappeared. */
 	if (!HeapTupleIsValid(pg_class_tuple))
+	{
+		Assert(lock_held == NoLock);
+
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 (errmsg("Table no longer exists"))));
+	}
 
-	/* Check if pg_class(xmin) has changed. */
+	/*
+	 * Check if pg_class(xmin) has changed. Note that it makes no sense to
+	 * check CatalogState.is_catalog here. Even true value does not tell
+	 * whether "user_catalog_option" was never changed back and
+	 * forth. pg_class(xmin) will reveal any change of the storage option.
+	 *
+	 * Besides the "user_catalog_option", we use pg_class(xmin) to detect
+	 * change of pg_class(relfilenode), which indicates heap rewriting or
+	 * TRUNCATE command (or concurrent call of squeeze_table(), but that
+	 * should fail to allocate new replication slot). (Invalid relfilenode
+	 * does not change, but mapped relations are excluded from processing
+	 * by get_catalog_state().)
+	 */
 	pg_class_xmin = HeapTupleHeaderGetXmin(pg_class_tuple->t_data);
-	if (!TransactionIdEquals(pg_class_xmin, state->pg_class_xmin))
+	if (!TransactionIdEquals(pg_class_xmin, xmin))
 		/* XXX Does more suitable error code exist? */
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE),
-						errmsg("Concurrent DDL detected")));
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("Incompatible DDL or heap rewrite performed concurrently")));
 
 	systable_endscan(pg_class_scan);
 	heap_close(pg_class_rel, AccessShareLock);
 	pfree(pg_class_desc);
+}
+
+static void
+check_attribute_changes(Oid relid, TransactionId *attrs, int relnatts)
+{
+	TransactionId	*attrs_new;
+	int i;
+
+	/*
+	 * Since pg_class should have been checked by now, relnatts can only be
+	 * zero if it was zero originally, so there's no info to be compared to
+	 * the current state.
+	 */
+	if (relnatts == 0)
+	{
+		Assert(attrs == NULL);
+		return;
+	}
+
+	attrs_new = get_attribute_xmins(relid, relnatts, NULL);
+	for (i = 0; i < relnatts; i++)
+	{
+		if (!TransactionIdEquals(attrs[i], attrs_new[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("Table definition changed concurrently")));
+	}
+	pfree(attrs_new);
+}
+
+static void
+check_index_changes(Oid relid, TransactionId *inds, int relninds)
+{
+	TransactionId	*inds_new;
+	int	relninds_new;
+	bool	failed = false;
+
+	if (relninds == 0)
+	{
+		Assert(inds == NULL);
+		return;
+	}
+
+	inds_new = get_index_xmins(relid, &relninds_new, NULL);
+	if (relninds_new != relninds)
+		failed = true;
+
+	if (!failed)
+	{
+		int i;
+
+		for (i = 0; i < relninds; i++)
+		{
+			if (!TransactionIdEquals(inds[i], inds_new[i]))
+			{
+				failed = true;
+				break;
+			}
+		}
+	}
+	if (failed)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("Concurrent change of index detected")));
+	pfree(inds_new);
+}
+
+static void
+free_catalog_state(CatalogState *state)
+{
+	if (state->attr_xmins)
+		pfree(state->attr_xmins);
+	if (state->index_xmins)
+		pfree(state->index_xmins);
+	pfree(state);
 }
 
 /*
