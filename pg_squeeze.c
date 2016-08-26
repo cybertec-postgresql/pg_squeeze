@@ -322,14 +322,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	relname_dst = quote_qualified_identifier(relrv_src->schemaname,
 											 relname_tmp->data);
 
-	/* TODO Include constraints (including FK). */
 	stmt = makeStringInfo();
 	appendStringInfo(stmt,
-					 "SELECT a.attname, a.attnotnull, "
+					 "SELECT a.attname, a.attisdropped, "
 					 "  pg_catalog.format_type(a.atttypid, NULL)"
 					 "FROM pg_catalog.pg_attribute a "
-					 "WHERE a.attrelid = %u AND a.attnum > 0 AND "
-					 "NOT a.attisdropped", relid_src);
+					 "WHERE a.attrelid = %u AND a.attnum > 0 "
+					 "ORDER BY a.attnum", relid_src);
 
 	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_SELECT)
 		elog(ERROR, "Failed to get definition of table %s (%d)",
@@ -1181,37 +1180,67 @@ static char *
 get_column_list(SPITupleTable *cat_data, bool create)
 {
 	TupleDesc	tupdesc;
-	int	i;
-	StringInfo	result;
+	int	i, j;
+	StringInfo	result, colname_buf = NULL;
 
 	result = makeStringInfo();
 	tupdesc = SPI_tuptable->tupdesc;
+	j = 1;
 	for (i = 0; i < SPI_processed; i++)
 	{
 		HeapTuple	tup;
 		const char	*colname;
+		const char	*typname;
+		bool	valisnull;
+		Datum	isdropped;
 
 		tup = SPI_tuptable->vals[i];
-		colname = quote_identifier(SPI_getvalue(tup, tupdesc, 1));
+
+		isdropped = SPI_getbinval(tup, tupdesc, 2, &valisnull);
+		Assert(!valisnull);
+
+		if (!isdropped)
+		{
+			colname = quote_identifier(SPI_getvalue(tup, tupdesc, 1));
+			typname = SPI_getvalue(tup, tupdesc, 3);
+		}
+		else
+		{
+			if (create)
+			{
+				/*
+				 * Dropped column must be preserved as a placeholder, so that
+				 * pg_attribute works for the new table.
+				 */
+				if (colname_buf == NULL)
+					/* First time through. */
+					colname_buf = makeStringInfo();
+				else
+					resetStringInfo(colname_buf);
+				appendStringInfo(colname_buf, "dropped_%d", j++);
+				colname = colname_buf->data;
+			}
+			else
+				colname = "NULL";
+
+			/*
+			 * pg_attribute(atttypid) is no longer available, so use arbitrary
+			 * type. We'll only insert NULL values into the column.
+			 */
+			typname = "bool";
+		}
 
 		if (i > 0)
 			appendStringInfoString(result, ", ");
 
-		appendStringInfoString(result, colname);
-
 		if (create)
+			appendStringInfo(result, "%s %s", colname, typname);
+		else
 		{
-			const char	*typname;
-			Datum	notnull;
-			bool	valisnull;
-
-			notnull = SPI_getbinval(tup, tupdesc, 2, &valisnull);
-			Assert(!valisnull);
-			typname = SPI_getvalue(tup, tupdesc, 3);
-
-			appendStringInfo(result, " %s", typname);
-			if (DatumGetBool(notnull))
-				appendStringInfoString(result, " NOT NULL");
+			if (!DatumGetBool(isdropped))
+				appendStringInfoString(result, colname);
+			else
+				appendStringInfo(result, "%s::%s", colname, typname);
 		}
 	}
 
