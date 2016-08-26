@@ -898,7 +898,7 @@ static TransactionId *
 get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 {
 	Relation	rel;
-	ScanKeyData key[1];
+	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tuple;
 	TransactionId	*result;
@@ -907,10 +907,16 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 	rel = heap_open(AttributeRelationId, AccessShareLock);
 	if (snapshot == NULL)
 		snapshot = GetCatalogSnapshot(relid);
-	ScanKeyInit(&key[0], 1, BTEqualStrategyNumber, F_OIDEQ,
+	ScanKeyInit(&key[0], Anum_pg_attribute_attrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
+	/* System columns should not be ALTERed. */
+	ScanKeyInit(&key[1],
+				Anum_pg_attribute_attnum,
+				BTGreaterStrategyNumber, F_INT2GT,
+				Int16GetDatum(0));
 	scan = systable_beginscan(rel, AttributeRelidNumIndexId, true, snapshot,
-							  1, key);
+							  2, key);
 	result = (TransactionId *) palloc(relnatts * sizeof(TransactionId));
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
@@ -919,9 +925,7 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 
 		Assert(HeapTupleIsValid(tuple));
 		form = (Form_pg_attribute) GETSTRUCT(tuple);
-		/* System attributes shouldn't change anyway. */
-		if (form->attnum < 1)
-			continue;
+		Assert(form->attnum > 0);
 
 		/* AttributeRelidNumIndexId index ensures ordering. */
 		i = form->attnum - 1;
@@ -957,7 +961,8 @@ get_index_xmins(Oid relid, int *relninds, Snapshot snapshot)
 	if (snapshot == NULL)
 		snapshot = GetCatalogSnapshot(relid);
 	/* indrelid is the 2nd column of pg_index. */
-	ScanKeyInit(&key[0], 2, BTEqualStrategyNumber, F_OIDEQ,
+	ScanKeyInit(&key[0], Anum_pg_index_indrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	scan = systable_beginscan(rel, IndexIndrelidIndexId, true, snapshot,
 							  1, key);
