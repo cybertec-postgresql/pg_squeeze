@@ -1541,7 +1541,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 			Form_pg_attribute	att;
 
 			heap_col_id = ind->rd_index->indkey.values[j] - 1;
-			att = ind->rd_att->attrs[heap_col_id];
+			att = rel_src->rd_att->attrs[heap_col_id];
 			colname = NameStr(att->attname);
 			colnames = lappend(colnames, pstrdup(colname));
 			collations[j] = att->attcollation;
