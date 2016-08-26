@@ -339,22 +339,26 @@ squeeze_table(PG_FUNCTION_ARGS)
 	switch_snapshot(NULL);
 
 	/*
-	 * If user is adding columns concurrently, it'd cause ERROR during the
+	 * If user is removing columns concurrently, it'd cause ERROR during the
 	 * subsequent decoding anyway.
+	 */
+	/*
+	 * TODO If the number of columns is non-zero, check if there's at least
+	 * one valid (not dropped).
 	 */
 	if (SPI_processed < 1)
 		/* XXX Try to find better error code. */
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 (errmsg("Table %s has no columns", relname_src))));
+				 (errmsg("Table %s has no valid columns",
+						 relname_src))));
 
-	/* Construct CREATE TABLE command. */
 	/*
-	 * TODO The command contains NOT NULL constraints. Add PK, UNIQUE and FK
-	 * ones when the data has been loaded. (This means that we need to extract
-	 * the relevant data from the tuple and store it in local memory table
-	 * before we use SPI to load the data. Better option: create the
-	 * constraint strings right away and use them later?)
+	 * Construct CREATE TABLE command.
+	 *
+	 * Constraints are not created because each data change must be committed
+	 * in the source table before we see it during initial load or via logical
+	 * decoding.
 	 */
 	resetStringInfo(stmt);
 	appendStringInfo(stmt, "CREATE TABLE %s ", relname_dst);
