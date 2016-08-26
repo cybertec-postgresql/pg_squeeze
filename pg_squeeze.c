@@ -99,6 +99,7 @@ static void process_concurrent_changes(DecodingOutputState *s,
 static void build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid **indexes_src, Oid **indexes_dst,
 									int *nindexes);
+static void unlock_table(Oid relid);
 static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
 						   int nindexes);
 static void swap_relation_files(Oid r1, Oid r2);
@@ -581,23 +582,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 *
 	 * As we haven't changed the catalog entry yet, there's no need to send
 	 * invalidation messages.
-	 *
-	 * There are supposedly 3 locks: one acquired by SPI_prepared() (see
-	 * transformTableEntry())and two by SPI_cursor_open() (see PortalStart()
-	 * and ScanQueryForLocks()) - the expected lock mode is always
-	 * AccessShareLock.
 	 */
-	UnlockRelationOid(relid_src, AccessShareLock);
-	UnlockRelationOid(relid_src, AccessShareLock);
-	/*
-	 * The last one should have been re-assigned to the top transaction by
-	 * SPI_cursor_close(). (All this unlocking stuff is ugly, but I have no
-	 * better idea right now.)
-	 */
-	resowner_old = CurrentResourceOwner;
-	CurrentResourceOwner = TopTransactionResourceOwner;
-	UnlockRelationOid(relid_src, AccessShareLock);
-	CurrentResourceOwner = resowner_old;
+	unlock_table(relid_src);
+	/* Do the same for indexes. */
+	/* TODO Handle oid index if there's one. */
+	for (i = 0; i < nindexes; i++)
+		/*
+		 * There's only one lock per index: SPI_cursor_open() -> ... ->
+		 * ScanQueryForLocks().
+		 */
+		UnlockRelationOid(indexes_src[i], AccessShareLock);
 
 	/*
 	 * Lock the source table exclusively last time, to finalize the work.
@@ -629,6 +623,17 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * can, so that less work is left to the exclusive lock time.
 	 */
 	LockRelationOid(relid_src, AccessExclusiveLock);
+
+	/*
+	 * Lock the indexes too, as ALTER INDEX does not need table lock.
+	 *
+	 * The locking will succeed even if the index is no longer there. In that
+	 * case, ERROR will be raised during the catalog check below.
+	 *
+	 * TODO Handle OID index if there's one.
+	 */
+	for (i = 0; i < nindexes; i++)
+		LockRelationOid(indexes_src[i], AccessShareLock);
 
 	/*
 	 * Check the source relation for DDLs once again. If this check passes, no
@@ -1629,6 +1634,29 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 	Assert(indexes_src != NULL && indexes_dst != NULL);
 	*indexes_src = result_src;
 	*indexes_dst = result_dst;
+}
+
+static void
+unlock_table(Oid relid)
+{
+	ResourceOwner	resowner_old;
+
+	/* There are supposedly 3 locks: one acquired by SPI_prepared() (see
+	 * transformTableEntry())and two by SPI_cursor_open() (see PortalStart()
+	 * and ScanQueryForLocks()) - the expected lock mode is always
+	 * AccessShareLock.
+	 */
+	UnlockRelationOid(relid, AccessShareLock);
+	UnlockRelationOid(relid, AccessShareLock);
+	/*
+	 * The last one should have been re-assigned to the top transaction by
+	 * SPI_cursor_close(). (All this unlocking stuff is ugly, but I have no
+	 * better idea right now.)
+	 */
+	resowner_old = CurrentResourceOwner;
+	CurrentResourceOwner = TopTransactionResourceOwner;
+	UnlockRelationOid(relid, AccessShareLock);
+	CurrentResourceOwner = resowner_old;
 }
 
 /* Insert ctid into all indexes of relation. */
