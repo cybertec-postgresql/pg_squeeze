@@ -1,3 +1,6 @@
 *~
 *.o
 *.so
+GPATH
+GRTAGS
+GTAGS
