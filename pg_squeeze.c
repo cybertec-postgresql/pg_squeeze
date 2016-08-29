@@ -44,6 +44,19 @@ PG_MODULE_MAGIC;
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 /*
+ * Information on source relation index, used to build the index on the
+ * transient relation. To avoid repeated retrieval of the index OIDs, we also
+ * add pg_class(xmin) and pass the same structure to check_catalog_changes().
+ */
+typedef struct IndexCatInfo
+{
+	Oid	oid;
+	TransactionId		xmin;
+} IndexCatInfo;
+
+static int index_cat_info_compare(const void *arg1, const void *arg2);
+
+/*
  * Information to check whether an "incompatible" catalog change took
  * place. Such a change prevents us from completing processing of the current
  * table.
@@ -58,15 +71,12 @@ typedef struct CatalogState
 
 	/* pg_class(relnatts) */
 	int16		relnatts;
-
 	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
 	TransactionId	*attr_xmins;
 
-	/* Number of indexes. */
+	/* Likewise, per-index info. */
 	int		relninds;
-
-	/* Array of pg_attribute(xmin). */
-	TransactionId	*index_xmins;
+	IndexCatInfo	*indexes;
 
 	/*
 	 * xmin of the pg_class tuple of the source relation during the initial
@@ -79,11 +89,11 @@ static LogicalDecodingContext *setup_decoding(void);
 static CatalogState *get_catalog_state(Oid relid);
 static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
 										  Snapshot snapshot);
-static TransactionId *get_index_xmins(Oid relid, int *relninds,
-									  Snapshot snapshot);
+static IndexCatInfo *get_index_info(Oid relid, int *relninds, Snapshot snapshot);
 static void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
 static void check_attribute_changes(Oid relid, TransactionId	*attrs, int relnatts);
-static void check_index_changes(Oid relid, TransactionId *inds, int relninds);
+static void check_index_changes(Oid relid, IndexCatInfo *indexes,
+								int relninds);
 static void free_catalog_state(CatalogState *state);
 static void check_pg_class_changes(Oid relid, TransactionId xmin,
 								   LOCKMODE lock_held);
@@ -96,9 +106,8 @@ static void process_concurrent_changes(DecodingOutputState *s,
 									   Relation relation, ScanKey key,
 									   int nkeys, Oid *indexes, int nindexes,
 									   Oid ident_index);
-static void build_transient_indexes(Relation rel_dst, Relation rel_src,
-									Oid **indexes_src, Oid **indexes_dst,
-									int *nindexes);
+static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
+									Oid *indexes_src, int nindexes);
 static void unlock_table(Oid relid);
 static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
 						   int nindexes);
@@ -165,7 +174,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	ResourceOwner resowner_old, resowner_decode;
 	XLogRecPtr	xlog_insert_ptr;
 	int	nindexes;
-	Oid	*indexes_src, *indexes_dst;
+	Oid	*indexes_src = NULL, *indexes_dst = NULL;
 
 	relname = PG_GETARG_TEXT_P(0);
 	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
@@ -275,6 +284,17 @@ squeeze_table(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 (errmsg("\"user_catalog_table\" option not set"))));
 	Assert(cat_state->is_catalog);
+
+	nindexes = cat_state->relninds;
+	if (nindexes > 0)
+	{
+		int		j;
+
+		/* Copy the OIDs into a separate array, for convenient use later. */
+		indexes_src = (Oid *) palloc(cat_state->relninds * sizeof(Oid));
+		for (j = 0; j < cat_state->relninds; j++)
+			indexes_src[j] = cat_state->indexes[j].oid;
+	}
 
 	/*
 	 * The relation shouldn't be locked during slot setup. Otherwise another
@@ -523,17 +543,20 @@ squeeze_table(PG_FUNCTION_ARGS)
 	check_catalog_changes(cat_state, AccessShareLock);
 
 	/*
-	 * Create indexes on the temporary table - that might take a
-	 * while. (Unlike the concurrent changes, which we insert into existing
-	 * indexes.)
+	 * Create indexes on the temporary table if the source table has some -
+	 * that might take a while. (Unlike the concurrent changes, which we
+	 * insert into existing indexes.)
 	 *
-	 * The lock acquired for the initial load should still be effective, so
-	 * don't request any additional lock.
+	 * The lock acquired for the initial load query should still be effective,
+	 * so don't request any additional lock.
 	 */
-	rel_src = relation_open(relid_src, NoLock);
-	build_transient_indexes(rel_dst, rel_src, &indexes_src, &indexes_dst,
-							&nindexes);
-	relation_close(rel_src, NoLock);
+	if (nindexes > 0)
+	{
+		rel_src = relation_open(relid_src, NoLock);
+		indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
+											  nindexes);
+		relation_close(rel_src, NoLock);
+	}
 
 	/* Find "identity index" of the transient relation. */
 	ident_idx_dst = InvalidOid;
@@ -583,11 +606,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* Do the same for indexes. */
 	/* TODO Handle oid index if there's one. */
 	for (i = 0; i < nindexes; i++)
+	{
 		/*
 		 * There's only one lock per index: SPI_cursor_open() -> ... ->
 		 * ScanQueryForLocks().
 		 */
 		UnlockRelationOid(indexes_src[i], AccessShareLock);
+	}
 
 	/*
 	 * Lock the source table exclusively last time, to finalize the work.
@@ -746,6 +771,20 @@ squeeze_table(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+static int
+index_cat_info_compare(const void *arg1, const void *arg2)
+{
+	IndexCatInfo *i1 = (IndexCatInfo *) arg1;
+	IndexCatInfo *i2 = (IndexCatInfo *) arg2;
+
+	if (i1->oid > i2->oid)
+		return 1;
+	else if (i1->oid < i2->oid)
+		return -1;
+	else
+		return 0;
+}
+
 /*
  * This function is much like pg_create_logical_replication_slot() except that
  * the new slot is neither released (if anyone else could read changes from
@@ -803,7 +842,7 @@ setup_decoding(void)
 static CatalogState *
 get_catalog_state(Oid relid)
 {
-	HeapTuple	tuple = NULL;
+	HeapTuple	tuple;
 	Form_pg_class	form_class;
 	Relation	rel;
 	TupleDesc	desc;
@@ -869,8 +908,11 @@ get_catalog_state(Oid relid)
 												 snapshot);
 	if (form_class->relhasindex)
 	{
-		result->index_xmins = get_index_xmins(relid, &result->relninds,
-											 snapshot);
+		result->indexes = get_index_info(relid, &result->relninds, snapshot);
+		/*
+		 * As we use the same snapshot for all catalogs, relhasindex and
+		 * relninds must be consistent.
+		 */
 		Assert(result->relninds > 0);
 	}
 
@@ -942,37 +984,48 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 }
 
 /*
- * Retrieve array of pg_index(xmin) values for given relation. The result is
- * not ordered, but it shouldn't be a problem. It's hard to imagine that
- * someone changes the order. False alarm about concurrent change is the worst
- * case.
+ * Retrieve pg_class(oid) and pg_class(xmin) for each index of given
+ * relation. The result is not ordered, but it shouldn't be a problem. It's
+ * hard to imagine that someone changes the order. (Even if so, false alarm
+ * about concurrent change is the worst case, as opposed to using index whose
+ * tuple descriptor is obsolete.)
  */
-static TransactionId *
-get_index_xmins(Oid relid, int *relninds, Snapshot snapshot)
+static IndexCatInfo *
+get_index_info(Oid relid, int *relninds, Snapshot snapshot)
 {
 	Relation	rel;
 	ScanKeyData key[1];
+	bool		snap_received;
 	SysScanDesc scan;
 	HeapTuple	tuple;
-	TransactionId	*result;
-	int	n = 0;
+	IndexCatInfo		*result;
+	int	i, n = 0;
 	int	relninds_max = 4;
+	Datum		*oids_d;
+	int16		oidlen;
+	bool		oidbyval;
+	char		oidalign;
+	ArrayType	*oids_a;
+	bool		mismatch;
 
 	rel = heap_open(IndexRelationId, AccessShareLock);
-	if (snapshot == NULL)
+	if (snapshot != NULL)
+		snap_received = true;
+	if (!snap_received)
 		snapshot = GetCatalogSnapshot(relid);
-	/* indrelid is the 2nd column of pg_index. */
 	ScanKeyInit(&key[0], Anum_pg_index_indrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	scan = systable_beginscan(rel, IndexIndrelidIndexId, true, snapshot,
 							  1, key);
 
-	result = (TransactionId *) palloc(relninds_max * sizeof(TransactionId));
+	result = (IndexCatInfo *) palloc(relninds_max * sizeof(IndexCatInfo));
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
-		Assert(HeapTupleIsValid(tuple));
-		result[n++] = HeapTupleHeaderGetXmin(tuple->t_data);
+		Form_pg_index	form;
+
+		form = (Form_pg_index) GETSTRUCT(tuple);
+		result[n++].oid = form->indexrelid;
 
 		/*
 		 * Unlike get_attribute_xmins(), we can't receive the expected number
@@ -981,13 +1034,67 @@ get_index_xmins(Oid relid, int *relninds, Snapshot snapshot)
 		if (n == relninds_max)
 		{
 			relninds_max *= 2;
-			result = (TransactionId *)
-				repalloc(result, relninds_max * sizeof(TransactionId));
+			result = (IndexCatInfo *)
+				repalloc(result, relninds_max * sizeof(IndexCatInfo));
 		}
 	}
 	systable_endscan(scan);
 	heap_close(rel, AccessShareLock);
+
+	/*
+	 * Enforce sorting by OID, so that the entries match the result of the
+	 * following scan using OID index.
+	 */
+	qsort(result, n, sizeof(IndexCatInfo), index_cat_info_compare);
+
 	*relninds = n;
+	if (n == 0)
+		return result;
+
+	/*
+	 * Now retrieve the corresponding pg_class(xmax) values.
+	 *
+	 * Here it seems reasonable to construct an array of OIDs of the pg_class
+	 * entries of the indexes and use amsearcharray function of the index.
+	 */
+	oids_d = (Datum *) palloc(n * sizeof(Datum));
+	for (i = 0; i < n; i++)
+		oids_d[i] = ObjectIdGetDatum(result[i].oid);
+	get_typlenbyvalalign(OIDOID, &oidlen, &oidbyval, &oidalign);
+	oids_a = construct_array(oids_d, n, OIDOID, oidlen, oidbyval, oidalign);
+	pfree(oids_d);
+
+	rel = heap_open(RelationRelationId, AccessShareLock);
+	if (!snap_received)
+		snapshot = GetCatalogSnapshot(relid);
+	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
+				F_OIDEQ, PointerGetDatum(oids_a));
+	key[0].sk_flags |= SK_SEARCHARRAY;
+	scan = systable_beginscan(rel, ClassOidIndexId, true, snapshot, 1, key);
+	i = 0;
+	mismatch = false;
+	while ((tuple = systable_getnext(scan)) != NULL)
+	{
+		if (i == n)
+		{
+			/* Index added concurrently? */
+			mismatch = true;
+			break;
+		}
+		result[i++].xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+	}
+	if (i < n)
+		mismatch = true;
+
+	if (mismatch)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("Concurrent change of index detected")));
+
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
+	pfree(oids_a);
+
 	return result;
 }
 
@@ -1043,7 +1150,7 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 	 * also call them unconditionally.
 	 */
 	check_attribute_changes(state->relid, state->attr_xmins, state->relnatts);
-	check_index_changes(state->relid, state->index_xmins, state->relninds);
+	check_index_changes(state->relid, state->indexes, state->relninds);
 }
 
 static void
@@ -1131,19 +1238,19 @@ check_attribute_changes(Oid relid, TransactionId *attrs, int relnatts)
 }
 
 static void
-check_index_changes(Oid relid, TransactionId *inds, int relninds)
+check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 {
-	TransactionId	*inds_new;
+	IndexCatInfo	*inds_new;
 	int	relninds_new;
 	bool	failed = false;
 
 	if (relninds == 0)
 	{
-		Assert(inds == NULL);
+		Assert(indexes == NULL);
 		return;
 	}
 
-	inds_new = get_index_xmins(relid, &relninds_new, NULL);
+	inds_new = get_index_info(relid, &relninds_new, NULL);
 	if (relninds_new != relninds)
 		failed = true;
 
@@ -1153,7 +1260,12 @@ check_index_changes(Oid relid, TransactionId *inds, int relninds)
 
 		for (i = 0; i < relninds; i++)
 		{
-			if (!TransactionIdEquals(inds[i], inds_new[i]))
+			IndexCatInfo	*ind, *ind_new;
+
+			ind = &indexes[i];
+			ind_new = &inds_new[i];
+			if (ind->oid != ind_new->oid ||
+				!TransactionIdEquals(ind->xmin, ind_new->xmin))
 			{
 				failed = true;
 				break;
@@ -1172,8 +1284,8 @@ free_catalog_state(CatalogState *state)
 {
 	if (state->attr_xmins)
 		pfree(state->attr_xmins);
-	if (state->index_xmins)
-		pfree(state->index_xmins);
+	if (state->indexes)
+		pfree(state->indexes);
 	pfree(state);
 }
 
@@ -1501,39 +1613,30 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 /*
  * Make sure "dst" relation has the same indexes as "src".
  *
- * nindexes receives the number of indexes processed. If it's positive,
- * indexes_src and indexes_dst receive oids of the source destination relation
- * indexes respectively. The order of items does match, so we can use these
+ * indexes_src is array of existing indexes on the source relation and
+ * nindexes the number of its entries.
+ *
+ * An array of oids of corresponding indexes created on the destination
+ * relation is returned. The order of items does match, so we can use these
  * arrays to swap index storage.
  */
-static void
+/*
+ * TODO Process rd_oidindex if it exists.
+ */
+static Oid *
 build_transient_indexes(Relation rel_dst, Relation rel_src,
-						Oid **indexes_src, Oid **indexes_dst, int *nindexes)
+						Oid *indexes_src, int nindexes)
 {
-	List	*ind_list_src;
-	ListCell	*lc;
 	StringInfo	ind_name;
 	int	i;
-	Oid	*result_src, *result_dst;
+	Oid	*result;
+
+	Assert(nindexes > 0);
 
 	ind_name = makeStringInfo();
+	result = (Oid *) palloc(nindexes * sizeof(Oid));
 
-	/*
-	 * TODO Process rd_oidindex if it exists. (Simply by lappend() to
-	 * ind_list_src?)
-	 */
-	ind_list_src = RelationGetIndexList(rel_src);
-
-	Assert(nindexes != NULL);
-	*nindexes = list_length(ind_list_src);
-	if (*nindexes == 0)
-		return;
-
-	result_src = (Oid *) palloc(*nindexes * sizeof(Oid));
-	result_dst = (Oid *) palloc(*nindexes * sizeof(Oid));
-
-	i = 0;
-	foreach (lc, ind_list_src)
+	for (i = 0; i < nindexes; i++)
 	{
 		Oid	ind_oid, ind_oid_new;
 		Relation	ind;
@@ -1552,7 +1655,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		int16	*indoptions;
 		bool	isconstraint;
 
-		ind_oid = lfirst_oid(lc);
+		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
 		ind_info = BuildIndexInfo(ind);
 
@@ -1616,20 +1719,14 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   ind->rd_index->indisprimary, isconstraint,
 								   false, false, false, false, false, false,
 								   false);
-		result_src[i] = ind_oid;
-		result_dst[i] = ind_oid_new;
+		result[i] = ind_oid_new;
 
 		list_free_deep(colnames);
 		pfree(collations);
 		pfree(opclasses);
-
-		i++;
 	}
-	list_free(ind_list_src);
 
-	Assert(indexes_src != NULL && indexes_dst != NULL);
-	*indexes_src = result_src;
-	*indexes_dst = result_dst;
+	return result;
 }
 
 static void
