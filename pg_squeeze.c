@@ -517,14 +517,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	CurrentResourceOwner = resowner_old;
 
 	/*
-	 * Check if concurrent DDL (affecting pg_class, pg_attribute or
-	 * constraints of the soure table) took place concurrently. Only tuple
-	 * descriptor change makes the decoded data unusable, but changes of
-	 * constraint would introduce another class of problems, so reject them
-	 * too.
-	 *
-	 * Indexes can take quite some effort to build and we don't want to waste
-	 * it.
+	 * Check if any disruptive DDL took place concurrently. Index build can
+	 * take quite some effort and we don't want to waste it.
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
 
@@ -559,12 +553,14 @@ squeeze_table(PG_FUNCTION_ARGS)
 		elog(ERROR, "Identity index missing on the transient relation");
 
 	/*
-	 * Check for catalog changes again, to make sure no index changed.
+	 * Since the build of indexes could have taken relatively long time, it's
+	 * worth checking for concurrent changes again. The point is that the
+	 * first batch of concurrent changes can be big (it contains the changes
+	 * that took place during the initial load), changes again, so failed
+	 * check can prevent us from doing significant work needlessly.
 	 *
-	 * The point is to ensure that the changes decoded so far are compatible
-	 * with the transient table (In fact, catalog change could have happened
-	 * after the decoding had completed, but that breaks the whole procedure
-	 * anyway. We'll check when needed again.)
+	 * (We hold share lock on the source relation, but that does not conflict
+	 * with some commands, e.g. ALTER INDEX.)
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
 
@@ -1012,9 +1008,9 @@ get_index_xmins(Oid relid, int *relninds, Snapshot snapshot)
  * the storage is "compatible", i.e. no column and no index was added /
  * altered/ dropped, and no heap rewriting took place.
  *
- * Unlike get_catalog_state(), we fresh catalog snapshot is used for each
- * catalog scan. That might increase the chance a little bit that concurrent
- * change will be detected in the current call, instead of the following one.
+ * Unlike get_catalog_state(), fresh catalog snapshot is used for each catalog
+ * scan. That might increase the chance a little bit that concurrent change
+ * will be detected in the current call, instead of the following one.
  *
  * (As long as we use xmin columns of the catalog tables to detect changes, we
  * can't use syscache here.)
