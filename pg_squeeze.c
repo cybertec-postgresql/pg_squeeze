@@ -45,13 +45,16 @@ PG_MODULE_MAGIC;
 
 /*
  * Information on source relation index, used to build the index on the
- * transient relation. To avoid repeated retrieval of the index OIDs, we also
- * add pg_class(xmin) and pass the same structure to check_catalog_changes().
+ * transient relation. To avoid repeated retrieval of the pg_index fields we
+ * also add pg_class(xmin) and pass the same structure to
+ * check_catalog_changes().
  */
 typedef struct IndexCatInfo
 {
-	Oid	oid;
-	TransactionId		xmin;
+	Oid	oid;					/* pg_index(indexrelid) */
+	TransactionId		xmin;	/* pg_index(xmin) */
+	TransactionId		pg_class_xmin; /* pg_class(xmin) of the index (not the
+										* parent relation) */
 } IndexCatInfo;
 
 static int index_cat_info_compare(const void *arg1, const void *arg2);
@@ -83,13 +86,21 @@ typedef struct CatalogState
 	 * check.
 	 */
 	TransactionId		pg_class_xmin;
+
+	/*
+	 * Does at least one index wrong value of indisvalid, indisready or
+	 * indislive?
+	 */
+	bool	invalid_index;
 } CatalogState;
 
 static LogicalDecodingContext *setup_decoding(void);
 static CatalogState *get_catalog_state(Oid relid);
 static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
 										  Snapshot snapshot);
-static IndexCatInfo *get_index_info(Oid relid, int *relninds, Snapshot snapshot);
+static IndexCatInfo *get_index_info(Oid relid, int *relninds,
+									bool *found_invalid, bool invalid_check_only,
+									Snapshot snapshot);
 static void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
 static void check_attribute_changes(Oid relid, TransactionId	*attrs, int relnatts);
 static void check_index_changes(Oid relid, IndexCatInfo *indexes,
@@ -175,6 +186,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	XLogRecPtr	xlog_insert_ptr;
 	int	nindexes;
 	Oid	*indexes_src = NULL, *indexes_dst = NULL;
+	bool	invalid_index = false;
+	IndexCatInfo	*ind_info;
 
 	relname = PG_GETARG_TEXT_P(0);
 	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
@@ -279,11 +292,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/* Get ready for the subsequent calls of check_catalog_changes(). */
 	cat_state = get_catalog_state(relid_src);
-	if (cat_state == NULL)
+
+	/* Give up if it's clear enough to do. */
+	if (!cat_state->is_catalog)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 (errmsg("\"user_catalog_table\" option not set"))));
-	Assert(cat_state->is_catalog);
+	if (cat_state->invalid_index)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 (errmsg("At least one index is invalid"))));
 
 	nindexes = cat_state->relninds;
 	if (nindexes > 0)
@@ -615,6 +633,26 @@ squeeze_table(PG_FUNCTION_ARGS)
 	}
 
 	/*
+	 * This (supposedly cheap) special check should avoid one particular
+	 * deadlock scenario: another transaction, performing index DDL
+	 * concurrenly (e.g. DROP INDEX CONCURRENTLY) committed change of
+	 * indisvalid, indisready, ... and called WaitForLockers() before we
+	 * unlocked both source table and its indexes above. Since our transaction
+	 * is still running, the other transaction keeps waiting, but holds
+	 * (non-exclusive) lock on both relation and index. In this situation we'd
+	 * cause deadlock by requesting exclusive lock. Fortunately we should
+	 * recognize this scenario by checking pg_index.
+	 */
+	ind_info = get_index_info(relid_src, NULL, &invalid_index, true,
+							  NULL);
+	if (invalid_index)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("Concurrent change of index detected")));
+	else
+		pfree(ind_info);
+
+	/*
 	 * Lock the source table exclusively last time, to finalize the work.
 	 *
 	 * On pg_repack: before taking the exclusive lock, pg_repack extension is
@@ -833,9 +871,7 @@ setup_decoding(void)
 
 
 /*
- * Retrieve the catalog state to be passed later to check_catalog_changes. If
- * the "is_catalog" attribute should be returned, do not construct the state
- * at all and return NULL.
+ * Retrieve the catalog state to be passed later to check_catalog_changes.
  *
  * Caller is supposed to hold (at least) AccessShareLock on the relation.
  */
@@ -894,28 +930,19 @@ get_catalog_state(Oid relid)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 (errmsg("Mapped relation cannot be squeezed"))));
 
+	result = (CatalogState *) palloc0(sizeof(CatalogState));
+
 	/* The "user_catalog_option" is essential. */
 	options = (StdRdOptions *) extractRelOptions(tuple, desc, NULL);
 	if (options == NULL || !options->user_catalog_table)
-		return NULL;
+	{
+		Assert(!result->is_catalog);
+		return result;
+	}
 
-	result = (CatalogState *) palloc0(sizeof(CatalogState));
 	result->relid = relid;
 	result->is_catalog = true;
 	result->relnatts = form_class->relnatts;
-	if (result->relnatts > 0)
-		result->attr_xmins = get_attribute_xmins(relid, result->relnatts,
-												 snapshot);
-	if (form_class->relhasindex)
-	{
-		result->indexes = get_index_info(relid, &result->relninds, snapshot);
-		/*
-		 * As we use the same snapshot for all catalogs, relhasindex and
-		 * relninds must be consistent.
-		 */
-		Assert(result->relninds > 0);
-	}
-
 
 	/*
 	 * pg_class(xmin) helps to ensure that the "user_catalog_option" wasn't
@@ -923,6 +950,19 @@ get_catalog_state(Oid relid)
 	 * DDLs that would be safe as such.
 	 */
 	result->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+	if (form_class->relhasindex)
+		result->indexes = get_index_info(relid, &result->relninds,
+										 &result->invalid_index, false,
+										 snapshot);
+
+	/* If any index is "invalid", no more catalog information is needed. */
+	if (result->invalid_index)
+		return result;
+
+	if (result->relnatts > 0)
+		result->attr_xmins = get_attribute_xmins(relid, result->relnatts,
+												 snapshot);
 
 	/* Cleanup. */
 	systable_endscan(scan);
@@ -985,13 +1025,18 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 
 /*
  * Retrieve pg_class(oid) and pg_class(xmin) for each index of given
- * relation. The result is not ordered, but it shouldn't be a problem. It's
- * hard to imagine that someone changes the order. (Even if so, false alarm
- * about concurrent change is the worst case, as opposed to using index whose
- * tuple descriptor is obsolete.)
+ * relation.
+ *
+ * If at least one index appears to be problematic in terms of concurrency,
+ * *found_invalid receives true and retrieval of index information ends
+ * immediately.
+ *
+ * If invalid_check_only is true, return after having verified that all
+ * indexes are valid.
  */
 static IndexCatInfo *
-get_index_info(Oid relid, int *relninds, Snapshot snapshot)
+get_index_info(Oid relid, int *relninds, bool *found_invalid,
+			   bool invalid_check_only, Snapshot snapshot)
 {
 	Relation	rel;
 	ScanKeyData key[1];
@@ -1008,6 +1053,8 @@ get_index_info(Oid relid, int *relninds, Snapshot snapshot)
 	ArrayType	*oids_a;
 	bool		mismatch;
 
+	*found_invalid = false;
+
 	rel = heap_open(IndexRelationId, AccessShareLock);
 	if (snapshot != NULL)
 		snap_received = true;
@@ -1023,9 +1070,23 @@ get_index_info(Oid relid, int *relninds, Snapshot snapshot)
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_index	form;
+		IndexCatInfo	*res_entry;
 
 		form = (Form_pg_index) GETSTRUCT(tuple);
-		result[n++].oid = form->indexrelid;
+
+		/*
+		 * First, perform the simple checks that can make the next work
+		 * unnecessary.
+		 */
+		if (!IndexIsValid(form) || !IndexIsReady(form) || !IndexIsLive(form))
+		{
+			*found_invalid = true;
+			break;
+		}
+
+		res_entry = (IndexCatInfo *) &result[n++];
+		res_entry->oid = form->indexrelid;
+		res_entry->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 
 		/*
 		 * Unlike get_attribute_xmins(), we can't receive the expected number
@@ -1041,13 +1102,21 @@ get_index_info(Oid relid, int *relninds, Snapshot snapshot)
 	systable_endscan(scan);
 	heap_close(rel, AccessShareLock);
 
+	/* Return if invalid index was found or ... */
+	if (*found_invalid)
+		return result;
+	/* ... caller is not interested in anything else.  */
+	if (invalid_check_only)
+		return result;
+
 	/*
 	 * Enforce sorting by OID, so that the entries match the result of the
 	 * following scan using OID index.
 	 */
 	qsort(result, n, sizeof(IndexCatInfo), index_cat_info_compare);
 
-	*relninds = n;
+	if (relninds)
+		*relninds = n;
 	if (n == 0)
 		return result;
 
@@ -1081,7 +1150,7 @@ get_index_info(Oid relid, int *relninds, Snapshot snapshot)
 			mismatch = true;
 			break;
 		}
-		result[i++].xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+		result[i++].pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 	}
 	if (i < n)
 		mismatch = true;
@@ -1149,8 +1218,8 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 	 * Attribute and index changes should really need AccessExclusiveLock, so
 	 * also call them unconditionally.
 	 */
-	check_attribute_changes(state->relid, state->attr_xmins, state->relnatts);
 	check_index_changes(state->relid, state->indexes, state->relninds);
+	check_attribute_changes(state->relid, state->attr_xmins, state->relnatts);
 }
 
 static void
@@ -1243,6 +1312,7 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 	IndexCatInfo	*inds_new;
 	int	relninds_new;
 	bool	failed = false;
+	bool	invalid_index;
 
 	if (relninds == 0)
 	{
@@ -1250,8 +1320,17 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 		return;
 	}
 
-	inds_new = get_index_info(relid, &relninds_new, NULL);
-	if (relninds_new != relninds)
+	inds_new = get_index_info(relid, &relninds_new, &invalid_index, false,
+							  NULL);
+
+	/*
+	 * If this field was set to true, no attention was paid to the other
+	 * fields during catalog scans.
+	 */
+	if (invalid_index)
+		failed = true;
+
+	if (!failed && relninds_new != relninds)
 		failed = true;
 
 	if (!failed)
@@ -1265,7 +1344,9 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 			ind = &indexes[i];
 			ind_new = &inds_new[i];
 			if (ind->oid != ind_new->oid ||
-				!TransactionIdEquals(ind->xmin, ind_new->xmin))
+				!TransactionIdEquals(ind->xmin, ind_new->xmin) ||
+				!TransactionIdEquals(ind->pg_class_xmin,
+									 ind_new->pg_class_xmin))
 			{
 				failed = true;
 				break;
