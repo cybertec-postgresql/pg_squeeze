@@ -173,6 +173,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Snapshot	snap_hist;
 	StringInfo	relname_tmp, stmt;
 	char	*relname_src, *relname_dst, *create_stmt;
+	bool	src_has_oids;
 	int	spi_res;
 	SPIPlanPtr	plan;
 	Portal	portal;
@@ -314,6 +315,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 			indexes_src[j] = cat_state->indexes[j].oid;
 	}
 
+	src_has_oids = rel_src->rd_rel->relhasoids;
+
 	/*
 	 * The relation shouldn't be locked during slot setup. Otherwise another
 	 * transaction could write XLOG records before the slots' data.restart_lsn
@@ -401,6 +404,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	resetStringInfo(stmt);
 	appendStringInfo(stmt, "CREATE TABLE %s ", relname_dst);
 	appendStringInfo(stmt, "(%s)", get_column_list(SPI_tuptable, true));
+	if (src_has_oids)
+		appendStringInfoString(stmt, " WITH OIDS");
 	create_stmt = pstrdup(stmt->data);
 
 	/*
@@ -622,7 +627,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	unlock_table(relid_src);
 	/* Do the same for indexes. */
-	/* TODO Handle oid index if there's one. */
 	for (i = 0; i < nindexes; i++)
 	{
 		/*
@@ -688,8 +692,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 *
 	 * The locking will succeed even if the index is no longer there. In that
 	 * case, ERROR will be raised during the catalog check below.
-	 *
-	 * TODO Handle OID index if there's one.
 	 */
 	for (i = 0; i < nindexes; i++)
 		LockRelationOid(indexes_src[i], AccessShareLock);
@@ -1701,9 +1703,6 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
  * relation is returned. The order of items does match, so we can use these
  * arrays to swap index storage.
  */
-/*
- * TODO Process rd_oidindex if it exists.
- */
 static Oid *
 build_transient_indexes(Relation rel_dst, Relation rel_src,
 						Oid *indexes_src, int nindexes)
@@ -1723,6 +1722,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		Relation	ind;
 		IndexInfo	*ind_info;
 		int	j, heap_col_id;
+		StringInfo	col_name_buf = NULL;
 		List	*colnames;
 		int16	indnatts;
 		Oid	*collations, *opclasses;
@@ -1757,13 +1757,40 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		for (j = 0; j < indnatts; j++)
 		{
 			char	*colname;
-			Form_pg_attribute	att;
 
-			heap_col_id = ind->rd_index->indkey.values[j] - 1;
-			att = rel_src->rd_att->attrs[heap_col_id];
-			colname = NameStr(att->attname);
+			heap_col_id = ind->rd_index->indkey.values[j];
+			if (heap_col_id >= 1)
+			{
+				Form_pg_attribute	att;
+
+				/* Normal attribute. */
+				att = rel_src->rd_att->attrs[heap_col_id - 1];
+				colname = NameStr(att->attname);
+				collations[j] = att->attcollation;
+			}
+			else if (heap_col_id == ObjectIdAttributeNumber)
+			{
+				/*
+				 * OID should be expected because of OID indexes, however user
+				 * can use the OID column in arbitrary index. Therefore we'd
+				 * better generate an unique column name.
+				 *
+				 * XXX Is it worth checking that the index satisfies other
+				 * characteristics of an OID index?
+				 */
+				if (col_name_buf == NULL)
+					col_name_buf = makeStringInfo();
+				else
+					resetStringInfo(col_name_buf);
+				appendStringInfo(col_name_buf, "oid_%d", j);
+				colname = col_name_buf->data;
+				collations[j] = InvalidOid;
+			}
+			else
+				elog(ERROR, "Unexpected column number: %d",
+					 heap_col_id);
+
 			colnames = lappend(colnames, pstrdup(colname));
-			collations[j] = att->attcollation;
 		}
 		/*
 		 * Special effort needed for variable length attributes of
