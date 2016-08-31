@@ -119,6 +119,8 @@ static void process_concurrent_changes(DecodingOutputState *s,
 									   Oid ident_index);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes);
+static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
+								  int *nentries);
 static void unlock_table(Oid relid);
 static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
 						   int nindexes);
@@ -162,13 +164,12 @@ squeeze_table(PG_FUNCTION_ARGS)
 {
 	text	   *relname;
 	RangeVar   *relrv_src, *relrv_dst;
-	Relation	rel_src, rel_dst, ident_idx_rel;
-	Form_pg_index ident_idx;
-	Oid	ident_idx_id, ident_idx_dst;
+	Relation	rel_src, rel_dst;
+	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
 	char	replident;
-	ScanKey	key;
-	int	i, nkeys;
+	ScanKey	ident_key;
+	int	i, ident_key_nentries;
 	LogicalDecodingContext	*ctx;
 	Snapshot	snap_hist;
 	StringInfo	relname_tmp, stmt;
@@ -197,6 +198,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	RelationGetIndexList(rel_src);
 	replident = rel_src->rd_rel->relreplident;
+	/*
+	 * Save the identity index OID so that we don't have to call
+	 * RelationGetIndexList later again.
+	 */
+	ident_idx_src = rel_src->rd_replidindex;
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
@@ -215,8 +221,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * as well.)
 	 */
 	if (replident == REPLICA_IDENTITY_NOTHING ||
-		(replident == REPLICA_IDENTITY_DEFAULT &&
-		 !OidIsValid(rel_src->rd_replidindex)))
+		(replident == REPLICA_IDENTITY_DEFAULT && !OidIsValid(ident_idx_src)))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
 				 (errmsg("Table is not selective"))));
@@ -226,48 +231,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
 				 (errmsg("Replica identity \"full\" not supported"))));
-
-	/* Build scan key to process logical changes. */
-	/* TODO Consider constructing the key later, when the destination table
-	 * also has it (so it's constructed short before use). (Also move this
-	 * part into a separate function.) */
-	Assert(OidIsValid(rel_src->rd_replidindex));
-	ident_idx_rel = index_open(rel_src->rd_replidindex, AccessShareLock);
-	ident_idx = ident_idx_rel->rd_index;
-	ident_idx_id = ident_idx_rel->rd_id;
-	nkeys = ident_idx->indnatts;
-	key = (ScanKey) palloc(sizeof(ScanKeyData) * nkeys);
-	for (i = 0; i < nkeys; i++)
-	{
-		ScanKey	entry;
-		int16	relattno;
-		TupleDesc	desc;
-		Form_pg_attribute	att;
-		Oid	opfamily, opno, opcode;
-
-		entry = &key[i];
-		relattno = ident_idx->indkey.values[i];
-		desc = rel_src->rd_att;
-		att = desc->attrs[relattno - 1];
-		opfamily = ident_idx_rel->rd_opfamily[i];
-		opno = get_opfamily_member(opfamily, att->atttypid, att->atttypid,
-								   BTEqualStrategyNumber);
-		if (!OidIsValid(opno))
-			elog(ERROR, "Failed to find = operator for type %u",
-				 att->atttypid);
-
-		opcode = get_opcode(opno);
-		if (!OidIsValid(opcode))
-			elog(ERROR, "Failed to find = operator for operator %u", opno);
-
-		/* Initialize everything but argument. */
-		ScanKeyInit(entry,
-					relattno,
-					BTEqualStrategyNumber, opcode,
-					(Datum) NULL);
-		entry->sk_collation = att->attcollation;
-	}
-	index_close(ident_idx_rel, AccessShareLock);
 
 	/*
 	 * The "user_catalog_table" relation option is essential for the initial
@@ -442,7 +405,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * took place that allows for data inconsistency. That includes removal of
 	 * the "user_catalog_table" option.
 	 *
-	 * The relation was unlock for some time since last check, so pass NoLock.
+	 * The relation was unlocked for some time since last check, so pass
+	 * NoLock.
 	 *
 	 * XXX If replacing SPI with low level code (e.g. "relation rewrite") and
 	 * if this call of check_catalog_changes() appears to be the last one,
@@ -585,7 +549,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	ident_idx_dst = InvalidOid;
 	for (i = 0; i < nindexes; i++)
 	{
-		if (ident_idx_id == indexes_src[i])
+		if (ident_idx_src == indexes_src[i])
 		{
 			ident_idx_dst = indexes_dst[i];
 			break;
@@ -597,6 +561,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 		 * ago.
 		 */
 		elog(ERROR, "Identity index missing on the transient relation");
+
+	/*
+	 * Build scan key that we'll use to look for rows to be updated / deleted
+	 * during logical decoding.
+	 */
+	ident_key = build_identity_key(ident_idx_src, rel_src,
+								   &ident_key_nentries);
 
 	/*
 	 * Since the build of indexes could have taken relatively long time, it's
@@ -611,8 +582,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	check_catalog_changes(cat_state, AccessShareLock);
 
 	/* Process the first batch of concurrent changes. */
-	process_concurrent_changes(dstate, rel_dst, key, nkeys, indexes_dst,
-							   nindexes, ident_idx_dst);
+	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
+							   indexes_dst, nindexes, ident_idx_dst);
 	tuplestore_clear(dstate->data.tupstore);
 	tuplestore_clear(dstate->metadata.tupstore);
 
@@ -732,10 +703,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	CurrentResourceOwner = resowner_old;
 
 	/* Process the second batch of concurrent changes. */
-	process_concurrent_changes(dstate, rel_dst, key, nkeys, indexes_dst,
-							   nindexes, ident_idx_dst);
+	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
+							   indexes_dst, nindexes, ident_idx_dst);
 
-	pfree(key);
+	pfree(ident_key);
 	FreeTupleDesc(tup_desc);
 	tuplestore_end(dstate->data.tupstore);
 	FreeTupleDesc(dstate->metadata.tupdesc);
@@ -1502,6 +1473,7 @@ switch_snapshot(Snapshot snap_hist)
 	}
 }
 
+
 static void
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 	XLogRecPtr end_of_wal)
@@ -1834,6 +1806,60 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		pfree(opclasses);
 	}
 
+	return result;
+}
+
+/*
+ * Build scan key to process logical changes.
+ *
+ * Caller must hold at least AccessShareLock on rel_src.
+ */
+static ScanKey
+build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
+{
+	Relation	ident_idx_rel;
+	Form_pg_index	ident_idx;
+	int	n, i;
+	ScanKey	result;
+
+	Assert(OidIsValid(ident_idx_oid));
+	ident_idx_rel = index_open(ident_idx_oid, AccessShareLock);
+	ident_idx = ident_idx_rel->rd_index;
+	n = ident_idx->indnatts;
+	result = (ScanKey) palloc(sizeof(ScanKeyData) * n);
+	for (i = 0; i < n; i++)
+	{
+		ScanKey	entry;
+		int16	relattno;
+		TupleDesc	desc;
+		Form_pg_attribute	att;
+		Oid	opfamily, opno, opcode;
+
+		entry = &result[i];
+		relattno = ident_idx->indkey.values[i];
+		desc = rel_src->rd_att;
+		att = desc->attrs[relattno - 1];
+		opfamily = ident_idx_rel->rd_opfamily[i];
+		opno = get_opfamily_member(opfamily, att->atttypid, att->atttypid,
+								   BTEqualStrategyNumber);
+		if (!OidIsValid(opno))
+			elog(ERROR, "Failed to find = operator for type %u",
+				 att->atttypid);
+
+		opcode = get_opcode(opno);
+		if (!OidIsValid(opcode))
+			elog(ERROR, "Failed to find = operator for operator %u", opno);
+
+		/* Initialize everything but argument. */
+		ScanKeyInit(entry,
+					relattno,
+					BTEqualStrategyNumber, opcode,
+					(Datum) NULL);
+		entry->sk_collation = att->attcollation;
+	}
+	index_close(ident_idx_rel, AccessShareLock);
+
+	*nentries = n;
 	return result;
 }
 
