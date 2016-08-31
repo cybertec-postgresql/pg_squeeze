@@ -1591,7 +1591,6 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 			int i;
 			ItemPointerData	ctid;
 			Relation	index;
-			SnapshotData SnapshotDirty;
 
 			if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
@@ -1605,13 +1604,25 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 
 			/* No lock, the parent relation is not yet visible to others. */
 			index = index_open(ident_index, NoLock);
+
 			/*
-			 * TODO Find out what's different about SnapshotSelf or
-			 * DirtySnapshot (the snapshot affects processing of multiple
-			 * changes of the same row within the same transaction.)q
+			 * Find the tuple to be updated or deleted.
+			 *
+			 * XXX Not sure we need PushActiveSnapshot() - as the table is not
+			 * visible to other transactions, the xmin, xmax, xip, etc. fields
+			 * of the snapshot are not important, and CurrentSnapshot->curcid
+			 * should stay consistent with CommandCounterIncrement() even if
+			 * GetSnapshotData() gets called anytime.
+			 *
+			 * XXX As no other transactions are engaged, SnapshotSelf might
+			 * seem to prevent us from wasting values of the command counter
+			 * (as we do not update catalog here, cache invalidation is not
+			 * the reason to increment the counter). However, heap_update()
+			 * does require CommandCounterIncrement().
 			 */
-			InitDirtySnapshot(SnapshotDirty);
-			scan = index_beginscan(relation, index, &SnapshotDirty, nkeys, 0);
+			scan = index_beginscan(relation, index, GetTransactionSnapshot(),
+								   nkeys, 0);
+
 			index_rescan(scan, key, nkeys, NULL, 0);
 
 			/* Use the incoming tuple to finalize the scan key. */
@@ -1654,6 +1665,9 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 		else
 			elog(ERROR, "Unrecognized kind of change: %d", change_kind);
 
+		/* If there's any change, make it visible to the next iteration. */
+		if (change_kind != PG_SQUEEZE_CHANGE_UPDATE_OLD)
+			CommandCounterIncrement();
 		pfree(tup_meta);
 	}
 
