@@ -1925,7 +1925,7 @@ update_indexes(Relation heap, HeapTuple tuple, Oid *indexes, int nindexes)
 		{
 			AttrNumber	attno_heap;
 
-			attno_heap = ind_form->indkey.values[j];
+			attno_heap = ind_form->indkey.values[j] - 1;
 			values[j] = values_heap[attno_heap];
 			isnull[j] = isnull_heap[attno_heap];
 		}
