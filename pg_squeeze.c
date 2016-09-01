@@ -1528,14 +1528,6 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
  * create constraints, so relation->rd_replidindex field would be empty
  * anyway. But this approach might change in the future.)
  */
-/*
- * TODO Use the executor API - that takes care of constraints and indexes
- * (including index predicates), that we'll probably neeed to create after the
- * initial load. The question is how to generate a plan.
- *
- * If we take the "rewrite" approach, does the executor allow us to preserve
- * heap tuple header (xmin, xmax, flags etc.) of the original row?
- */
 static void
 process_concurrent_changes(DecodingOutputState *s, Relation relation,
 						   ScanKey key, int nkeys, Oid *indexes, int nindexes,
