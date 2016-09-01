@@ -2012,7 +2012,14 @@ swap_relation_files(Oid r1, Oid r2)
 	else
 		elog(ERROR, "cannot swap mapped relations");
 
-	/* set rel1's frozen Xid and minimum MultiXid */
+	/*
+	 * Set rel1's frozen Xid and minimum MultiXid so that they simply reflect
+	 * the status of the new storage.
+	 *
+	 * In PG core, swap_relation_files() receives the value as argument, and
+	 * those have just been used for heap rewriting, so they reflect the new
+	 * storage as well.
+	 */
 	if (relform1->relkind != RELKIND_INDEX)
 	{
 		TransactionId frozenXid;
