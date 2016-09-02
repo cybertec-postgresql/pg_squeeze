@@ -2013,24 +2013,32 @@ swap_relation_files(Oid r1, Oid r2)
 		elog(ERROR, "cannot swap mapped relations");
 
 	/*
-	 * Set rel1's frozen Xid and minimum MultiXid so that they simply reflect
-	 * the status of the new storage.
+	 * Set rel1's frozen Xid and minimum MultiXid so that they become the
+	 * lower bounds on XID.
 	 *
-	 * In PG core, swap_relation_files() receives the value as argument, and
-	 * those have just been used for heap rewriting, so they reflect the new
-	 * storage as well.
+	 * It'd probably be correct to copy the values from the original table,
+	 * but that would leave the tuples too far in the past. Thus VACUUM could
+	 * get overly eager about wrap-around avoidance (possibly including
+	 * unnecessary full scans), but would find very little work to do.
 	 */
 	if (relform1->relkind != RELKIND_INDEX)
 	{
 		TransactionId frozenXid;
 		MultiXactId cutoffMulti;
 
-		frozenXid = relform2->relfrozenxid;
+		frozenXid = RecentXmin;
 		Assert(TransactionIdIsNormal(frozenXid));
+		/*
+		 * Unlike CLUSTER command (see copy_heap_data()), we don't derive the
+		 * new value from any freeze-related configuration parameters, so
+		 * there should be no way to see the value go backwards.
+		 */
+		Assert(!TransactionIdPrecedes(frozenXid, relform2->relfrozenxid));
 		relform1->relfrozenxid = frozenXid;
 
-		cutoffMulti = relform2->relminmxid;
+		cutoffMulti = GetOldestMultiXactId();
 		Assert(MultiXactIdIsValid(cutoffMulti));
+		Assert(!MultiXactIdPrecedes(cutoffMulti, relform2->relminmxid));
 		relform1->relminmxid = cutoffMulti;
 	}
 
