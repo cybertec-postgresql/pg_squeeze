@@ -15,12 +15,14 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
 #include "nodes/makefuncs.h"
+#include "optimizer/planner.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalfuncs.h"
@@ -108,8 +110,10 @@ static void check_index_changes(Oid relid, IndexCatInfo *indexes,
 static void free_catalog_state(CatalogState *state);
 static void check_pg_class_changes(Oid relid, TransactionId xmin,
 								   LOCKMODE lock_held);
-static char *get_column_list(SPITupleTable *cat_data, bool create);
+static char *get_column_list(SPITupleTable *cat_data);
 static void switch_snapshot(Snapshot snap_hist);
+static void perform_initial_load(Relation rel_src, Oid cluster_idx_id,
+								 Snapshot snap_hist, Relation rel_dst);
 static void decode_concurrent_changes(LogicalDecodingContext *ctx,
 									  XLogRecPtr *startptr,
 									  XLogRecPtr end_of_wal);
@@ -121,7 +125,6 @@ static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
-static void unlock_table(Oid relid);
 static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
 						   int nindexes);
 static void swap_relation_files(Oid r1, Oid r2);
@@ -167,19 +170,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Relation	rel_src, rel_dst;
 	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
+	Oid	cluster_idx_id;
 	char	replident;
 	ScanKey	ident_key;
 	int	i, ident_key_nentries;
 	LogicalDecodingContext	*ctx;
 	Snapshot	snap_hist;
 	StringInfo	relname_tmp, stmt;
-	char	*relname_src, *relname_dst, *create_stmt;
+	char	*relname_src, *relname_dst;
 	bool	src_has_oids;
 	int	spi_res;
-	SPIPlanPtr	plan;
-	Portal	portal;
-	TupleTableSlot	*slot;
-	Tuplestorestate	*tsstate;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
 	DecodingOutputState	*dstate;
@@ -203,6 +203,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * RelationGetIndexList later again.
 	 */
 	ident_idx_src = rel_src->rd_replidindex;
+
+	/* TODO Accept the clustering index as function argument. ERROR if
+	 * rd_rel->relam != BTREE_AM_OID. */
+	cluster_idx_id = ident_idx_src;
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
@@ -339,9 +343,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 		elog(ERROR, "Failed to get definition of table %s (%d)",
 			 relname_dst, spi_res);
 
-	/* Return to presence so far. */
-	switch_snapshot(NULL);
-
 	/*
 	 * If user is removing columns concurrently, it'd cause ERROR during the
 	 * subsequent decoding anyway.
@@ -366,58 +367,17 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	resetStringInfo(stmt);
 	appendStringInfo(stmt, "CREATE TABLE %s ", relname_dst);
-	appendStringInfo(stmt, "(%s)", get_column_list(SPI_tuptable, true));
+	appendStringInfo(stmt, "(%s)", get_column_list(SPI_tuptable));
 	if (src_has_oids)
 		appendStringInfoString(stmt, " WITH OIDS");
-	create_stmt = pstrdup(stmt->data);
 
-	/*
-	 * Use the same SPI_tuptable to construct the query for the initial load.
-	 */
-	resetStringInfo(stmt);
-	appendStringInfo(stmt, "SELECT %s ",
-					 get_column_list(SPI_tuptable, false));
-	appendStringInfo(stmt, "FROM ONLY %s", relname_src);
-	/* TODO Add ORDER BY clause, to ensure clustering. */
-
-	if ((spi_res = SPI_exec(create_stmt, 0)) != SPI_OK_UTILITY)
-		elog(ERROR, "Failed to create temporary table %s (%d)",
-			 relname_dst, spi_res);
-
-	/*
-	 * Any activity concerning the initial load needs the historic
-	 * snapshot. Thus we ignore data changes another transaction might be
-	 * doing right now - we'll use logical decoding to retrieve them later.
-	 *
-	 * Note that we only retrieve the data now and put it into a temporary
-	 * storage. Insertion while using the historic snapshot (INSERT INTO
-	 * .. SELECT ...) probably isn't a good idea.
-	 */
-	switch_snapshot(snap_hist);
-	plan = SPI_prepare(stmt->data, 0, NULL);
-	if (plan == NULL)
-		elog(ERROR, "Failed to prepare plan");
+	/* Back to presence. */
 	switch_snapshot(NULL);
 
-	/*
-	 * Now that the plan exists, the source table is locked. We need at least
-	 * to know whether the catalog option was never changed, and that no DDL
-	 * took place that allows for data inconsistency. That includes removal of
-	 * the "user_catalog_table" option.
-	 *
-	 * The relation was unlocked for some time since last check, so pass
-	 * NoLock.
-	 *
-	 * XXX If replacing SPI with low level code (e.g. "relation rewrite") and
-	 * if this call of check_catalog_changes() appears to be the last one,
-	 * adjust (simplify) the code responsible for unlocking relid_src.
-	 */
-	check_catalog_changes(cat_state, NoLock);
-
-	/*
-	 * TODO Check in similar way that there's no change in pg_attribute. That
-	 * change includes renaming check_catalog_option to check_catalog_changes.
-	 */
+	/* Create the transient table. */
+	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_UTILITY)
+		elog(ERROR, "Failed to create transient table %s (%d)",
+			 relname_dst, spi_res);
 
 	/*
 	 * No lock is needed on the target relation - no other transaction should
@@ -427,60 +387,20 @@ squeeze_table(PG_FUNCTION_ARGS)
 	rel_dst = relation_openrv(relrv_dst, NoLock);
 	relid_dst = rel_dst->rd_id;
 
-	/*
-	 * The initial load starts by fetching data from the source table and
-	 * should not include concurrent changes.
-	 */
-	switch_snapshot(snap_hist);
+	/* The source relation will be needed for the initial load. */
+	rel_src = heap_open(relid_src, AccessShareLock);
 
 	/*
-	 * TODO Tune the in-memory size. That may include dynamic adjustments of
-	 * the limit of SPI_cursor_fetch().
+	 * We need at least to know whether the catalog option was never changed,
+	 * and that no DDL took place that allows for data inconsistency. That
+	 * includes removal of the "user_catalog_table" option.
+	 *
+	 * The relation was unlocked for some time since last check, so pass
+	 * NoLock.
 	 */
-	slot = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(slot, tup_desc);
-	tsstate = tuplestore_begin_heap(false, false, work_mem);
-	portal = SPI_cursor_open(NULL, plan, NULL, NULL, true);
-	while (true)
-	{
-		int	i;
+	check_catalog_changes(cat_state, NoLock);
 
-		SPI_cursor_fetch(portal, true, 1024);
-
-		/* Done? */
-		if (SPI_processed == 0)
-			break;
-
-		for (i = 0; i < SPI_processed; i++)
-		{
-			tuplestore_puttuple(tsstate, SPI_tuptable->vals[i]);
-		}
-
-		/*
-		 * TODO consider additional fetch if the tuplestore seems to be have
-		 * enough memory for the next batch.
-		 */
-
-		/* Insert the tuples into the target table. */
-		switch_snapshot(NULL);
-		while (tuplestore_gettupleslot(tsstate, true, false, slot))
-		{
-			HeapTuple tup;
-
-			tup = ExecCopySlotTuple(slot);
-			/* TODO Enable bulk insert. */
-			heap_insert(rel_dst, tup, GetCurrentCommandId(true), 0, NULL);
-			pfree(tup);
-		}
-		tuplestore_clear(tsstate);
-		switch_snapshot(snap_hist);
-	}
-	SPI_cursor_close(portal);
-	tuplestore_end(tsstate);
-	ExecDropSingleTupleTableSlot(slot);
-
-	/* The historic snapshot is no longer needed. */
-	switch_snapshot(NULL);
+	perform_initial_load(rel_src, cluster_idx_id, snap_hist, rel_dst);
 
 	/*
 	 * Make sure the logical changes can UPDATE existing rows of the target
@@ -529,21 +449,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
 
+	/* At least the identity index should exist. */
+	Assert(nindexes > 0);
+
 	/*
-	 * Create indexes on the temporary table if the source table has some -
-	 * that might take a while. (Unlike the concurrent changes, which we
-	 * insert into existing indexes.)
-	 *
-	 * The lock acquired for the initial load query should still be effective,
-	 * so don't request any additional lock.
+	 * Create indexes on the temporary table - that might take a
+	 * while. (Unlike the concurrent changes, which we insert into existing
+	 * indexes.)
 	 */
-	if (nindexes > 0)
-	{
-		rel_src = relation_open(relid_src, NoLock);
-		indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
-											  nindexes);
-		relation_close(rel_src, NoLock);
-	}
+	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
+										  nindexes);
 
 	/* Find "identity index" of the transient relation. */
 	ident_idx_dst = InvalidOid;
@@ -588,24 +503,15 @@ squeeze_table(PG_FUNCTION_ARGS)
 	tuplestore_clear(dstate->metadata.tupstore);
 
 	/*
-	 * Before we request exclusive lock, release the shared one acquired by
-	 * SPI (to perform the initial load) above. Otherwise we risk a deadlock
-	 * if some other transaction holds shared lock and tries to get exclusive
-	 * one at the moment.
+	 * Before we request exclusive lock, release the shared one acquired for
+	 * the initial load. Otherwise we risk a deadlock if some other
+	 * transaction holds shared lock and tries to get exclusive one at the
+	 * moment.
 	 *
 	 * As we haven't changed the catalog entry yet, there's no need to send
 	 * invalidation messages.
 	 */
-	unlock_table(relid_src);
-	/* Do the same for indexes. */
-	for (i = 0; i < nindexes; i++)
-	{
-		/*
-		 * There's only one lock per index: SPI_cursor_open() -> ... ->
-		 * ScanQueryForLocks().
-		 */
-		UnlockRelationOid(indexes_src[i], AccessShareLock);
-	}
+	heap_close(rel_src, AccessShareLock);
 
 	/*
 	 * This (supposedly cheap) special check should avoid one particular
@@ -665,7 +571,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * case, ERROR will be raised during the catalog check below.
 	 */
 	for (i = 0; i < nindexes; i++)
-		LockRelationOid(indexes_src[i], AccessShareLock);
+		LockRelationOid(indexes_src[i], AccessExclusiveLock);
 
 	/*
 	 * Check the source relation for DDLs once again. If this check passes, no
@@ -1344,12 +1250,11 @@ free_catalog_state(CatalogState *state)
 }
 
 /*
- * Create column list out of a set of catalog tuples. If "create" is true, the
- * list will be used for CREATE TABLE command, otherwise it's a target list of
- * SELECT.
+ * Create column list out of a set of catalog tuples, to be used in CREATE
+ * TABLE command.
  */
 static char *
-get_column_list(SPITupleTable *cat_data, bool create)
+get_column_list(SPITupleTable *cat_data)
 {
 	TupleDesc	tupdesc;
 	int	i, j;
@@ -1378,22 +1283,17 @@ get_column_list(SPITupleTable *cat_data, bool create)
 		}
 		else
 		{
-			if (create)
-			{
-				/*
-				 * Dropped column must be preserved as a placeholder, so that
-				 * pg_attribute works for the new table.
-				 */
-				if (colname_buf == NULL)
-					/* First time through. */
-					colname_buf = makeStringInfo();
-				else
-					resetStringInfo(colname_buf);
-				appendStringInfo(colname_buf, "dropped_%d", j++);
-				colname = colname_buf->data;
-			}
+			/*
+			 * Dropped column must be preserved as a placeholder, so that
+			 * pg_attribute works for the new table.
+			 */
+			if (colname_buf == NULL)
+				/* First time through. */
+				colname_buf = makeStringInfo();
 			else
-				colname = "NULL";
+				resetStringInfo(colname_buf);
+			appendStringInfo(colname_buf, "dropped_%d", j++);
+			colname = colname_buf->data;
 
 			/*
 			 * pg_attribute(atttypid) is no longer available, so use arbitrary
@@ -1405,15 +1305,7 @@ get_column_list(SPITupleTable *cat_data, bool create)
 		if (i > 0)
 			appendStringInfoString(result, ", ");
 
-		if (create)
-			appendStringInfo(result, "%s %s", colname, typname);
-		else
-		{
-			if (!DatumGetBool(isdropped))
-				appendStringInfoString(result, colname);
-			else
-				appendStringInfo(result, "%s::%s", colname, typname);
-		}
+		appendStringInfo(result, "%s %s", colname, typname);
 	}
 
 	return result->data;
@@ -1473,6 +1365,166 @@ switch_snapshot(Snapshot snap_hist)
 	}
 }
 
+/*
+ * Use snap_hist snapshot to get the relevant data from rel_src and insert it
+ * into rel_dst.
+ *
+ * Caller is responsible for opening and locking both relations.
+ */
+static void
+perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
+					 Relation rel_dst)
+{
+	bool	use_sort;
+	int	batch_size, batch_max_size;
+	Tuplesortstate *tuplesort = NULL;
+	Relation	cluster_idx = NULL;
+	HeapScanDesc	heap_scan = NULL;
+	IndexScanDesc	index_scan = NULL;
+	HeapTuple	*tuples = NULL;
+
+	/*
+	 * The initial load starts by fetching data from the source table and
+	 * should not include concurrent changes.
+	 */
+	switch_snapshot(snap_hist);
+
+	if (OidIsValid(cluster_idx_id))
+	{
+		cluster_idx = relation_open(cluster_idx_id, AccessShareLock);
+		Assert(cluster_idx->rd_rel->relam == BTREE_AM_OID);
+		use_sort = plan_cluster_use_sort(rel_src->rd_id, cluster_idx_id);
+	}
+	else
+		use_sort = false;
+
+	if (use_sort)
+	{
+		heap_scan = heap_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
+
+		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
+											cluster_idx, maintenance_work_mem,
+											false);
+	}
+	else
+	{
+		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, 0, 0);
+		index_rescan(index_scan, NULL, 0, NULL, 0);
+	}
+
+	/*
+	 * TODO Unless tuplesort is used, tune the batch_max_size and consider
+	 * automatic adjustment, so that maintenance_work_mem is not
+	 * exceeded. (The current low value is there for development purposes
+	 * only.)
+	 */
+	batch_max_size = 2;
+	if (!use_sort)
+		tuples = (HeapTuple *) palloc0(batch_max_size * sizeof(HeapTuple));
+	while (true)
+	{
+		HeapTuple	tup_in;
+		int	i = 0;
+
+		/* Sorting cannot be split into batches. */
+		for (; use_sort || i < batch_max_size; i++)
+		{
+			tup_in = use_sort ?
+				heap_getnext(heap_scan, ForwardScanDirection) :
+				index_getnext(index_scan, ForwardScanDirection);
+			if (tup_in != NULL)
+			{
+				if (use_sort)
+					tuplesort_putheaptuple(tuplesort, tup_in);
+				else
+					tuples[i] = heap_copytuple(tup_in);
+			}
+			else
+				break;
+		}
+
+		/*
+		 * Insert the tuples into the target table.
+		 *
+		 * check_catalog_changes() shouldn't be necessary as long as the
+		 * AccessSqhareLock we hold on the source relation does not allow
+		 * change of table type. (Should ALTER INDEX take place concurrently,
+		 * it does not break the heap insertions. In such a case we'll find
+		 * out later that we need to terminate processing of the current
+		 * table, but it's probably not worth checking each batch.)
+		 */
+		switch_snapshot(NULL);
+
+		if (use_sort)
+			tuplesort_performsort(tuplesort);
+		else
+		{
+			/*
+			 * It's probably safer not to do this test in the generic case: in
+			 * theory, the counter might end up zero as a result of
+			 * overflow. (For the unsorted case we assume reasonable batch
+			 * size.)
+			 */
+			if (i == 0)
+				break;
+		}
+
+		batch_size = i;
+		i = 0;
+		while (true)
+		{
+			HeapTuple	tup_out;
+			bool	should_free = false;;
+
+			if (use_sort)
+				tup_out = tuplesort_getheaptuple(tuplesort, true,
+												 &should_free);
+			else
+			{
+				if (i == batch_size)
+					tup_out = NULL;
+				else
+					tup_out = tuples[i++];
+			}
+
+			if (tup_out == NULL)
+				break;
+
+
+			/* TODO Enable bulk insert. */
+			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0, NULL);
+			if (!use_sort && should_free)
+				pfree(tup_out);
+		}
+
+		if (tup_in == NULL)
+			break;
+
+		switch_snapshot(snap_hist);
+	}
+	/*
+	 * At whichever stage the loop broke, the historic snapshot should no
+	 * longer be active.
+	 */
+
+	/* Cleanup. */
+	if (use_sort)
+		tuplesort_end(tuplesort);
+	else
+		pfree(tuples);
+
+	if (heap_scan != NULL)
+		heap_endscan(heap_scan);
+	if (index_scan != NULL)
+		index_endscan(index_scan);
+
+	/*
+	 * Unlock the index, but not the relation yet - caller will do so when
+	 * appropriate.
+	 */
+	if (cluster_idx != NULL)
+		relation_close(cluster_idx, AccessShareLock);
+}
 
 static void
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
@@ -1869,28 +1921,6 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 	return result;
 }
 
-static void
-unlock_table(Oid relid)
-{
-	ResourceOwner	resowner_old;
-
-	/* There are supposedly 3 locks: one acquired by SPI_prepared() (see
-	 * transformTableEntry())and two by SPI_cursor_open() (see PortalStart()
-	 * and ScanQueryForLocks()) - the expected lock mode is always
-	 * AccessShareLock.
-	 */
-	UnlockRelationOid(relid, AccessShareLock);
-	UnlockRelationOid(relid, AccessShareLock);
-	/*
-	 * The last one should have been re-assigned to the top transaction by
-	 * SPI_cursor_close(). (All this unlocking stuff is ugly, but I have no
-	 * better idea right now.)
-	 */
-	resowner_old = CurrentResourceOwner;
-	CurrentResourceOwner = TopTransactionResourceOwner;
-	UnlockRelationOid(relid, AccessShareLock);
-	CurrentResourceOwner = resowner_old;
-}
 
 /* Insert ctid into all indexes of relation. */
 static void
