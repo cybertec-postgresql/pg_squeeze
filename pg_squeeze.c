@@ -112,7 +112,7 @@ static void check_pg_class_changes(Oid relid, TransactionId xmin,
 								   LOCKMODE lock_held);
 static char *get_column_list(SPITupleTable *cat_data);
 static void switch_snapshot(Snapshot snap_hist);
-static void perform_initial_load(Relation rel_src, Oid cluster_idx_id,
+static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst);
 static void decode_concurrent_changes(LogicalDecodingContext *ctx,
 									  XLogRecPtr *startptr,
@@ -167,10 +167,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 {
 	text	   *relname;
 	RangeVar   *relrv_src, *relrv_dst;
+	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
 	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
-	Oid	cluster_idx_id;
 	char	replident;
 	ScanKey	ident_key;
 	int	i, ident_key_nentries;
@@ -196,6 +196,25 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* TODO Consider heap_open() / heap_close(). */
 	rel_src = relation_openrv(relrv_src, AccessShareLock);
 
+	/*
+	 * Clustering index, if any.
+	 *
+	 * Do not lock the index so far, e.g. just to retrieve OID and to keep it
+	 * valid. Neither the relation can be locked continuously, so by keeping
+	 * the index locked alone we'd introduce incorrect order of
+	 * locking. Although we use only share locks in most cases (so I'm not
+	 * aware of particular deadlock scenario), it doesn't seem wise. The worst
+	 * consequence of not locking is that perform_initial_load() will error
+	 * out.
+	 */
+	if (!PG_ARGISNULL(1))
+	{
+		text	*indname;
+
+		indname = PG_GETARG_TEXT_P(1);
+		relrv_cl_idx = makeRangeVar(NULL, text_to_cstring(indname), -1);
+	}
+
 	RelationGetIndexList(rel_src);
 	replident = rel_src->rd_rel->relreplident;
 	/*
@@ -203,10 +222,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * RelationGetIndexList later again.
 	 */
 	ident_idx_src = rel_src->rd_replidindex;
-
-	/* TODO Accept the clustering index as function argument. ERROR if
-	 * rd_rel->relam != BTREE_AM_OID. */
-	cluster_idx_id = ident_idx_src;
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
@@ -401,7 +416,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	check_catalog_changes(cat_state, NoLock);
 
-	perform_initial_load(rel_src, cluster_idx_id, snap_hist, rel_dst);
+	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
 
 	/*
 	 * Make sure the logical changes can UPDATE existing rows of the target
@@ -1377,8 +1392,8 @@ switch_snapshot(Snapshot snap_hist)
  * Caller is responsible for opening and locking both relations.
  */
 static void
-perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
-					 Relation rel_dst)
+perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
+					 Snapshot snap_hist, Relation rel_dst)
 {
 	bool	use_sort;
 	int	batch_size, batch_max_size;
@@ -1395,10 +1410,13 @@ perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
 	 */
 	switch_snapshot(snap_hist);
 
-	if (OidIsValid(cluster_idx_id))
+	if (cluster_idx_rv != NULL)
 	{
-		cluster_idx = relation_open(cluster_idx_id, AccessShareLock);
-		Assert(cluster_idx->rd_rel->relam == BTREE_AM_OID);
+		cluster_idx = relation_openrv(cluster_idx_rv, AccessShareLock);
+
+		if (cluster_idx->rd_rel->relam != BTREE_AM_OID)
+			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							errmsg("Only B-tree index can be used for clustering")));
 
 		/*
 		 * Decide whether index scan or explicit sort should be used.
@@ -1410,7 +1428,7 @@ perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
 		res_owner_plan = ResourceOwnerCreate(res_owner_old,
 											 "use_sort owner");
 		CurrentResourceOwner = res_owner_plan;
-		use_sort = plan_cluster_use_sort(rel_src->rd_id, cluster_idx_id);
+		use_sort = plan_cluster_use_sort(rel_src->rd_id, cluster_idx->rd_id);
 
 		/*
 		 * Now use the special resource owner to release those planner
@@ -1431,19 +1449,18 @@ perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
 	else
 		use_sort = false;
 
-	if (use_sort)
-	{
+	if (use_sort || cluster_idx == NULL)
 		heap_scan = heap_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
-
-		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
-											cluster_idx, maintenance_work_mem,
-											false);
-	}
 	else
 	{
 		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, 0, 0);
 		index_rescan(index_scan, NULL, 0, NULL, 0);
 	}
+
+	if (use_sort)
+		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
+											cluster_idx, maintenance_work_mem,
+											false);
 
 	/*
 	 * TODO Unless tuplesort is used, tune the batch_max_size and consider
@@ -1462,7 +1479,7 @@ perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
 		/* Sorting cannot be split into batches. */
 		for (; use_sort || i < batch_max_size; i++)
 		{
-			tup_in = use_sort ?
+			tup_in = use_sort || cluster_idx == NULL ?
 				heap_getnext(heap_scan, ForwardScanDirection) :
 				index_getnext(index_scan, ForwardScanDirection);
 			if (tup_in != NULL)
