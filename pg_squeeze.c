@@ -1382,6 +1382,7 @@ perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
 	HeapScanDesc	heap_scan = NULL;
 	IndexScanDesc	index_scan = NULL;
 	HeapTuple	*tuples = NULL;
+	ResourceOwner	res_owner_old, res_owner_plan;
 
 	/*
 	 * The initial load starts by fetching data from the source table and
@@ -1393,7 +1394,34 @@ perform_initial_load(Relation rel_src, Oid cluster_idx_id, Snapshot snap_hist,
 	{
 		cluster_idx = relation_open(cluster_idx_id, AccessShareLock);
 		Assert(cluster_idx->rd_rel->relam == BTREE_AM_OID);
+
+		/*
+		 * Decide whether index scan or explicit sort should be used.
+		 *
+		 * Caller does not expect to see any additional locks, so use a
+		 * separate resource owner to keep track of them.
+		 */
+		res_owner_old = CurrentResourceOwner;
+		res_owner_plan = ResourceOwnerCreate(res_owner_old,
+											 "use_sort owner");
+		CurrentResourceOwner = res_owner_plan;
 		use_sort = plan_cluster_use_sort(rel_src->rd_id, cluster_idx_id);
+
+		/*
+		 * Now use the special resource owner to release those planner
+		 * locks. In fact this owner should contain any other resources, that
+		 * the planner might have allocated. Release them all, to avoid leak.
+		 */
+		ResourceOwnerRelease(CurrentResourceOwner,
+							 RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
+		ResourceOwnerRelease(CurrentResourceOwner,
+							 RESOURCE_RELEASE_LOCKS, false, false);
+		ResourceOwnerRelease(CurrentResourceOwner,
+							 RESOURCE_RELEASE_AFTER_LOCKS, false, false);
+
+		/* Cleanup. */
+		CurrentResourceOwner = res_owner_old;
+		ResourceOwnerDelete(res_owner_plan);
 	}
 	else
 		use_sort = false;
