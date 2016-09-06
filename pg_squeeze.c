@@ -445,8 +445,15 @@ squeeze_table(PG_FUNCTION_ARGS)
 	CurrentResourceOwner = resowner_old;
 
 	/*
-	 * Check if any disruptive DDL took place concurrently. Index build can
-	 * take quite some effort and we don't want to waste it.
+	 * Check for concurrent changes that would make us stop working later.
+	 * Index build can take quite some effort and we don't want to waste it.
+	 *
+	 * Note: The reason we haven't released the relation lock immediately
+	 * after perform_initial_load() is that the lock might make catalog checks
+	 * easier, if check_catalog_changes() gets improved someday. However, as
+	 * we need to release the lock later anyway, the current lock does not
+	 * prevent already waiting backends from breaking our work. That's why we
+	 * don't spend extra effort to lock indexes of the source relation.
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
 
