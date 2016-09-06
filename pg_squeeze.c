@@ -271,16 +271,17 @@ squeeze_table(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 (errmsg("At least one index is invalid"))));
 
-	nindexes = cat_state->relninds;
-	if (nindexes > 0)
-	{
-		int		j;
+	/* Valid identity index should exist now. */
+	Assert(OidIsValid(ident_idx_src));
 
-		/* Copy the OIDs into a separate array, for convenient use later. */
-		indexes_src = (Oid *) palloc(cat_state->relninds * sizeof(Oid));
-		for (j = 0; j < cat_state->relninds; j++)
-			indexes_src[j] = cat_state->indexes[j].oid;
-	}
+	/* Therefore the total number of indexes is non-zero. */
+	nindexes = cat_state->relninds;
+	Assert(nindexes > 0);
+
+	/* Copy the OIDs into a separate array, for convenient use later. */
+	indexes_src = (Oid *) palloc(nindexes * sizeof(Oid));
+	for (i = 0; i < nindexes; i++)
+		indexes_src[i] = cat_state->indexes[i].oid;
 
 	src_has_oids = rel_src->rd_rel->relhasoids;
 
@@ -448,9 +449,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * take quite some effort and we don't want to waste it.
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
-
-	/* At least the identity index should exist. */
-	Assert(nindexes > 0);
 
 	/*
 	 * Create indexes on the temporary table - that might take a
