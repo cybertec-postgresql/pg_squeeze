@@ -1543,7 +1543,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 			/* TODO Enable bulk insert. */
 			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0, NULL);
-			if (!use_sort && should_free)
+			if (!use_sort || should_free)
 				pfree(tup_out);
 		}
 
