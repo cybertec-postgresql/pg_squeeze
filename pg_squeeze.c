@@ -1332,9 +1332,16 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	{
 		cluster_idx = relation_openrv(cluster_idx_rv, AccessShareLock);
 
+		if (cluster_idx->rd_rel->relkind != RELKIND_INDEX)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("Relation \"%s\" is not an index",
+							cluster_idx_rv->relname)));
+
 		if (cluster_idx->rd_rel->relam != BTREE_AM_OID)
-			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("Only B-tree index can be used for clustering")));
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("Only B-tree index can be used for clustering")));
 
 		/*
 		 * Decide whether index scan or explicit sort should be used.
