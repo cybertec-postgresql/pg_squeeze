@@ -11,6 +11,7 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -74,8 +75,9 @@ typedef struct CatalogState
 	/* Has the source relation the "user_catalog_table" option set? */
 	bool		is_catalog;
 
-	/* pg_class(relnatts) */
-	int16		relnatts;
+	/* Copy of pg_class tuple. */
+	Form_pg_class	form_class;
+
 	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
 	TransactionId	*attr_xmins;
 
@@ -110,7 +112,6 @@ static void check_index_changes(Oid relid, IndexCatInfo *indexes,
 static void free_catalog_state(CatalogState *state);
 static void check_pg_class_changes(Oid relid, TransactionId xmin,
 								   LOCKMODE lock_held);
-static char *get_column_list(SPITupleTable *cat_data);
 static void switch_snapshot(Snapshot snap_hist);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst);
@@ -166,7 +167,7 @@ Datum
 squeeze_table(PG_FUNCTION_ARGS)
 {
 	text	   *relname;
-	RangeVar   *relrv_src, *relrv_dst;
+	RangeVar   *relrv_src;
 	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
 	Oid	ident_idx_src, ident_idx_dst;
@@ -178,7 +179,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Snapshot	snap_hist;
 	StringInfo	relname_tmp, stmt;
 	char	*relname_src, *relname_dst;
-	bool	src_has_oids;
 	int	spi_res;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
@@ -190,6 +190,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Oid	*indexes_src = NULL, *indexes_dst = NULL;
 	bool	invalid_index = false;
 	IndexCatInfo	*ind_info;
+	Form_pg_class	form_class;
 
 	relname = PG_GETARG_TEXT_P(0);
 	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
@@ -269,8 +270,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Info to initialize tuple slot to retrieve tuples from tuplestore during
 	 * the initial load.
 	 */
-	/* TODO Use check_catalog_changes() to retrieve (a local copy) this
-	 * info. */
 	tup_desc = CreateTupleDescCopy(RelationGetDescr(rel_src));
 
 	/* Get ready for the subsequent calls of check_catalog_changes(). */
@@ -285,6 +284,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 (errmsg("At least one index is invalid"))));
+	/*
+	 * TODO If the number of columns is non-zero, check if there's at least
+	 * one valid (not dropped).
+	 */
+	if (cat_state->form_class->relnatts < 1)
+		/* XXX Try to find better error code. */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 (errmsg("Table \"%s\" has no valid columns",
+						 relrv_src->relname))));
 
 	/* Valid identity index should exist now. */
 	Assert(OidIsValid(ident_idx_src));
@@ -297,8 +306,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	indexes_src = (Oid *) palloc(nindexes * sizeof(Oid));
 	for (i = 0; i < nindexes; i++)
 		indexes_src[i] = cat_state->indexes[i].oid;
-
-	src_has_oids = rel_src->rd_rel->relhasoids;
 
 	/*
 	 * The relation shouldn't be locked during slot setup. Otherwise another
@@ -323,85 +330,35 @@ squeeze_table(PG_FUNCTION_ARGS)
 	snap_hist = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder,
 											InvalidTransactionId);
 
-	switch_snapshot(snap_hist);
-
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-
 	/*
-	 * Create a new table.
-	 *
-	 * CREATE TABLE ... LIKE ... would be great but the command is implemented
-	 * in a way that does not like historic snapshot (i.e. it can't see the
-	 * newly created relation). Therefore we need to construct the DDL
-	 * "manually" and execute with the existing transaction snapshot.
-	 *
-	 * The historic snapshot is still used to retrieve the current table
-	 * definition. Thus if anyone changes the table concurrently, he'll
-	 * (correctly) cause ERROR during decoding later.
+	 * Create "transient" table.
 	 */
-	relname_src = quote_qualified_identifier(relrv_src->schemaname,
-											 relrv_src->relname);
 	relname_tmp = makeStringInfo();
 	appendStringInfo(relname_tmp, "tmp_%u", relid_src);
 	relname_dst = quote_qualified_identifier(relrv_src->schemaname,
 											 relname_tmp->data);
 
-	stmt = makeStringInfo();
-	appendStringInfo(stmt,
-					 "SELECT a.attname, a.attisdropped, "
-					 "  pg_catalog.format_type(a.atttypid, NULL)"
-					 "FROM pg_catalog.pg_attribute a "
-					 "WHERE a.attrelid = %u AND a.attnum > 0 "
-					 "ORDER BY a.attnum", relid_src);
-
-	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_SELECT)
-		elog(ERROR, "Failed to get definition of table %s (%d)",
-			 relname_dst, spi_res);
-
 	/*
-	 * If user is removing columns concurrently, it'd cause ERROR during the
-	 * subsequent decoding anyway.
-	 */
-	/*
-	 * TODO If the number of columns is non-zero, check if there's at least
-	 * one valid (not dropped).
-	 */
-	if (SPI_processed < 1)
-		/* XXX Try to find better error code. */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 (errmsg("Table %s has no valid columns",
-						 relname_src))));
-
-	/*
-	 * Construct CREATE TABLE command.
-	 *
 	 * Constraints are not created because each data change must be committed
 	 * in the source table before we see it during initial load or via logical
 	 * decoding.
 	 */
-	resetStringInfo(stmt);
-	appendStringInfo(stmt, "CREATE TABLE %s ", relname_dst);
-	appendStringInfo(stmt, "(%s)", get_column_list(SPI_tuptable));
-	if (src_has_oids)
-		appendStringInfoString(stmt, " WITH OIDS");
-
-	/* Back to presence. */
-	switch_snapshot(NULL);
-
-	/* Create the transient table. */
-	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_UTILITY)
-		elog(ERROR, "Failed to create transient table %s (%d)",
-			 relname_dst, spi_res);
+	form_class = cat_state->form_class;
+	relid_dst = heap_create_with_catalog(
+		relname_tmp->data,
+		form_class->relnamespace, form_class->reltablespace,
+		InvalidOid, InvalidOid, InvalidOid,
+		form_class->relowner, tup_desc, NIL,
+		form_class->relkind, form_class->relpersistence,
+		false, false, true, 0,
+		ONCOMMIT_NOOP, (Datum) 0,
+		false, false, false, NULL);
 
 	/*
 	 * No lock is needed on the target relation - no other transaction should
 	 * be able to see it yet.
 	 */
-	relrv_dst = makeRangeVar(relrv_src->schemaname, relname_tmp->data, -1);
-	rel_dst = relation_openrv(relrv_dst, NoLock);
-	relid_dst = rel_dst->rd_id;
+	rel_dst = heap_open(relid_dst, NoLock);
 
 	/* The source relation will be needed for the initial load. */
 	rel_src = heap_open(relid_src, AccessShareLock);
@@ -641,7 +598,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* The destination table is no longer necessary, so close it. */
 	/* XXX (Should have been closed right after
 	 * process_concurrent_changes()?) */
-	relation_close(rel_dst, NoLock);
+	heap_close(rel_dst, NoLock);
 
 	/*
 	 * Exchange storage and indexes between the source and destination
@@ -680,9 +637,14 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * constraint for the "reorganized" table - that shouldn't need vacuum for
 	 * some time.
 	 */
-	resetStringInfo(stmt);
+	stmt = makeStringInfo();
+	relname_src = quote_qualified_identifier(relrv_src->schemaname,
+											 relrv_src->relname);
 	appendStringInfo(stmt, "ALTER TABLE %s SET (user_catalog_table=false)",
 					 relname_src);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
 
 	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_UTILITY)
 		elog(ERROR, "Failed to set \"user_catalog_table\" option (%d)",
@@ -801,13 +763,11 @@ get_catalog_state(Oid relid)
 	 * snapshot "freshness".
 	 *
 	 * The same snapshot is used for all the catalog scans in this function,
-	 * but it's not critical. If someone managed to change attribute or index
-	 * concurrently (shouldn't happen because AccessShareLock should be held
-	 * on the source relation now), new snapshot could see the change(s), but
-	 * snapshot builder should also include them into the first historic
-	 * snapshot (by waiting for the writing transaction(s) to commit). The
-	 * point is that only DDLs on the top of the first historic snapshot are
-	 * worth attention.
+	 * but it's not critical at the moment. If someone manages to change
+	 * attribute or index concurrently (shouldn't happen at least for
+	 * attributes because AccessShareLock should currently be held on the
+	 * source relation), the first call of check_catalog_changes() will reveal
+	 * the change.
 	 */
 	snapshot = GetCatalogSnapshot(relid);
 
@@ -841,7 +801,8 @@ get_catalog_state(Oid relid)
 
 	result->relid = relid;
 	result->is_catalog = true;
-	result->relnatts = form_class->relnatts;
+	result->form_class = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
+	memcpy(result->form_class, form_class, CLASS_TUPLE_SIZE);
 
 	/*
 	 * pg_class(xmin) helps to ensure that the "user_catalog_option" wasn't
@@ -859,8 +820,9 @@ get_catalog_state(Oid relid)
 	if (result->invalid_index)
 		return result;
 
-	if (result->relnatts > 0)
-		result->attr_xmins = get_attribute_xmins(relid, result->relnatts,
+	if (result->form_class->relnatts > 0)
+		result->attr_xmins = get_attribute_xmins(relid,
+												 result->form_class->relnatts,
 												 snapshot);
 
 	/* Cleanup. */
@@ -913,8 +875,15 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 		i = form->attnum - 1;
 		Assert(i == n);
 
+		/*
+		 * Caller should hold at least AccesShareLock on the owning relation,
+		 * supposedly no need for repalloc(). (elog() rather than Assert() as
+		 * it's not difficult to break this assumption during future coding.)
+		 */
+		if (n++ > relnatts)
+			elog(ERROR, "Relation %u has too many attributes", relid);
+
 		result[i] = HeapTupleHeaderGetXmin(tuple->t_data);
-		n++;
 	}
 	Assert(relnatts == n);
 	systable_endscan(scan);
@@ -1118,7 +1087,8 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 	 * also call them unconditionally.
 	 */
 	check_index_changes(state->relid, state->indexes, state->relninds);
-	check_attribute_changes(state->relid, state->attr_xmins, state->relnatts);
+	check_attribute_changes(state->relid, state->attr_xmins,
+							state->form_class->relnatts);
 }
 
 static void
@@ -1262,75 +1232,16 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 static void
 free_catalog_state(CatalogState *state)
 {
+	if (state->form_class)
+		pfree(state->form_class);
+
 	if (state->attr_xmins)
 		pfree(state->attr_xmins);
+
 	if (state->indexes)
 		pfree(state->indexes);
 	pfree(state);
 }
-
-/*
- * Create column list out of a set of catalog tuples, to be used in CREATE
- * TABLE command.
- */
-static char *
-get_column_list(SPITupleTable *cat_data)
-{
-	TupleDesc	tupdesc;
-	int	i, j;
-	StringInfo	result, colname_buf = NULL;
-
-	result = makeStringInfo();
-	tupdesc = SPI_tuptable->tupdesc;
-	j = 1;
-	for (i = 0; i < SPI_processed; i++)
-	{
-		HeapTuple	tup;
-		const char	*colname;
-		const char	*typname;
-		bool	valisnull;
-		Datum	isdropped;
-
-		tup = SPI_tuptable->vals[i];
-
-		isdropped = SPI_getbinval(tup, tupdesc, 2, &valisnull);
-		Assert(!valisnull);
-
-		if (!isdropped)
-		{
-			colname = quote_identifier(SPI_getvalue(tup, tupdesc, 1));
-			typname = SPI_getvalue(tup, tupdesc, 3);
-		}
-		else
-		{
-			/*
-			 * Dropped column must be preserved as a placeholder, so that
-			 * pg_attribute works for the new table.
-			 */
-			if (colname_buf == NULL)
-				/* First time through. */
-				colname_buf = makeStringInfo();
-			else
-				resetStringInfo(colname_buf);
-			appendStringInfo(colname_buf, "dropped_%d", j++);
-			colname = colname_buf->data;
-
-			/*
-			 * pg_attribute(atttypid) is no longer available, so use arbitrary
-			 * type. We'll only insert NULL values into the column.
-			 */
-			typname = "bool";
-		}
-
-		if (i > 0)
-			appendStringInfoString(result, ", ");
-
-		appendStringInfo(result, "%s %s", colname, typname);
-	}
-
-	return result->data;
-}
-
 
 /*
  * Install the passed historic snapshot or uninstall it if NULL is passed.
@@ -1360,13 +1271,6 @@ switch_snapshot(Snapshot snap_hist)
 		SetupHistoricSnapshot(snap_hist, NULL);
 
 		/*
-		 * The SPI uses GetActiveSnapshot() for read-only transactions and
-		 * GetTransactionSnapshot() for writing ones. Adjust both to see
-		 * consistent behavior.
-		 */
-		PushActiveSnapshot(snap_hist);
-
-		/*
 		 * We don't use the historic snapshot in the way SPI expects. Avoid
 		 * assertion failure in GetTransactionSnapshot() when it's called by
 		 * the SPI.
@@ -1380,8 +1284,6 @@ switch_snapshot(Snapshot snap_hist)
 		TeardownHistoricSnapshot(false);
 		/* Revert the hack done above. */
 		FirstSnapshotSet = true;
-
-		PopActiveSnapshot();
 	}
 }
 
