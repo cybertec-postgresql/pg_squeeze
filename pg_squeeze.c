@@ -373,7 +373,22 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	check_catalog_changes(cat_state, NoLock);
 
-	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
+	/*
+	 * The historic snapshot is used to retrieve data w/o concurrent
+	 * changes. It must not stay active afterwards.
+	 */
+	PG_TRY();
+	{
+		perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
+		TeardownHistoricSnapshot(true);
+	}
+	PG_CATCH();
+	{
+		TeardownHistoricSnapshot(true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 
 	/*
 	 * Make sure the logical changes can UPDATE existing rows of the target
@@ -1246,6 +1261,9 @@ free_catalog_state(CatalogState *state)
 /*
  * Install the passed historic snapshot or uninstall it if NULL is passed.
  *
+ * Caution: Caller is responsible for calling TeardownHistoricSnapshot()
+ * anytime ERROR is raised while the historic snapshot is active.
+ *
  * TODO
  *
  * 1. Consider if we'd better invalidate the whole catalog cache. (If so, use
@@ -1253,8 +1271,6 @@ free_catalog_state(CatalogState *state)
  *
  * 2. If the unused argument of TeardownHistoricSnapshot() is clarified, pass
  * it to this function too.
- *
- * 3. Make sure the historic snapshot is uninstalled on ERROR anywhere.
  */
 static void
 switch_snapshot(Snapshot snap_hist)
