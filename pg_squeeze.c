@@ -19,7 +19,6 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
-#include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
 #include "nodes/makefuncs.h"
@@ -184,9 +183,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	int	i, ident_key_nentries;
 	LogicalDecodingContext	*ctx;
 	Snapshot	snap_hist;
-	StringInfo	relname_tmp, stmt;
-	char	*relname_dst;
-	int	spi_res;
+	StringInfo	relname_tmp;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
 	DecodingOutputState	*dstate;
@@ -198,6 +195,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	bool	invalid_index = false;
 	IndexCatInfo	*ind_info;
 	Form_pg_class	form_class;
+	ObjectAddress	object;
 
 	relname = PG_GETARG_TEXT_P(0);
 	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
@@ -342,8 +340,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	relname_tmp = makeStringInfo();
 	appendStringInfo(relname_tmp, "tmp_%u", relid_src);
-	relname_dst = quote_qualified_identifier(relrv_src->schemaname,
-											 relname_tmp->data);
 
 	/*
 	 * Constraints are not created because each data change must be committed
@@ -627,6 +623,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	swap_relation_files(relid_src, relid_dst);
 	for (i = 0; i < nindexes; i++)
 		swap_relation_files(indexes_src[i], indexes_dst[i]);
+
 	if (nindexes > 0)
 	{
 		pfree(indexes_src);
@@ -663,17 +660,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* State not needed anymore. */
 	free_catalog_state(cat_state);
 
-	stmt = makeStringInfo();
-	appendStringInfo(stmt, "DROP TABLE %s", relname_dst);
-
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-
-	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_UTILITY)
-		elog(ERROR, "Failed to drop transient table (%d)", spi_res);
-
-	if (SPI_finish() != SPI_OK_FINISH)
-		elog(ERROR, "SPI_finish failed");
+	/* Drop the transient table (including indexes and constraints). */
+	object.classId = RelationRelationId;
+	object.objectSubId = 0;
+	object.objectId = relid_dst;
+	performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
 
 	PG_RETURN_VOID();
 }
