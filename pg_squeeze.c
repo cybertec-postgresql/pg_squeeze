@@ -675,14 +675,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 
-	/*
-	 * Ensure invalidation of the relation of caches of all other backends,
-	 * some possibly waiting for the relation exclusive lock. Invalidations
-	 * include closing of the old node at SMGR level, so that the now waiting
-	 * backends don't try to use the old node(s).
-	 */
-	CommandCounterIncrement();
-
 	PG_RETURN_VOID();
 }
 
