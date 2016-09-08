@@ -75,8 +75,14 @@ typedef struct CatalogState
 	/* Has the source relation the "user_catalog_table" option set? */
 	bool		is_catalog;
 
+	/* Backup of storage options, to be restored before commit. */
+	Datum	rel_options;
+
 	/* Copy of pg_class tuple. */
 	Form_pg_class	form_class;
+
+	/* Copy of pg_class tuple descriptor. */
+	TupleDesc	desc_class;
 
 	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
 	TransactionId	*attr_xmins;
@@ -129,6 +135,7 @@ static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
 						   int nindexes);
 static void swap_relation_files(Oid r1, Oid r2);
+static void clear_user_catalog_option(CatalogState *cat_state);
 
 /*
  * Char attribute to construct tuple descriptor for
@@ -178,7 +185,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	LogicalDecodingContext	*ctx;
 	Snapshot	snap_hist;
 	StringInfo	relname_tmp, stmt;
-	char	*relname_src, *relname_dst;
+	char	*relname_dst;
 	int	spi_res;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
@@ -577,8 +584,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * is kept while accessing user relation, deadlock can occur.
 	 */
 	check_catalog_changes(cat_state, NoLock);
-	/* This was the last check. */
-	free_catalog_state(cat_state);
 
 	/*
 	 * Flush anything we see in WAL, to make sure that all changes committed
@@ -652,21 +657,17 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * constraint for the "reorganized" table - that shouldn't need vacuum for
 	 * some time.
 	 */
+	CommandCounterIncrement();
+	clear_user_catalog_option(cat_state);
+
+	/* State not needed anymore. */
+	free_catalog_state(cat_state);
+
 	stmt = makeStringInfo();
-	relname_src = quote_qualified_identifier(relrv_src->schemaname,
-											 relrv_src->relname);
-	appendStringInfo(stmt, "ALTER TABLE %s SET (user_catalog_table=false)",
-					 relname_src);
+	appendStringInfo(stmt, "DROP TABLE %s", relname_dst);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-
-	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_UTILITY)
-		elog(ERROR, "Failed to set \"user_catalog_table\" option (%d)",
-			 spi_res);
-
-	resetStringInfo(stmt);
-	appendStringInfo(stmt, "DROP TABLE %s", relname_dst);
 
 	if ((spi_res = SPI_exec(stmt->data, 0)) != SPI_OK_UTILITY)
 		elog(ERROR, "Failed to drop transient table (%d)", spi_res);
@@ -762,6 +763,7 @@ get_catalog_state(Oid relid)
 	ScanKeyData key[1];
 	Snapshot	snapshot;
 	StdRdOptions *options;
+	bool	isnull;
 	CatalogState	*result;
 
 	/*
@@ -815,9 +817,14 @@ get_catalog_state(Oid relid)
 	}
 
 	result->relid = relid;
-	result->is_catalog = true;
 	result->form_class = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
+	result->desc_class = desc;
 	memcpy(result->form_class, form_class, CLASS_TUPLE_SIZE);
+	result->is_catalog = true;
+	result->rel_options = fastgetattr(tuple, Anum_pg_class_reloptions, desc,
+									  &isnull);
+	Assert(!isnull);
+	Assert(PointerIsValid(DatumGetPointer(result->rel_options)));
 
 	/*
 	 * pg_class(xmin) helps to ensure that the "user_catalog_option" wasn't
@@ -843,7 +850,6 @@ get_catalog_state(Oid relid)
 	/* Cleanup. */
 	systable_endscan(scan);
 	heap_close(rel, AccessShareLock);
-	pfree(desc);
 
 	return result;
 }
@@ -1249,6 +1255,9 @@ free_catalog_state(CatalogState *state)
 {
 	if (state->form_class)
 		pfree(state->form_class);
+
+	if (state->desc_class)
+		pfree(state->desc_class);
 
 	if (state->attr_xmins)
 		pfree(state->attr_xmins);
@@ -1954,7 +1963,7 @@ update_indexes(Relation heap, HeapTuple tuple, Oid *indexes, int nindexes)
  * Derived from swap_relation_files() in PG core, but removed anything we
  * don't need. Also incorporated the relevant parts of finish_heap_swap().
  *
- * Important: r1 is the relation to remain, r2 is the one to be dropped.
+ * Caution: r1 is the relation to remain, r2 is the one to be dropped.
  *
  * XXX Unlike PG core, we currently receive neither frozenXid nor cutoffMulti
  * arguments. Instead we only copy these fields from r2 to r1. This should
@@ -2131,4 +2140,51 @@ swap_relation_files(Oid r1, Oid r2)
 
 	RelationCloseSmgrByOid(r1);
 	RelationCloseSmgrByOid(r2);
+}
+
+/*
+ * Clear the "user_catalog_table" storage option of the source table.
+ */
+static void
+clear_user_catalog_option(CatalogState *cat_state)
+{
+	Relation	rel;
+	HeapTuple	tuple, tuple_new;
+	int	natts;
+	Datum	rel_options;
+	DefElem	*def;
+	List	*def_list = NIL;
+	Datum	*repl_vals;
+	bool	*repl_nulls, *do_repl;
+
+	natts = cat_state->desc_class->natts;
+	Assert(natts == Natts_pg_class);
+
+	repl_vals = (Datum *) palloc(natts * sizeof(Datum));
+	repl_nulls = (bool *) palloc0(natts * sizeof(bool));
+	do_repl = (bool *) palloc0(natts * sizeof(bool));
+
+	rel = heap_open(RelationRelationId, RowExclusiveLock);
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(cat_state->relid));
+	Assert(HeapTupleIsValid(tuple));
+
+	def = makeDefElem("user_catalog_table", NULL);
+	def_list = lappend(def_list, def);
+	rel_options = transformRelOptions(cat_state->rel_options, def_list, NULL,
+									  NULL, false, true);
+
+	if (rel_options != (Datum) 0)
+		repl_vals[Anum_pg_class_reloptions - 1] = rel_options;
+	else
+		repl_nulls[Anum_pg_class_reloptions - 1] = true;
+	do_repl[Anum_pg_class_reloptions - 1] = true;
+
+	tuple_new = heap_modify_tuple(tuple, cat_state->desc_class, repl_vals,
+								  repl_nulls, do_repl);
+	simple_heap_update(rel, &tuple_new->t_self, tuple_new);
+	CatalogUpdateIndexes(rel, tuple_new);
+
+	ReleaseSysCache(tuple);
+	heap_freetuple(tuple_new);
+	heap_close(rel, RowExclusiveLock);
 }
