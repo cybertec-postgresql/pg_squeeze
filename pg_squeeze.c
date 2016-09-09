@@ -81,6 +81,9 @@ typedef struct CatalogState
 	/* Copy of pg_class tuple descriptor. */
 	TupleDesc	desc_class;
 
+	/* Copy of pg_class(reloptions). */
+	Datum	reloptions;
+
 	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
 	TransactionId	*attr_xmins;
 
@@ -125,6 +128,7 @@ static void process_concurrent_changes(DecodingOutputState *s,
 									   Relation relation, ScanKey key,
 									   int nkeys, Oid *indexes, int nindexes,
 									   Oid ident_index);
+static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
@@ -175,13 +179,12 @@ squeeze_table(PG_FUNCTION_ARGS)
 	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
 	Oid	ident_idx_src, ident_idx_dst;
-	Oid	relid_src, relid_dst, rel_src_toastid;
+	Oid	relid_src, relid_dst;
 	char	replident;
 	ScanKey	ident_key;
 	int	i, ident_key_nentries;
 	LogicalDecodingContext	*ctx;
 	Snapshot	snap_hist;
-	StringInfo	relname_tmp;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
 	DecodingOutputState	*dstate;
@@ -192,7 +195,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Oid	*indexes_src = NULL, *indexes_dst = NULL;
 	bool	invalid_index = false;
 	IndexCatInfo	*ind_info;
-	Form_pg_class	form_class;
 	ObjectAddress	object;
 
 	relname = PG_GETARG_TEXT_P(0);
@@ -268,7 +270,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * the code less readable.
 	 */
 	relid_src = rel_src->rd_id;
-	rel_src_toastid = rel_src->rd_rel->reltoastrelid;
 
 	/*
 	 * Info to initialize tuple slot to retrieve tuples from tuplestore during
@@ -334,65 +335,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	snap_hist = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder,
 											InvalidTransactionId);
 
-	/*
-	 * Create "transient" table.
-	 */
-	relname_tmp = makeStringInfo();
-	appendStringInfo(relname_tmp, "tmp_%u", relid_src);
-
-	/*
-	 * Constraints are not created because each data change must be committed
-	 * in the source table before we see it during initial load or via logical
-	 * decoding.
-	 */
-	form_class = cat_state->form_class;
-	relid_dst = heap_create_with_catalog(
-		relname_tmp->data,
-		form_class->relnamespace, form_class->reltablespace,
-		InvalidOid, InvalidOid, InvalidOid,
-		form_class->relowner, tup_desc, NIL,
-		form_class->relkind, form_class->relpersistence,
-		false, false, true, 0,
-		ONCOMMIT_NOOP, (Datum) 0,
-		false, false, false, NULL);
-
-	Assert(OidIsValid(relid_dst));
-
-	/* Make sure the transient relation is visible.  */
-	CommandCounterIncrement();
-
-	/*
-	 * See cluster.c:make_new_heap() for details about the supposed
-	 * (non)existence of TOAST relation on both source and the transient
-	 * relations.
-	 */
-	if (OidIsValid(rel_src_toastid))
-	{
-		Datum	reloptions;
-		bool	is_null;
-		HeapTuple	tuple;
-
-		/* keep the existing toast table's reloptions, if any */
-		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(rel_src_toastid));
-		if (!HeapTupleIsValid(tuple))
-			elog(ERROR, "cache lookup failed for relation %u",
-				 rel_src_toastid);
-		reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
-									 &is_null);
-		if (is_null)
-			reloptions = (Datum) 0;
-
-		/*
-		 * No lock is needed on the target relation - no other transaction
-		 * should be able to see it yet.
-		 */
-		NewHeapCreateToastTable(relid_dst, reloptions, NoLock);
-
-		ReleaseSysCache(tuple);
-
-		/* Make sure the TOAST relation is visible.  */
-		CommandCounterIncrement();
-	}
+	relid_dst = create_transient_table(cat_state, tup_desc);
 
 	/* The source relation will be needed for the initial load. */
 	rel_src = heap_open(relid_src, AccessShareLock);
@@ -778,6 +721,8 @@ get_catalog_state(Oid relid)
 	SysScanDesc scan;
 	ScanKeyData key[1];
 	Snapshot	snapshot;
+	Datum	options_raw;
+	bool	isnull;
 	StdRdOptions *options;
 	CatalogState	*result;
 
@@ -832,9 +777,15 @@ get_catalog_state(Oid relid)
 	}
 
 	result->relid = relid;
-	result->form_class = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
 	result->desc_class = desc;
+	result->form_class = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
 	memcpy(result->form_class, form_class, CLASS_TUPLE_SIZE);
+
+	options_raw = fastgetattr(tuple, Anum_pg_class_reloptions, desc, &isnull);
+	Assert(!isnull);
+	Assert(PointerIsValid(DatumGetPointer(options_raw)));
+	result->reloptions = (Datum) PG_DETOAST_DATUM_COPY(options_raw);
+
 	result->is_catalog = true;
 
 	/*
@@ -853,9 +804,8 @@ get_catalog_state(Oid relid)
 	if (result->invalid_index)
 		return result;
 
-	if (result->form_class->relnatts > 0)
-		result->attr_xmins = get_attribute_xmins(relid,
-												 result->form_class->relnatts,
+	if (form_class->relnatts > 0)
+		result->attr_xmins = get_attribute_xmins(relid, form_class->relnatts,
 												 snapshot);
 
 	/* Cleanup. */
@@ -1269,6 +1219,9 @@ free_catalog_state(CatalogState *state)
 
 	if (state->desc_class)
 		pfree(state->desc_class);
+
+	if (state->reloptions)
+		pfree(state->reloptions);
 
 	if (state->attr_xmins)
 		pfree(state->attr_xmins);
@@ -1719,6 +1672,82 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 }
 
 /*
+ * Create a table into which we'll copy the contents of the source table, as
+ * well as changes of the source table that happened during the copying. At
+ * the end of processing we'll just swap storage of the transient and the
+ * source relation and drop the transient one.
+ *
+ * Return oid of the new relation, which is neither locked nor open.
+ */
+static Oid
+create_transient_table(CatalogState *cat_state, TupleDesc tup_desc)
+{
+	StringInfo	relname;
+	Form_pg_class	form_class;
+	Oid	toastrelid;
+	Oid	result;
+
+	relname = makeStringInfo();
+	appendStringInfo(relname, "tmp_%u", cat_state->relid);
+
+	/*
+	 * Constraints are not created because each data change must be committed
+	 * in the source table before we see it during initial load or via logical
+	 * decoding.
+	 */
+	form_class = cat_state->form_class;
+	result = heap_create_with_catalog(
+		relname->data,
+		form_class->relnamespace, form_class->reltablespace,
+		InvalidOid, InvalidOid, InvalidOid,
+		form_class->relowner, tup_desc, NIL,
+		form_class->relkind, form_class->relpersistence,
+		false, false, true, 0,
+		ONCOMMIT_NOOP, cat_state->reloptions,
+		false, false, false, NULL);
+
+	Assert(OidIsValid(result));
+
+	/* Make sure the transient relation is visible.  */
+	CommandCounterIncrement();
+
+	/*
+	 * See cluster.c:make_new_heap() for details about the supposed
+	 * (non)existence of TOAST relation on both source and the transient
+	 * relations.
+	 */
+	toastrelid = form_class->reltoastrelid;
+	if (OidIsValid(toastrelid))
+	{
+		Datum	reloptions;
+		bool	is_null;
+		HeapTuple	tuple;
+
+		/* keep the existing toast table's reloptions, if any */
+		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(toastrelid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for relation %u", toastrelid);
+		reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
+									 &is_null);
+		if (is_null)
+			reloptions = (Datum) 0;
+
+		/*
+		 * No lock is needed on the target relation - no other transaction
+		 * should be able to see it yet.
+		 */
+		NewHeapCreateToastTable(result, reloptions, NoLock);
+
+		ReleaseSysCache(tuple);
+
+		/* Make sure the TOAST relation is visible.  */
+		CommandCounterIncrement();
+	}
+
+	return result;
+}
+
+/*
  * Make sure "dst" relation has the same indexes as "src".
  *
  * indexes_src is array of existing indexes on the source relation and
@@ -2162,8 +2191,7 @@ clear_user_catalog_option(CatalogState *cat_state)
 	Relation	rel;
 	HeapTuple	tuple, tuple_new;
 	int	natts;
-	bool	isnull;
-	Datum	rel_options;
+	Datum	reloptions;
 	DefElem	*def;
 	List	*def_list = NIL;
 	Datum	*repl_vals;
@@ -2172,32 +2200,37 @@ clear_user_catalog_option(CatalogState *cat_state)
 	natts = cat_state->desc_class->natts;
 	Assert(natts == Natts_pg_class);
 
+	rel = heap_open(RelationRelationId, RowExclusiveLock);
+	/*
+	 * XXX We could have stored a copy of the tuple in cat_state earlier, but
+	 * that wouldn't be visible for update - at least the instance created by
+	 * heap_copytuple().
+	 */
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(cat_state->relid));
+	Assert(HeapTupleIsValid(tuple));
+
+	/*
+	 * As for coding, it's simpler to get the reloptions from cat_state.
+	 */
+	reloptions = cat_state->reloptions;
+	def = makeDefElem("user_catalog_table", NULL);
+	def_list = lappend(def_list, def);
+	reloptions = transformRelOptions(reloptions, def_list, NULL, NULL, false,
+									 true);
+
 	repl_vals = (Datum *) palloc(natts * sizeof(Datum));
 	repl_nulls = (bool *) palloc0(natts * sizeof(bool));
 	do_repl = (bool *) palloc0(natts * sizeof(bool));
 
-	rel = heap_open(RelationRelationId, RowExclusiveLock);
-	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(cat_state->relid));
-	Assert(HeapTupleIsValid(tuple));
-	rel_options = fastgetattr(tuple, Anum_pg_class_reloptions,
-							  cat_state->desc_class, &isnull);
-	Assert(!isnull);
-	Assert(PointerIsValid(DatumGetPointer(rel_options)));
-
-	def = makeDefElem("user_catalog_table", NULL);
-	def_list = lappend(def_list, def);
-
-	rel_options = transformRelOptions(rel_options, def_list, NULL, NULL,
-									  false, true);
-
-	if (rel_options != (Datum) 0)
-		repl_vals[Anum_pg_class_reloptions - 1] = rel_options;
+	if (reloptions != (Datum) 0)
+		repl_vals[Anum_pg_class_reloptions - 1] = reloptions;
 	else
 		repl_nulls[Anum_pg_class_reloptions - 1] = true;
 	do_repl[Anum_pg_class_reloptions - 1] = true;
 
 	tuple_new = heap_modify_tuple(tuple, cat_state->desc_class, repl_vals,
 								  repl_nulls, do_repl);
+
 	simple_heap_update(rel, &tuple_new->t_self, tuple_new);
 	CatalogUpdateIndexes(rel, tuple_new);
 
