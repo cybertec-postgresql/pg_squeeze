@@ -1359,15 +1359,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 											cluster_idx, maintenance_work_mem,
 											false);
 
-	/*
-	 * TODO Unless tuplesort is used, tune the batch_max_size and consider
-	 * automatic adjustment, so that maintenance_work_mem is not
-	 * exceeded. (The current low value is there for development purposes
-	 * only.)
-	 */
-	batch_max_size = 2;
+	batch_max_size = 1024;
 	if (!use_sort)
-		tuples = (HeapTuple *) palloc0(batch_max_size * sizeof(HeapTuple));
+		tuples = (HeapTuple *) palloc(batch_max_size * sizeof(HeapTuple));
 
 	/* Expect many insertions. */
 	bistate = GetBulkInsertState();
@@ -1376,9 +1370,13 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	{
 		HeapTuple	tup_in;
 		int	i = 0;
+		Size	data_size;
+
+		if (!use_sort)
+			data_size = 0;
 
 		/* Sorting cannot be split into batches. */
-		for (; use_sort || i < batch_max_size; i++)
+		for (; use_sort || (data_size / 1024) < maintenance_work_mem; i++)
 		{
 			tup_in = use_sort || cluster_idx == NULL ?
 				heap_getnext(heap_scan, ForwardScanDirection) :
@@ -1388,7 +1386,17 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				if (use_sort)
 					tuplesort_putheaptuple(tuplesort, tup_in);
 				else
+				{
+					if (i == batch_max_size)
+					{
+						batch_max_size *= 2;
+						tuples = (HeapTuple *)
+							repalloc(tuples,
+									 batch_max_size * sizeof(HeapTuple));
+					}
 					tuples[i] = heap_copytuple(tup_in);
+					data_size += HEAPTUPLESIZE + tup_in->t_len;
+				}
 			}
 			else
 				break;
