@@ -1292,6 +1292,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	IndexScanDesc	index_scan = NULL;
 	HeapTuple	*tuples = NULL;
 	ResourceOwner	res_owner_old, res_owner_plan;
+	BulkInsertState bistate;
 
 	/*
 	 * The initial load starts by fetching data from the source table and
@@ -1367,6 +1368,10 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	batch_max_size = 2;
 	if (!use_sort)
 		tuples = (HeapTuple *) palloc0(batch_max_size * sizeof(HeapTuple));
+
+	/* Expect many insertions. */
+	bistate = GetBulkInsertState();
+
 	while (true)
 	{
 		HeapTuple	tup_in;
@@ -1436,9 +1441,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			if (tup_out == NULL)
 				break;
 
-
-			/* TODO Enable bulk insert. */
-			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0, NULL);
+			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0,
+						bistate);
 			if (!use_sort || should_free)
 				pfree(tup_out);
 		}
@@ -1454,6 +1458,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	 */
 
 	/* Cleanup. */
+	FreeBulkInsertState(bistate);
+
 	if (use_sort)
 		tuplesort_end(tuplesort);
 	else
@@ -1548,6 +1554,7 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 {
 	TupleTableSlot	*slot_data, *slot_metadata;
 	HeapTuple tup_old = NULL;
+	BulkInsertState bistate = NULL;
 
 	slot_metadata = MakeTupleTableSlot();
 	ExecSetSlotDescriptor(slot_metadata, s->metadata.tupdesc);
@@ -1567,11 +1574,22 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 									 slot_data))
 			elog(ERROR, "The data and metadata slots do not match.");
 
+		/* Find out of what kind current change is. */
 		tup_meta = ExecCopySlotTuple(slot_metadata);
 		heap_deform_tuple(tup_meta, slot_metadata->tts_tupleDescriptor,
 						  kind_value, kind_isnull);
 		Assert(!kind_isnull[0]);
 		change_kind = DatumGetChar(kind_value[0]);
+
+		/*
+		 * Do not keep buffer pinned for insert if the current change is
+		 * something else.
+		 */
+		if (change_kind != PG_SQUEEZE_CHANGE_INSERT && bistate != NULL)
+		{
+			FreeBulkInsertState(bistate);
+			bistate = NULL;
+		}
 
 		tup = ExecCopySlotTuple(slot_data);
 		if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_OLD)
@@ -1582,9 +1600,15 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 		else if (change_kind == PG_SQUEEZE_CHANGE_INSERT)
 		{
 			Assert(tup_old == NULL);
-			/* TODO Bulk insert if several consecutive changes are
-			 * INSERT. (But impose limit on memory.) */
-			heap_insert(relation, tup, GetCurrentCommandId(true), 0, NULL);
+
+			/*
+			 * If the next change will also be INSERT, we'll try to use the
+			 * same buffer.
+			 */
+			if (bistate == NULL)
+				bistate = GetBulkInsertState();
+
+			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
 			update_indexes(relation, tup, indexes, nindexes);
 			pfree(tup);
 		}
@@ -1675,6 +1699,10 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 			CommandCounterIncrement();
 		pfree(tup_meta);
 	}
+
+	/* Cleanup. */
+	if (bistate != NULL)
+		FreeBulkInsertState(bistate);
 
 	if (tuplestore_gettupleslot(s->data.tupstore, true, false,
 								 slot_data))
