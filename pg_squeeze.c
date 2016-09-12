@@ -1221,7 +1221,7 @@ free_catalog_state(CatalogState *state)
 		pfree(state->desc_class);
 
 	if (state->reloptions)
-		pfree(state->reloptions);
+		pfree(DatumGetPointer(state->reloptions));
 
 	if (state->attr_xmins)
 		pfree(state->attr_xmins);
