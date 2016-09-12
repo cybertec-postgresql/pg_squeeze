@@ -1265,6 +1265,13 @@ switch_snapshot(Snapshot snap_hist)
 		/* Revert the hack done above. */
 		FirstSnapshotSet = true;
 	}
+
+	/*
+	 * This is rather paranoia than anything else - the perform_initial_load()
+	 * uses each snapshot to access different table, and it does not catalog
+	 * changes.
+	 */
+	InvalidateSystemCaches();
 }
 
 /*
