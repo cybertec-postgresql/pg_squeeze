@@ -18,7 +18,9 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
+#include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
@@ -55,6 +57,8 @@ PG_MODULE_MAGIC;
 typedef struct IndexCatInfo
 {
 	Oid	oid;					/* pg_index(indexrelid) */
+	NameData	relname;		/* pg_class(relname) */
+	Oid	reltablespace;			/* pg_class(reltablespace) */
 	TransactionId		xmin;	/* pg_index(xmin) */
 	TransactionId		pg_class_xmin; /* pg_class(xmin) of the index (not the
 										* parent relation) */
@@ -104,6 +108,22 @@ typedef struct CatalogState
 	bool	invalid_index;
 } CatalogState;
 
+/* Index-to-tablespace mapping. */
+typedef struct IndexTablespace
+{
+	Oid	index;
+	Oid	tablespace;
+} IndexTablespace;
+
+/* Where should the new table and its indexes be located? */
+typedef struct TablespaceInfo
+{
+	Oid	table;
+
+	int	nindexes;
+	IndexTablespace *indexes;
+} TablespaceInfo;
+
 static LogicalDecodingContext *setup_decoding(void);
 static CatalogState *get_catalog_state(Oid relid);
 static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
@@ -118,6 +138,10 @@ static void check_index_changes(Oid relid, IndexCatInfo *indexes,
 static void free_catalog_state(CatalogState *state);
 static void check_pg_class_changes(Oid relid, TransactionId xmin,
 								   LOCKMODE lock_held);
+static void free_tablespace_info(TablespaceInfo *tbsp_info);
+static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
+									 CatalogState *cat_state,
+									 ArrayType *ind_tbsp_a);
 static void switch_snapshot(Snapshot snap_hist);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst);
@@ -129,9 +153,12 @@ static void process_concurrent_changes(DecodingOutputState *s,
 									   Relation relation, ScanKey key,
 									   int nkeys, Oid *indexes, int nindexes,
 									   Oid ident_index);
-static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc);
+static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
+								  Oid tablespace);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
-									Oid *indexes_src, int nindexes);
+									Oid *indexes_src, int nindexes,
+									TablespaceInfo *tbsp_info,
+									CatalogState *cat_state);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
 static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
@@ -181,6 +208,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Relation	rel_src, rel_dst;
 	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
+	List	*relsrc_indlist;
 	char	replident;
 	ScanKey	ident_key;
 	int	i, ident_key_nentries;
@@ -196,6 +224,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Oid	*indexes_src = NULL, *indexes_dst = NULL;
 	bool	invalid_index = false;
 	IndexCatInfo	*ind_info;
+	TablespaceInfo	*tbsp_info;
 	ObjectAddress	object;
 
 	relname = PG_GETARG_TEXT_P(0);
@@ -204,31 +233,71 @@ squeeze_table(PG_FUNCTION_ARGS)
 	rel_src = relation_openrv(relrv_src, AccessShareLock);
 
 	/*
-	 * Clustering index, if any.
+	 * Refresh the index list.
 	 *
-	 * Do not lock the index so far, e.g. just to retrieve OID and to keep it
-	 * valid. Neither the relation can be locked continuously, so by keeping
-	 * the index locked alone we'd introduce incorrect order of
-	 * locking. Although we use only share locks in most cases (so I'm not
-	 * aware of particular deadlock scenario), it doesn't seem wise. The worst
-	 * consequence of not locking is that perform_initial_load() will error
-	 * out.
+	 * Although our processing of the list shouldn't cause invalidation of
+	 * this particular relcache entry (RelationGetIndexList() comment mentions
+	 * invalidation due to cache lookup, but we'll only lookup tablespaces and
+	 * index relations) it seems at least cleaner to use the returned copy, as
+	 * opposed to rel_src->rd_indexlist. Thus we can eventually free it
+	 * explicitly.
 	 */
-	if (!PG_ARGISNULL(1))
-	{
-		text	*indname;
+	relsrc_indlist = RelationGetIndexList(rel_src);
 
-		indname = PG_GETARG_TEXT_P(1);
-		relrv_cl_idx = makeRangeVar(NULL, text_to_cstring(indname), -1);
-	}
-
-	RelationGetIndexList(rel_src);
-	replident = rel_src->rd_rel->relreplident;
 	/*
-	 * Save the identity index OID so that we don't have to call
-	 * RelationGetIndexList later again.
+	 * Retrieve all the relevant info before we do anything that might
+	 * invalidate the cache entry.
+	 *
+	 * (Some fields are protected by the lock we currently hold on the
+	 * relation, but not all.)
 	 */
+	replident = rel_src->rd_rel->relreplident;
 	ident_idx_src = rel_src->rd_replidindex;
+	relid_src = rel_src->rd_id;
+
+	/*
+	 * Info to initialize tuple slot to retrieve tuples from tuplestore during
+	 * the initial load.
+	 */
+	tup_desc = CreateTupleDescCopy(RelationGetDescr(rel_src));
+
+	/*
+	 * Get ready for the subsequent calls of check_catalog_changes().
+	 *
+	 * The "user_catalog_table" relation option is essential for the initial
+	 * scan, otherwise some useful tuples might get VACUUMed before we
+	 * retrieve them. It must be enabled before
+	 * ReplicationSlotsComputeRequiredXmin() sets up new catalog_xmin so that
+	 * GetOldestXmin() treats the table like catalog one as soon as it sees
+	 * the new catalog_min published.
+	 *
+	 * XXX It'd still be correct to start the check a bit later, i.e. just
+	 * before CreateInitDecodingContext(), but the gain is not worth making
+	 * the code less readable.
+	 */
+	cat_state = get_catalog_state(relid_src);
+
+	/* Give up if it's clear enough to do. */
+	if (!cat_state->is_catalog)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 (errmsg("\"user_catalog_table\" option not set"))));
+	if (cat_state->invalid_index)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 (errmsg("At least one index is invalid"))));
+
+	/*
+	 * The relation shouldn't be locked during the call of setup_decoding(),
+	 * otherwise another transaction could write XLOG records before the
+	 * slots' data.restart_lsn and we'd have to wait for it to finish. If such
+	 * a transaction requested exclusive lock on our relation (e.g. ALTER
+	 * TABLE), it'd result in a deadlock.
+	 *
+	 * We can't keep the lock till the end of transaction anyway - that's why
+	 * check_catalog_changes() exists.
+	 */
+	relation_close(rel_src, AccessShareLock);
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
@@ -259,37 +328,57 @@ squeeze_table(PG_FUNCTION_ARGS)
 				 (errmsg("Replica identity \"full\" not supported"))));
 
 	/*
-	 * The "user_catalog_table" relation option is essential for the initial
-	 * scan, otherwise some useful tuples might get VACUUMed before we
-	 * retrieve them. It must be enabled before
-	 * ReplicationSlotsComputeRequiredXmin() sets up new catalog_xmin so that
-	 * GetOldestXmin() treats the table like catalog one as soon as it sees
-	 * the new catalog_min published.
+	 * Clustering index, if any.
 	 *
-	 * XXX It'd still be correct to start the check a bit later, i.e. just
-	 * before CreateInitDecodingContext(), but the gain is not worth making
-	 * the code less readable.
+	 * Do not lock the index so far, e.g. just to retrieve OID and to keep it
+	 * valid. Neither the relation can be locked continuously, so by keeping
+	 * the index locked alone we'd introduce incorrect order of
+	 * locking. Although we use only share locks in most cases (so I'm not
+	 * aware of particular deadlock scenario), it doesn't seem wise. The worst
+	 * consequence of not locking is that perform_initial_load() will error
+	 * out.
 	 */
-	relid_src = rel_src->rd_id;
+	if (!PG_ARGISNULL(1))
+	{
+		text	*indname;
+
+		indname = PG_GETARG_TEXT_P(1);
+		relrv_cl_idx = makeRangeVar(NULL, text_to_cstring(indname), -1);
+	}
 
 	/*
-	 * Info to initialize tuple slot to retrieve tuples from tuplestore during
-	 * the initial load.
+	 * Process tablespace arguments, if provided.
+	 *
+	 * XXX Currently we consider tablespace DDLs rather infrequent, so we let
+	 * such a DDL to break transient table or index creation.  As we can't
+	 * keep the source table locked all the time, it's possible for tablespace
+	 * to disappear even if it contains the source table. Is it worth locking
+	 * the tablespaces here? Since concurrent renaming of a tablespace is
+	 * disruptive too, we'd probably need AccessExclusiveLock. Or are such
+	 * changes worth making check_catalog_changes() more expensive?
 	 */
-	tup_desc = CreateTupleDescCopy(RelationGetDescr(rel_src));
+	tbsp_info = (TablespaceInfo *) palloc0(sizeof(TablespaceInfo));
+	if (!PG_ARGISNULL(2))
+	{
+		text	*tbspname;
 
-	/* Get ready for the subsequent calls of check_catalog_changes(). */
-	cat_state = get_catalog_state(relid_src);
 
-	/* Give up if it's clear enough to do. */
-	if (!cat_state->is_catalog)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 (errmsg("\"user_catalog_table\" option not set"))));
-	if (cat_state->invalid_index)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 (errmsg("At least one index is invalid"))));
+		tbspname = PG_GETARG_TEXT_P(2);
+		tbsp_info->table = get_tablespace_oid(text_to_cstring(tbspname),
+											  false);
+	}
+	else
+		tbsp_info->table = cat_state->form_class->reltablespace;
+
+	/* Index-to-tablespace mappings. */
+	if (!PG_ARGISNULL(3))
+	{
+		ArrayType	*ind_tbsp = PG_GETARG_ARRAYTYPE_P(3);
+
+		resolve_index_tablepaces(tbsp_info, cat_state, ind_tbsp);
+	}
+	list_free(relsrc_indlist);
+
 	/*
 	 * TODO If the number of columns is non-zero, check if there's at least
 	 * one valid (not dropped).
@@ -301,9 +390,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 				 (errmsg("Table \"%s\" has no valid columns",
 						 relrv_src->relname))));
 
-	/* Valid identity index should exist now. */
-	Assert(OidIsValid(ident_idx_src));
-
 	/* Therefore the total number of indexes is non-zero. */
 	nindexes = cat_state->relninds;
 	Assert(nindexes > 0);
@@ -312,18 +398,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	indexes_src = (Oid *) palloc(nindexes * sizeof(Oid));
 	for (i = 0; i < nindexes; i++)
 		indexes_src[i] = cat_state->indexes[i].oid;
-
-	/*
-	 * The relation shouldn't be locked during slot setup. Otherwise another
-	 * transaction could write XLOG records before the slots' data.restart_lsn
-	 * and we'd have to wait for it to finish. If such a transaction requested
-	 * exclusive lock on our relation (e.g. ALTER TABLE), it'd result in a
-	 * deadlock.
-	 *
-	 * We can't keep the lock till the end of transaction anyway - that's why
-	 * check_catalog_changes() exists.
-	 */
-	relation_close(rel_src, AccessShareLock);
 
 	ctx = setup_decoding();
 
@@ -336,7 +410,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	snap_hist = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder,
 											InvalidTransactionId);
 
-	relid_dst = create_transient_table(cat_state, tup_desc);
+	relid_dst = create_transient_table(cat_state, tup_desc, tbsp_info->table);
 
 	/* The source relation will be needed for the initial load. */
 	rel_src = heap_open(relid_src, AccessShareLock);
@@ -427,7 +501,15 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * indexes.)
 	 */
 	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
-										  nindexes);
+										  nindexes, tbsp_info, cat_state);
+
+	/* This info is no longer needed. */
+	free_tablespace_info(tbsp_info);
+
+	/*
+	 * Valid identity index should exist now, see the identity checks above.
+	 */
+	Assert(OidIsValid(ident_idx_src));
 
 	/* Find "identity index" of the transient relation. */
 	ident_idx_dst = InvalidOid;
@@ -988,13 +1070,26 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	mismatch = false;
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
+		IndexCatInfo	*res_item;
+		Form_pg_class	form_class;
+		char	*namestr;
+		Size	namelen;
+
 		if (i == n)
 		{
 			/* Index added concurrently? */
 			mismatch = true;
 			break;
 		}
-		result[i++].pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+		res_item = &result[i++];
+		res_item->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+		form_class = (Form_pg_class) GETSTRUCT(tuple);
+		namestr = NameStr(form_class->relname);
+		namelen = strlen(namestr);
+		Assert(namelen < NAMEDATALEN);
+		strcpy(NameStr(result->relname), namestr);
+
+		res_item->reltablespace = form_class->reltablespace;
 	}
 	if (i < n)
 		mismatch = true;
@@ -1223,6 +1318,114 @@ free_catalog_state(CatalogState *state)
 	if (state->indexes)
 		pfree(state->indexes);
 	pfree(state);
+}
+
+static void
+resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
+						 ArrayType *ind_tbsp_a)
+{
+	int	*dims, *lb;
+	int	i, ndim;
+	int16 elmlen;
+	bool elmbyval;
+	char elmalign;
+	Datum	*elements;
+	bool	*nulls;
+	int	nelems, nentries;
+
+	/* The CREATE FUNCTION statement should ensure this. */
+	Assert(ARR_ELEMTYPE(ind_tbsp_a) == TEXTOID);
+
+	if ((ndim = ARR_NDIM(ind_tbsp_a)) != 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("Index-to-tablespace mappings must be text[][] array")));
+
+	dims = ARR_DIMS(ind_tbsp_a);
+	if (dims[1] != 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("The index-to-tablespace mappings must have 2 columns")));
+
+	lb = ARR_LBOUND(ind_tbsp_a);
+	for (i = 0; i < ndim; i++)
+		if (lb[i] != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("Each dimension of the index-to-tablespace mappings must start at 1")));
+
+	get_typlenbyvalalign(TEXTOID, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(ind_tbsp_a, TEXTOID, elmlen, elmbyval, elmalign,
+					  &elements, &nulls, &nelems);
+	Assert(nelems % 2 == 0);
+
+	for (i = 0; i < nelems; i++)
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("The index-to-tablespace array is must not contain NULLs")));
+
+	/* Do the actual processing. */
+	nentries = nelems / 2;
+	tbsp_info->indexes = (IndexTablespace *)
+		palloc(nentries * sizeof(IndexTablespace));
+	Assert(tbsp_info->nindexes == 0);
+
+	for (i = 0; i < nentries; i++)
+	{
+		char	*indname, *tbspname;
+		int	j;
+		Oid	ind_oid, tbsp_oid;
+		IndexTablespace	*ind_ts;
+
+		/* Find OID of the index. */
+		indname = TextDatumGetCString(elements[2 * i]);
+		ind_oid = InvalidOid;
+		for (j = 0; j < cat_state->relninds; j++)
+		{
+			IndexCatInfo	*ind_cat;
+
+			ind_cat = &cat_state->indexes[j];
+			if (strcmp(NameStr(ind_cat->relname), indname) == 0)
+			{
+				ind_oid = ind_cat->oid;
+				break;
+			}
+		}
+		if (!OidIsValid(ind_oid))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("Table has no index \"%s\"", indname)));
+
+		/* Duplicate entries are not expected in the input array. */
+		for (j = 0; j < tbsp_info->nindexes; j++)
+		{
+			ind_ts = &tbsp_info->indexes[j];
+			if (ind_ts->index == ind_oid)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("Duplicate tablespace mapping for index \"%s\"",
+								indname)));
+		}
+
+		/* Look up the tablespace. Fail if it does not exist. */
+		tbspname = TextDatumGetCString(elements[2 * i + 1]);
+		tbsp_oid = get_tablespace_oid(tbspname, false);
+
+		/* Add the new mapping entry to the array. */
+		ind_ts = &tbsp_info->indexes[tbsp_info->nindexes++];
+		ind_ts->index = ind_oid;
+		ind_ts->tablespace = tbsp_oid;
+	}
+	pfree(elements);
+	pfree(nulls);
+}
+
+static void
+free_tablespace_info(TablespaceInfo *tbsp_info)
+{
+	if (tbsp_info->indexes != NULL)
+		pfree(tbsp_info->indexes);
+	pfree(tbsp_info);
 }
 
 /*
@@ -1729,12 +1932,19 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
  * Return oid of the new relation, which is neither locked nor open.
  */
 static Oid
-create_transient_table(CatalogState *cat_state, TupleDesc tup_desc)
+create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
+					   Oid tablespace)
 {
 	StringInfo	relname;
 	Form_pg_class	form_class;
 	Oid	toastrelid;
 	Oid	result;
+
+	/* As elsewhere in PG core. */
+	if (tablespace == GLOBALTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("only shared relations can be placed in pg_global tablespace")));
 
 	relname = makeStringInfo();
 	appendStringInfo(relname, "tmp_%u", cat_state->relid);
@@ -1747,7 +1957,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc)
 	form_class = cat_state->form_class;
 	result = heap_create_with_catalog(
 		relname->data,
-		form_class->relnamespace, form_class->reltablespace,
+		form_class->relnamespace, tablespace,
 		InvalidOid, InvalidOid, InvalidOid,
 		form_class->relowner, tup_desc, NIL,
 		form_class->relkind, form_class->relpersistence,
@@ -1808,7 +2018,8 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc)
  */
 static Oid *
 build_transient_indexes(Relation rel_dst, Relation rel_src,
-						Oid *indexes_src, int nindexes)
+						Oid *indexes_src, int nindexes,
+						TablespaceInfo *tbsp_info, CatalogState *cat_state)
 {
 	StringInfo	ind_name;
 	int	i;
@@ -1821,7 +2032,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 	for (i = 0; i < nindexes; i++)
 	{
-		Oid	ind_oid, ind_oid_new;
+		Oid	ind_oid, ind_oid_new, tbsp_oid;
 		Relation	ind;
 		IndexInfo	*ind_info;
 		int	j, heap_col_id;
@@ -1842,6 +2053,55 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
 		ind_info = BuildIndexInfo(ind);
+
+		/*
+		 * Tablespace defaults to the original one, but can be overridden by
+		 * tbsp_info.
+		 */
+		tbsp_oid = InvalidOid;
+		for (j = 0; j < tbsp_info->nindexes; j++)
+		{
+			IndexTablespace	*ind;
+
+			ind = &tbsp_info->indexes[j];
+			if (ind->index == ind_oid)
+			{
+				tbsp_oid = ind->tablespace;
+				break;
+			}
+		}
+
+		if (tbsp_oid == GLOBALTABLESPACE_OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("only shared relations can be placed in pg_global tablespace")));
+
+		if (!OidIsValid(tbsp_oid))
+		{
+			bool found = false;
+
+			for (j = 0; j < cat_state->relninds; j++)
+			{
+				IndexCatInfo	*ind_cat;
+
+				ind_cat = &cat_state->indexes[j];
+				if (ind_cat->oid == ind_oid)
+				{
+					tbsp_oid = ind_cat->reltablespace;
+					found = true;
+					break;
+				}
+			}
+
+			/*
+			 * It's o.k. for tbsp_oid to end up invalid (if the default
+			 * tablespace of the database should be used), but the index
+			 * shouldn't have disappeared (caller should hold share lock on
+			 * the relation).
+			 */
+			if (!found)
+				elog(ERROR, "Failed to retrieve index tablespace");
+		}
 
 		/*
 		 * Index name really doesn't matter, we'll eventually use only their
@@ -1924,7 +2184,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		ind_oid_new = index_create(rel_dst, ind_name->data,
 								   InvalidOid, InvalidOid, ind_info,
 								   colnames, ind->rd_rel->relam,
-								   rel_dst->rd_rel->reltablespace,
+								   tbsp_oid,
 								   collations, opclasses, indoptions,
 								   PointerGetDatum(ind->rd_options),
 								   ind->rd_index->indisprimary, isconstraint,
