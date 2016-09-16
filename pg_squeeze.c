@@ -248,15 +248,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 	relsrc_indlist = RelationGetIndexList(rel_src);
 
 	/*
-	 * Retrieve all the relevant info before we do anything that might
-	 * invalidate the cache entry.
-	 *
-	 * (Some fields are protected by the lock we currently hold on the
-	 * relation, but not all.)
+	 * Retrieve other useful info while holding lock on the relation.
 	 */
 	replident = rel_src->rd_rel->relreplident;
-	ident_idx_src = rel_src->rd_replidindex;
-	relid_src = rel_src->rd_id;
+	ident_idx_src = RelationGetReplicaIndex(rel_src);
+	relid_src = RelationGetRelid(rel_src);
 
 	/*
 	 * Info to initialize tuple slot to retrieve tuples from tuplestore during
