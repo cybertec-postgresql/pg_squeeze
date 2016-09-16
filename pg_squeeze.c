@@ -20,6 +20,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
+#include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
@@ -124,6 +125,7 @@ typedef struct TablespaceInfo
 	IndexTablespace *indexes;
 } TablespaceInfo;
 
+static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(void);
 static CatalogState *get_catalog_state(Oid relid);
 static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
@@ -230,6 +232,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	relname = PG_GETARG_TEXT_P(0);
 	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel_src = heap_openrv(relrv_src, AccessShareLock);
+
+	check_prerequisites(rel_src);
 
 	/*
 	 * Refresh the index list.
@@ -639,8 +643,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/*
 	 * Flush anything we see in WAL, to make sure that all changes committed
 	 * while we were creating indexes and waiting for the exclusive lock are
-	 * available for decoding. (This should be unnecessary if
-	 * synchronous_commit is set, but we can't rely on this setting.)
+	 * available for decoding. (This should be unnecessary if all backends had
+	 * synchronous_commit set, but we can't rely on this setting.)
 	 */
 	xlog_insert_ptr = GetInsertRecPtr();
 	XLogFlush(xlog_insert_ptr);
@@ -732,6 +736,57 @@ index_cat_info_compare(const void *arg1, const void *arg2)
 		return -1;
 	else
 		return 0;
+}
+
+/*
+ * Raise error if the relation is not eligible for squeezing or any adverse
+ * conditions exist.
+ *
+ * Some of the checks may be redundant (e.g. heap_open() checks relkind) but
+ * its safer to have them all listed here.
+ */
+static void
+check_prerequisites(Relation rel)
+{
+	Form_pg_class	form = rel->rd_rel;
+
+	/* Check the relation first. */
+	if (form->relkind != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a table",
+						RelationGetRelationName(rel))));
+
+	if (form->relpersistence != RELPERSISTENCE_PERMANENT)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a regular table",
+						RelationGetRelationName(rel))));
+
+	if (form->relisshared)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is shared relation",
+						RelationGetRelationName(rel))));
+
+	if (RelationIsMapped(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is mapped relation",
+						RelationGetRelationName(rel))));
+
+	if (rel->rd_id <= FirstNormalObjectId)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not user relation",
+						RelationGetRelationName(rel))));
+
+	/*
+	 * While AFTER trigger should not be an issue (to generate an event must
+	 * have got XID assigned, causing setup_decoding() to fail later), open
+	 * cursor might be. See comments of the function for details.
+	 */
+	CheckTableNotInUse(rel, "squeeze_table()");
 }
 
 /*
