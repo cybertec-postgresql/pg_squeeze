@@ -229,8 +229,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	relname = PG_GETARG_TEXT_P(0);
 	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
-	/* TODO Consider heap_open() / heap_close(). */
-	rel_src = relation_openrv(relrv_src, AccessShareLock);
+	rel_src = heap_openrv(relrv_src, AccessShareLock);
 
 	/*
 	 * Refresh the index list.
@@ -297,7 +296,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * We can't keep the lock till the end of transaction anyway - that's why
 	 * check_catalog_changes() exists.
 	 */
-	relation_close(rel_src, AccessShareLock);
+	heap_close(rel_src, AccessShareLock);
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
