@@ -921,10 +921,14 @@ get_catalog_state(Oid relid)
 	 */
 	result->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 
-	if (form_class->relhasindex)
-		result->indexes = get_index_info(relid, &result->relninds,
-										 &result->invalid_index, false,
-										 snapshot);
+	/*
+	 * We might want to avoid the check if relhasindex is false, but
+	 * index_update_stats() updates this field in-place. (Currently it should
+	 * not change from "true" to "false", but let's be cautious anyway.)
+	 */
+	result->indexes = get_index_info(relid, &result->relninds,
+									 &result->invalid_index, false,
+									 snapshot);
 
 	/* If any index is "invalid", no more catalog information is needed. */
 	if (result->invalid_index)
