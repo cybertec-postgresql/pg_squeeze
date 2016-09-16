@@ -628,12 +628,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * DDL can break the process anymore. NoLock must be passed because the
 	 * relation was really unlocked for some period since the last check.
 	 */
-	/*
-	 * TODO Consider if this special case requires locking the relevant
-	 * catalog tables in front of the LockRelationOid() above and moving the
-	 * lock / unlock code into separate functions. If lock on catalog relation
-	 * is kept while accessing user relation, deadlock can occur.
-	 */
 	check_catalog_changes(cat_state, NoLock);
 
 	/*
