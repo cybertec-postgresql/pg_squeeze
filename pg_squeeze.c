@@ -444,55 +444,22 @@ squeeze_table(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	/*
-	 * Make sure the logical changes can UPDATE existing rows of the target
-	 * table.
-	 */
-	CommandCounterIncrement();
-
-	/*
-	 * Flush all WAL records inserted so far (possibly except for the last
-	 * incomplete page, see GetInsertRecPtr), to minimize the amount of data
-	 * we need to flush while holding exclusive lock on the source table.
-	 */
-	xlog_insert_ptr = GetInsertRecPtr();
-	XLogFlush(xlog_insert_ptr);
-
-	/*
-	 * Decode the data changes that occurred while the initial load was in
-	 * progress, and put them into a tuplestore. This is derived from
-	 * pg_logical_slot_get_changes_guts().
-	 *
-	 * TODO Find out what's wrong about letting the plugin immediately write
-	 * into the destination table itself. PG documentation forbids that, but
-	 * I'm not sure if that restriction is still valid and why.
-	 */
-	dstate = palloc0(sizeof(DecodingOutputState));
-	dstate->relid = relid_src;
-	dstate->data.tupstore = tuplestore_begin_heap(false, false, work_mem);
-	dstate->data.tupdesc = tup_desc;
-	dstate->metadata.tupstore = tuplestore_begin_heap(false, false, work_mem);
-	dstate->metadata.tupdesc = CreateTupleDesc(1, false, &att_char);
-
-	end_of_wal = GetFlushRecPtr();
-	ctx->output_writer_private = dstate;
-	startptr = MyReplicationSlot->data.restart_lsn;
-
-	resowner_decode = ResourceOwnerCreate(CurrentResourceOwner,
-										  "logical decoding");
-	decode_concurrent_changes(ctx, &startptr, end_of_wal, resowner_decode);
-
-	/*
 	 * Check for concurrent changes that would make us stop working later.
 	 * Index build can take quite some effort and we don't want to waste it.
 	 *
-	 * Note: The reason we haven't released the relation lock immediately
-	 * after perform_initial_load() is that the lock might make catalog checks
-	 * easier, if check_catalog_changes() gets improved someday. However, as
-	 * we need to release the lock later anyway, the current lock does not
-	 * prevent already waiting backends from breaking our work. That's why we
-	 * don't spend extra effort to lock indexes of the source relation.
+	 * Note: By still holding the share lock we only ensure that the source
+	 * relation is not altered underneath index build, but we'll have to
+	 * release the lock for a short time at some point. So while we can't
+	 * prevent anyone from forcing us to cancel our work,such cancellation
+	 * must happen at well-defined moment.
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
+
+	/*
+	 * Make sure the contents of the transient table contents if visible for
+	 * the scan(s) during index build.
+	 */
+	CommandCounterIncrement();
 
 	/*
 	 * Create indexes on the temporary table - that might take a
@@ -502,8 +469,23 @@ squeeze_table(PG_FUNCTION_ARGS)
 	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
 										  nindexes, tbsp_info, cat_state);
 
-	/* This info is no longer needed. */
+	/* Tablespace info is no longer needed. */
 	free_tablespace_info(tbsp_info);
+
+	/*
+	 * As we'll need to take exclusive lock later, release the shared one.
+	 *
+	 * Note: PG core code shouldn't actually participate in such a deadlock,
+	 * as it (supposedly) does not raise lock level. Nor should concurrent
+	 * call of the squeeze_table() function participate in the deadlock,
+	 * because it should have failed much earlier when creating an existing
+	 * logical replication slot again. Nevertheless, these circumstances still
+	 * don't justify generally bad practice.
+	 *
+	 * (As we haven't changed the catalog entry yet, there's no need to send
+	 * invalidation messages.)
+	 */
+	heap_close(rel_src, AccessShareLock);
 
 	/*
 	 * Valid identity index should exist now, see the identity checks above.
@@ -535,33 +517,63 @@ squeeze_table(PG_FUNCTION_ARGS)
 								   &ident_key_nentries);
 
 	/*
-	 * Since the build of indexes could have taken relatively long time, it's
-	 * worth checking for concurrent changes again. The point is that the
-	 * first batch of concurrent changes can be big (it contains the changes
-	 * that took place during the initial load), changes again, so failed
-	 * check can prevent us from doing significant work needlessly.
-	 *
-	 * (We hold share lock on the source relation, but that does not conflict
-	 * with some commands, e.g. ALTER INDEX.)
+	 * Flush all WAL records inserted so far (possibly except for the last
+	 * incomplete page, see GetInsertRecPtr), to minimize the amount of data
+	 * we need to flush while holding exclusive lock on the source table.
 	 */
-	check_catalog_changes(cat_state, AccessShareLock);
+	xlog_insert_ptr = GetInsertRecPtr();
+	XLogFlush(xlog_insert_ptr);
+
+	/*
+	 * Decode the data changes that occurred while the initial load was in
+	 * progress, and put them into a tuplestore. This is derived from
+	 * pg_logical_slot_get_changes_guts().
+	 *
+	 * TODO Find out what's wrong about letting the plugin immediately write
+	 * into the destination table itself. PG documentation forbids that, but
+	 * I'm not sure if that restriction is still valid and why.
+	 */
+	dstate = palloc0(sizeof(DecodingOutputState));
+	dstate->relid = relid_src;
+	dstate->data.tupstore = tuplestore_begin_heap(false, false, work_mem);
+	dstate->data.tupdesc = tup_desc;
+	dstate->metadata.tupstore = tuplestore_begin_heap(false, false, work_mem);
+	dstate->metadata.tupdesc = CreateTupleDesc(1, false, &att_char);
+
+	end_of_wal = GetFlushRecPtr();
+	ctx->output_writer_private = dstate;
+	startptr = MyReplicationSlot->data.restart_lsn;
+
+	resowner_decode = ResourceOwnerCreate(CurrentResourceOwner,
+										  "logical decoding");
+
+	/*
+	 * Even if there amount of concurrent changes might not be significant,
+	 * both initial load and index build could have produced many XLOG records
+	 * that we need to read. Do so before requesting exclusive lock on the
+	 * source relation.
+	 */
+	decode_concurrent_changes(ctx, &startptr, end_of_wal, resowner_decode);
+
+	/*
+	 * Since the build of indexes could have taken long time, many changes
+	 * could have happen in the source relation in between. We want to process
+	 * them before requesting exclusive lock, but first make sure the changes
+	 * are applicable.
+	 */
+	check_catalog_changes(cat_state, NoLock);
+
+	/*
+	 * Make the identity index of the transient table visible, for the sake of
+	 * concurrent UPDATEs and DELETEs.
+	 */
+	CommandCounterIncrement();
 
 	/* Process the first batch of concurrent changes. */
 	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
 							   indexes_dst, nindexes, ident_idx_dst);
 	tuplestore_clear(dstate->data.tupstore);
 	tuplestore_clear(dstate->metadata.tupstore);
-
-	/*
-	 * Before we request exclusive lock, release the shared one acquired for
-	 * the initial load. Otherwise we risk a deadlock if some other
-	 * transaction holds shared lock and tries to get exclusive one at the
-	 * moment.
-	 *
-	 * As we haven't changed the catalog entry yet, there's no need to send
-	 * invalidation messages.
-	 */
-	heap_close(rel_src, AccessShareLock);
 
 	/*
 	 * This (supposedly cheap) special check should avoid one particular
@@ -606,11 +618,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * lock and performed its scan. (And of course, waiting for transactions
 	 * A, B, ... to complete while holding the exclusive lock can cause
 	 * deadlocks.)
-	 */
-	/*
-	 * TODO As the index build could have taken long time, consider flushing
-	 * and decoding (or even catalog check and processing?) as much XLOG as we
-	 * can, so that less work is left to the exclusive lock time.
 	 */
 	LockRelationOid(relid_src, AccessExclusiveLock);
 
