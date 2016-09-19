@@ -204,7 +204,8 @@ PG_FUNCTION_INFO_V1(squeeze_table);
 Datum
 squeeze_table(PG_FUNCTION_ARGS)
 {
-	text	   *relname;
+	Name	   relschema, relname;
+	List	*name_list = NIL;
 	RangeVar   *relrv_src;
 	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
@@ -229,8 +230,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 	TablespaceInfo	*tbsp_info;
 	ObjectAddress	object;
 
-	relname = PG_GETARG_TEXT_P(0);
-	relrv_src = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 (errmsg("Both schema and table name must be specified"))));
+
+	relschema = PG_GETARG_NAME(0);
+	name_list = lappend(name_list, makeString(pstrdup(NameStr(*relschema))));
+	relname = PG_GETARG_NAME(1);
+	name_list = lappend(name_list, makeString(pstrdup(NameStr(*relname))));
+	relrv_src = makeRangeVarFromNameList(name_list);
 	rel_src = heap_openrv(relrv_src, AccessShareLock);
 
 	check_prerequisites(rel_src);
@@ -337,12 +346,12 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * consequence of not locking is that perform_initial_load() will error
 	 * out.
 	 */
-	if (!PG_ARGISNULL(1))
+	if (!PG_ARGISNULL(2))
 	{
-		text	*indname;
+		Name	indname;
 
-		indname = PG_GETARG_TEXT_P(1);
-		relrv_cl_idx = makeRangeVar(NULL, text_to_cstring(indname), -1);
+		indname = PG_GETARG_NAME(2);
+		relrv_cl_idx = makeRangeVar(NULL, pstrdup(NameStr(*indname)), -1);
 	}
 
 	/*
@@ -357,22 +366,22 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * changes worth making check_catalog_changes() more expensive?
 	 */
 	tbsp_info = (TablespaceInfo *) palloc0(sizeof(TablespaceInfo));
-	if (!PG_ARGISNULL(2))
+	if (!PG_ARGISNULL(3))
 	{
-		text	*tbspname;
+		Name	tbspname;
 
 
-		tbspname = PG_GETARG_TEXT_P(2);
-		tbsp_info->table = get_tablespace_oid(text_to_cstring(tbspname),
+		tbspname = PG_GETARG_NAME(3);
+		tbsp_info->table = get_tablespace_oid(pstrdup(NameStr(*tbspname)),
 											  false);
 	}
 	else
 		tbsp_info->table = cat_state->form_class->reltablespace;
 
 	/* Index-to-tablespace mappings. */
-	if (!PG_ARGISNULL(3))
+	if (!PG_ARGISNULL(4))
 	{
-		ArrayType	*ind_tbsp = PG_GETARG_ARRAYTYPE_P(3);
+		ArrayType	*ind_tbsp = PG_GETARG_ARRAYTYPE_P(4);
 
 		resolve_index_tablepaces(tbsp_info, cat_state, ind_tbsp);
 	}
@@ -1395,7 +1404,7 @@ resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
 	int	nelems, nentries;
 
 	/* The CREATE FUNCTION statement should ensure this. */
-	Assert(ARR_ELEMTYPE(ind_tbsp_a) == TEXTOID);
+	Assert(ARR_ELEMTYPE(ind_tbsp_a) == NAMEOID);
 
 	if ((ndim = ARR_NDIM(ind_tbsp_a)) != 2)
 		ereport(ERROR,
@@ -1415,8 +1424,8 @@ resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("Each dimension of the index-to-tablespace mappings must start at 1")));
 
-	get_typlenbyvalalign(TEXTOID, &elmlen, &elmbyval, &elmalign);
-	deconstruct_array(ind_tbsp_a, TEXTOID, elmlen, elmbyval, elmalign,
+	get_typlenbyvalalign(NAMEOID, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(ind_tbsp_a, NAMEOID, elmlen, elmbyval, elmalign,
 					  &elements, &nulls, &nelems);
 	Assert(nelems % 2 == 0);
 
@@ -1440,7 +1449,7 @@ resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
 		IndexTablespace	*ind_ts;
 
 		/* Find OID of the index. */
-		indname = TextDatumGetCString(elements[2 * i]);
+		indname = NameStr(*DatumGetName(elements[2 * i]));
 		ind_oid = InvalidOid;
 		for (j = 0; j < cat_state->relninds; j++)
 		{
@@ -1469,7 +1478,7 @@ resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
 		}
 
 		/* Look up the tablespace. Fail if it does not exist. */
-		tbspname = TextDatumGetCString(elements[2 * i + 1]);
+		tbspname = NameStr(*DatumGetName(elements[2 * i + 1]));
 		tbsp_oid = get_tablespace_oid(tbspname, false);
 
 		/* Add the new mapping entry to the array. */

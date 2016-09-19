@@ -4,10 +4,11 @@
 \echo Use "CREATE EXTENSION pg_squeeze" to load this file. \quit
 
 CREATE FUNCTION squeeze_table(
-       relation	text,
-       clustering_index text,
-       rel_tablespace text,
-       ind_tablespaces text[][])
+       relschema	name,
+       relation		name,
+       clustering_index name,
+       rel_tablespace 	name,
+       ind_tablespaces	name[][])
 RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_table'
 LANGUAGE C;
