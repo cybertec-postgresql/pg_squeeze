@@ -1209,10 +1209,16 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 	check_pg_class_changes(state->relid, state->pg_class_xmin, lock_held);
 
 	/*
-	 * Attribute and index changes should really need AccessExclusiveLock, so
-	 * also call them unconditionally.
+	 * Index change does not necessarily require lock of the parent relation,
+	 * so check indexes unconditionally.
 	 */
 	check_index_changes(state->relid, state->indexes, state->relninds);
+
+	/*
+	 * XXX If any lock level lower than AccessExclusiveLock conflicts with all
+	 * commands that change pg_attribute catalog, skip this check if lock_held
+	 * is at least that level.
+	 */
 	check_attribute_changes(state->relid, state->attr_xmins,
 							state->form_class->relnatts);
 }
