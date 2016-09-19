@@ -772,7 +772,7 @@ check_prerequisites(Relation rel)
 				 errmsg("\"%s\" is mapped relation",
 						RelationGetRelationName(rel))));
 
-	if (rel->rd_id <= FirstNormalObjectId)
+	if (rel->rd_id < FirstNormalObjectId)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not user relation",
