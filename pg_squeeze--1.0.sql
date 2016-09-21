@@ -16,6 +16,10 @@ CREATE TABLE tables (
 	check_interval	interval	NOT NULL	DEFAULT '1 minute',
 	CHECK (check_interval >= '1 minute'),
 
+	-- The first check ever. Can be used when rescheduling processing of
+	-- particular table.
+	first_check	timestamptz	NOT NULL	DEFAULT now(),
+
 	-- If at least check_interval elapsed since the last check and there's
         -- no task for the table in the queue, add a new one.
 	last_check	timestamptz,
@@ -80,14 +84,15 @@ AS $$
 	 UPDATE	squeeze.tables t
 	 SET	last_check = now()
 	 WHERE
-		    -- Checked too far in the past or never at all?
-		    (
-			    t.last_check + t.check_interval < now()
-			    OR
-			    t.last_check IS NULL
-		    ) AND
-		    -- Ignore tables for which a task currently exists.
-		    NOT t.id IN (SELECT table_id FROM squeeze.tasks)
+		first_check <= now() AND
+		-- Checked too far in the past or never at all?
+		(
+			t.last_check + t.check_interval < now()
+			OR
+			t.last_check IS NULL
+		) AND
+		-- Ignore tables for which a task currently exists.
+		NOT t.id IN (SELECT table_id FROM squeeze.tasks)
 	 RETURNING t.id, t.tabschema, t.tabname, t.max_dead_frac,
 		t.stats_max_age
     )
