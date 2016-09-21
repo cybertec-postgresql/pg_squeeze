@@ -13,7 +13,7 @@ CREATE TABLE tables (
 	-- table is eligible for squeeze. (User might prefer squeezing the
 	-- table at defined time rather than taking an immediate action to
 	-- address excessive bloat.)
-	check_interval	interval	NOT NULL	DEFAULT '1 minute',
+	check_interval	interval	NOT NULL	DEFAULT '1 hour',
 	CHECK (check_interval >= '1 minute'),
 
 	-- The first check ever. Can be used when rescheduling processing of
