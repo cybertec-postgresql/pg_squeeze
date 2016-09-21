@@ -140,7 +140,7 @@ BEGIN
 	RETURNING tb.tabschema, tb.tabname;
 
 	IF NOT FOUND THEN
-		RETURN;
+		RETURN false;
 	END IF;
 
 	-- squeeze_table() function requires the "user_catalog_option" to be
@@ -228,4 +228,9 @@ CREATE FUNCTION squeeze_table(
        ind_tablespaces	name[][])
 RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_table'
+LANGUAGE C;
+
+CREATE FUNCTION start_worker()
+RETURNS int
+AS 'MODULE_PATHNAME', 'start_worker'
 LANGUAGE C;
