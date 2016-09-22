@@ -281,3 +281,21 @@ CREATE FUNCTION start_worker()
 RETURNS int
 AS 'MODULE_PATHNAME', 'start_worker'
 LANGUAGE C;
+
+-- Stop "squeeze worker" if it's currently running.
+CREATE FUNCTION stop_worker()
+RETURNS boolean
+LANGUAGE sql
+AS $$
+	-- When looking for the PID we rely on the fact that the worker holds
+	-- lock on the extension. If the worker is not running, we could (in
+	-- theory) kill a regular backend trying to ALTER or DROP the
+	-- extension right now. It's not worth taking a different approach
+	-- just to avoid this extremely unlikely case (which shouldn't cause
+	-- data corruption).
+	SELECT	pg_terminate_backend(pid)
+	FROM	pg_catalog.pg_locks l,
+		pg_catalog.pg_extension e
+	WHERE  e.extname = 'pg_squeeze' AND
+		(l.classid, l.objid) = (3079, e.oid);
+$$;

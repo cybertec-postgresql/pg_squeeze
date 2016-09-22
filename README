@@ -103,12 +103,19 @@ perfectly understand what you're doing.
 Operation
 ---------
 
-To enable automated processing, call "squeeze.start_worker()" function. It
-starts a background worker that periodically checks which of the registered
-tables are eligible for squeeze and creates and executes tasks for them. If
-the worker is already running for the current database, the function does
-return PID of a new worker, but that new worker will exit immediately.
+To enable automated processing, run this statement:
 
+	SELECT squeeze.start_worker();
+
+The function starts a background worker that periodically checks which of the
+registered tables are eligible for squeeze and creates and executes tasks for
+them. If the worker is already running for the current database, the function
+does return PID of a new worker, but that new worker will exit immediately.
+
+If the background worker is running, you can use the following statement to
+stop it:
+
+	SELECT squeeze.stop_worker();
 
 CAUTION! Only the functions mentioned in this section are considered user
 interface. If you want to call any other one, make sure you perfectly
