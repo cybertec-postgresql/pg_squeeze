@@ -60,9 +60,6 @@ CREATE TABLE tasks (
 	-- Is this the task the next call of process() function will pick?
 	active		bool	NOT NULL	DEFAULT false,
 
-	-- Have we eventually succeeded?
-	success		bool	NOT NULL	DEFAULT false,
-
 	-- How many times did we try to process the task? The common use case
 	-- is that a concurrent DDL broke the processing.
 	tried		int	NOT NULL	DEFAULT 0
@@ -208,7 +205,6 @@ DECLARE
 	v_tabname	name;
 	v_task_id	int;
 	v_tried		int;
-	v_success	bool;
 	v_max_reached	bool;
 	v_stmt		text;
 
@@ -217,9 +213,9 @@ DECLARE
 	v_err_msg	text;
 	v_err_detail	text;
 BEGIN
-	SELECT tb.tabschema, tb.tabname, t.id, t.tried, t.success,
+	SELECT tb.tabschema, tb.tabname, t.id, t.tried,
 		t.tried >= tb.max_retry + 1
-	INTO v_tabschema, v_tabname, v_task_id, v_tried, v_success,
+	INTO v_tabschema, v_tabname, v_task_id, v_tried,
 		 v_max_reached
 	FROM squeeze.tasks t, squeeze.tables tb
 	WHERE t.table_id = tb.id AND t.active;
@@ -229,21 +225,18 @@ BEGIN
 		RETURN;
 	END IF;
 
-	-- If the current task succeeded or failures caused reaching of the
-	-- maximum number of attempts, delete it. start_next_task() will
-	-- prepare the next one.
-	IF v_success OR v_max_reached THEN
+	-- If the active task failed too many times, delete it.
+	-- start_next_task() will prepare the next one.
+	IF v_max_reached THEN
 		PERFORM squeeze.cleanup_task(v_task_id);
 
 		-- squeeze_table() resets the storage option on successful
-		-- completion, but we must do manually otherwise.
-		IF NOT v_success THEN
-			v_stmt := 'ALTER TABLE ' || v_tabschema || '.' ||
-			v_tabname || ' RESET (user_catalog_table)';
+		-- completion, but here we must do it explicitly.
+		v_stmt := 'ALTER TABLE ' || v_tabschema || '.' ||
+		v_tabname || ' RESET (user_catalog_table)';
 
-			RAISE NOTICE '%', v_stmt;
-			EXECUTE v_stmt;
-		END IF;
+		RAISE NOTICE '%', v_stmt;
+		EXECUTE v_stmt;
 
 		RETURN;
 	END IF;
