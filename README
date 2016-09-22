@@ -123,6 +123,10 @@ older than the value of "stats_max_age" described above. To make a table
 disappear from the view, run ANALYZE or VACUUM ANALYZE on it, or let
 autovaccuum worker do so.
 
+"squeeze.errors" table records errors that happened during the actual
+squeezing. Unless unexpected conditions exist, these errors should reflect to
+changes of table definition that prevented the squeeze from completion.
+
 
 Note on Concurrency
 -------------------

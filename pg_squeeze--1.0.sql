@@ -71,6 +71,17 @@ CREATE TABLE tasks (
 -- Make sure there is at most one active task anytime.
 CREATE UNIQUE INDEX ON tasks(active) WHERE active;
 
+CREATE TABLE errors (
+	id		bigserial	NOT NULL	PRIMARY KEY,
+	occurred	timestamptz	NOT NULL	DEFAULT now(),
+	tabschema	name	NOT NULL,
+	tabname		name	NOT NULL,
+
+	sql_state	text	NOT NULL,
+	err_msg		text	NOT NULL,
+	err_detail	text
+);
+
 -- Overview of all the registered tables for which the required freshness of
 -- statistics is not met.
 CREATE VIEW unusable_stats AS
@@ -200,6 +211,11 @@ DECLARE
 	v_success	bool;
 	v_max_reached	bool;
 	v_stmt		text;
+
+	-- Error info to be logged.
+	v_sql_state	text;
+	v_err_msg	text;
+	v_err_detail	text;
 BEGIN
 	SELECT tb.tabschema, tb.tabname, t.id, t.tried, t.success,
 		t.tried >= tb.max_retry + 1
@@ -239,10 +255,15 @@ BEGIN
 
 		PERFORM squeeze.cleanup_task(v_task_id);
 	EXCEPTION
-
 		WHEN OTHERS THEN
-			--TODO Insert record into log table.
-			RAISE NOTICE 'ERROR';
+			GET STACKED DIAGNOSTICS v_sql_state := RETURNED_SQLSTATE;
+			GET STACKED DIAGNOSTICS v_err_msg := MESSAGE_TEXT;
+			GET STACKED DIAGNOSTICS v_err_detail := PG_EXCEPTION_DETAIL;
+
+			INSERT INTO squeeze.errors (tabschema, tabname,
+				sql_state, err_msg, err_detail)
+			VALUES (v_tabschema, v_tabname, v_sql_state, v_err_msg,
+				v_err_detail);
 
 			-- Account for the current attempt.
 			UPDATE squeeze.tasks
