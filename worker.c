@@ -89,6 +89,7 @@ squeeze_worker_main(Datum main_arg)
 	char	*c;
 	LOCKTAG		tag;
 	LockAcquireResult	lock_res;
+	long	delay;
 
 	pqsignal(SIGTERM, squeeze_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
@@ -140,8 +141,7 @@ squeeze_worker_main(Datum main_arg)
 		int	rc;
 
 		rc = WaitLatch(MyLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   1000L);
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay);
 		ResetLatch(MyLatch);
 
 		if (rc & WL_POSTMASTER_DEATH)
@@ -150,7 +150,25 @@ squeeze_worker_main(Datum main_arg)
 		run_command("SELECT squeeze.add_new_tasks()", false);
 
 		if (!run_command("SELECT id FROM squeeze.tasks LIMIT 1", true))
+		{
+			/*
+			 * As there's no urgent work, wait some time.
+			 *
+			 * We might calculate how much time the actual work took and
+			 * calculate how long we need to wait so that each iteration
+			 * starts exactly N minutes after the previous one. However tables
+			 * can have the "task_interval" configured to longer time than 1
+			 * minute, so excessive processing time can add to the actual
+			 * task_interval anyway. Simply, the task_interval should be
+			 * considered the *minimum*.
+			 *
+			 * XXX Consider making this delay configurable.
+			 */
+			delay = 60000L;
 			continue;
+		}
+		else
+			delay = 0L;
 
 		run_command("SELECT squeeze.start_next_task()", false);
 		run_command("SELECT squeeze.process_current_task()", false);
