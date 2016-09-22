@@ -22,7 +22,14 @@ CREATE TABLE tables (
 
 	-- If at least task_interval elapsed since the last task creation and
         -- there's no task for the table in the queue, add a new one.
+	--
+	-- We could apply task_interval to last_task_finished instead, but
+	-- that would add the task duration as an extra delay to the next
+	-- schedule, making the schedule less predictable. (Of course the
+	-- schedule is shifted anyway if the task processing takes more than
+	-- task_interval.)
 	last_task_created	timestamptz,
+
 	last_task_finished	timestamptz,
 
 	-- The maximum tolerable fraction of dead tuples in the table. Once
@@ -37,13 +44,13 @@ CREATE TABLE tables (
 	-- TODO Tune the default value.
 	stats_max_age	interval	NOT NULL	DEFAULT '1 hour',
 
-	retry_max	int	NOT NULL	DEFAULT 0
+	max_retry	int	NOT NULL	DEFAULT 0
 );
 
 -- Task queue. If completed with success, the task is moved into "log" table.
 --
--- If task fails and tables(retry_max) is greater than zero, processing will
--- be retried automatically as long as tasks(tried) < tables(retry_max) +
+-- If task fails and tables(max_retry) is greater than zero, processing will
+-- be retried automatically as long as tasks(tried) < tables(max_retry) +
 -- 1. Then the task will be removed from the queue.
 CREATE TABLE tasks (
 	id		serial	NOT NULL	PRIMARY KEY,
@@ -76,6 +83,7 @@ WHERE	(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
 		OR
 		COALESCE(s.last_analyze, s.last_autoanalyze) < now() - t.stats_max_age
 	);
+
 
 -- Create tasks for newly qualifying tables.
 CREATE FUNCTION add_new_tasks() RETURNS void
@@ -194,7 +202,7 @@ DECLARE
 	v_stmt		text;
 BEGIN
 	SELECT tb.tabschema, tb.tabname, t.id, t.tried, t.success,
-		t.tried >= tb.retry_max + 1
+		t.tried >= tb.max_retry + 1
 	INTO v_tabschema, v_tabname, v_task_id, v_tried, v_success,
 		 v_max_reached
 	FROM squeeze.tasks t, squeeze.tables tb

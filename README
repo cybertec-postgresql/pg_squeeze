@@ -19,8 +19,8 @@ that we use logical decoding [4] instead of triggers to capture concurrent
 changes.
 
 
-Setup
------
+Installation
+------------
 
 1. Set PG_CONFIG envoirnment variable to point to pg_config command of your
    PostgreSQL installation.
@@ -41,8 +41,91 @@ Setup
    CREATE EXTENSION pg_squeeze;
 
 
-Concurrency
------------
+Configuration
+-------------
+
+To make the "pg_squeeze" extension aware of a table, you need to insert a
+record into "squeeze.tables" table. Once added, statistics of the table are
+checked periodically. Whenever the table meets criteria to be "squeezed", a
+"task" is added to a queue. The tasks are processed sequentially, in the order
+they were created.
+
+The simplest "registration" looks like
+
+	INSERT INTO squeeze.tables
+	(tabschema, tabname, first_check)
+	VALUES
+	('public', 'foo', now());
+
+* "tabschema" and "tabname" are schema and table name respectively.
+
+* "first_check" column determines time of the earliest check of statistics,
+  which can possibly result in a new task creation.
+
+Additional columns can be specified optionally, for example:
+
+	INSERT INTO squeeze.tables
+	(tabschema, tabname, first_check, task_interval, max_dead_frac,
+	stats_max_age, max_retry)
+	VALUES
+	('public', 'bar', now(), '1 day', 0.9, '2 hours', 2);
+
+* "task_interval" is the minimum time between creation of two subsequent tasks
+  for given table. Note that ANALYZE (whether manually or by "autovacuum
+  worker" process) must have been executed since the previous task had
+  completed. The default value is 1 hour.
+
+* "max_dead_frac" is the maximum fraction (a positive number greater than zero
+  and lower or equal to 1) of "dead tuples" in the table. If this ratio is
+  exceeded, the table becomes candidate for squeezing. The default value is
+  0.5.
+
+* "stats_max_age" is the maximum age of statistics (see "last_analyze" and
+  "last_autoanalyze" columns of "pg_stat_user_tables" table). If the
+  statistics is older than this, the corresponding table won't be squeezed
+  even if its value of "max_dead_frac" indicates it should be. The default
+  value is 1 hour.
+
+* "max_retry" is the maximum number of extra attempts to squeeze a table if
+  the first processing of the corresponding task failed. Typical reason to
+  retry the processing is that table definition got changed while the table
+  was being squeezed. (As we use "optimistic locking", such a definition
+  change causes the "squeezing transaction" to abort.) If the number of
+  retries is achieved, processing of the table is considered complete,
+  i.e. new task won't be created until the table gets ANALYZEd again. The
+  default value of "max_retry" is 0 (i.e. do not retry).
+
+CAUTION! Only the "squeeze.tables" table and only the columns described above
+should be touched by user. If you want to change anything else, make sure you
+perfectly understand what you're doing.
+
+
+Operation
+---------
+
+To enable automated processing, call "squeeze.start_worker()" function. It
+starts a background worker that periodically checks which of the registered
+tables are eligible for squeeze and creates and executes tasks for them. If
+the worker is already running for the current database, the function does
+return PID of a new worker, but that new worker will exit immediately.
+
+
+CAUTION! Only the functions mentioned in this section are considered user
+interface. If you want to call any other one, make sure you perfectly
+understand what you're doing.
+
+
+Monitoring
+----------
+
+"squeeze.unusable_stats" view shows registered tables whose statistics are
+older than the value of "stats_max_age" described above. To make a table
+disappear from the view, run ANALYZE or VACUUM ANALYZE on it, or let
+autovaccuum worker do so.
+
+
+Note on Concurrency
+-------------------
 
 Like [1], pg_squeeze holds exclusive table lock only for the (supposedly
 short) final stage of processing. The price user pays for it is that s/he
