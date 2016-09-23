@@ -33,19 +33,6 @@
 
 #include "pg_squeeze.h"
 
-extern void	_PG_init(void);
-extern void	_PG_fini(void);
-
-void
-_PG_init(void)
-{
-}
-
-void
-_PG_fini(void)
-{
-}
-
 /* This must be available to pg_dlsym(). */
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
 

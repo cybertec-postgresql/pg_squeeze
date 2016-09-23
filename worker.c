@@ -13,13 +13,18 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
+#include "utils/guc.h"
 #include "utils/snapmgr.h"
+
+#include "pg_squeeze.h"
 
 extern Datum start_worker(PG_FUNCTION_ARGS);
 
 extern void squeeze_worker_main(Datum main_arg);
 
+static void squeeze_worker_sighup(SIGNAL_ARGS);
 static void squeeze_worker_sigterm(SIGNAL_ARGS);
+
 static bool run_command(char *command, bool check_result);
 
 PG_FUNCTION_INFO_V1(start_worker);
@@ -81,6 +86,7 @@ start_worker(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pid);
 }
 
+static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
 void
@@ -92,6 +98,7 @@ squeeze_worker_main(Datum main_arg)
 	LockAcquireResult	lock_res;
 	long	delay;
 
+	pqsignal(SIGHUP, squeeze_worker_sighup);
 	pqsignal(SIGTERM, squeeze_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
 
@@ -148,6 +155,12 @@ squeeze_worker_main(Datum main_arg)
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
 
+		if (got_sighup)
+		{
+			got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
 		run_command("SELECT squeeze.add_new_tasks()", false);
 
 		if (!run_command("SELECT id FROM squeeze.tasks LIMIT 1", true))
@@ -162,10 +175,8 @@ squeeze_worker_main(Datum main_arg)
 			 * minute, so excessive processing time can add to the actual
 			 * task_interval anyway. Simply, the task_interval should be
 			 * considered the *minimum*.
-			 *
-			 * XXX Consider making this delay configurable.
 			 */
-			delay = 60000L;
+			delay = squeeze_worker_naptime * 1000L;
 			continue;
 		}
 		else
@@ -188,6 +199,17 @@ squeeze_worker_main(Datum main_arg)
 	if (!LockRelease(&tag, ExclusiveLock, false))
 		elog(ERROR, "Failed to release extension lock");
 	proc_exit(0);
+}
+
+static void
+squeeze_worker_sighup(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	got_sighup = true;
+	SetLatch(MyLatch);
+
+	errno = save_errno;
 }
 
 static void

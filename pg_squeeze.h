@@ -33,3 +33,7 @@ typedef struct DecodingOutputState
 	 */
 	ChangeStore	metadata;
 } DecodingOutputState;
+
+extern void	_PG_init(void);
+
+extern int squeeze_worker_naptime;

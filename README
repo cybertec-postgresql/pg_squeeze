@@ -32,7 +32,10 @@ Installation
 4. Apply the following settings to postgresql.conf:
 
    wal_level = logical
+
    max_replication_slots = 1 # ... or add 1 to the current value.
+
+   shared_preload_libraries = 'pg_squeeze' # ... or add the library to the existing ones.
 
 5. Start the PG cluster.
 
@@ -136,6 +139,10 @@ stop it:
 CAUTION! Only the functions mentioned in this section are considered user
 interface. If you want to call any other one, make sure you perfectly
 understand what you're doing.
+
+When there's no work to do, the worker sleeps before checking again. The delay
+is controlled by GUC parameter "squeeze.worker_naptime". It's measured in
+seconds and the default value is 1 minute.
 
 
 Monitoring

@@ -35,6 +35,7 @@
 #include "storage/standbydefs.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -167,6 +168,26 @@ static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
 						   int nindexes);
 static void swap_relation_files(Oid r1, Oid r2);
 static void clear_user_catalog_option(CatalogState *cat_state);
+
+
+int squeeze_worker_naptime;
+
+void
+_PG_init(void)
+{
+	DefineCustomIntVariable(
+		"squeeze.worker_naptime",
+		"Sleep time (in seconds) of the squeeze worker.",
+		"If there are no tables eligible for squeezing, the background worker "
+		"sleeps this amount of seconds and then tries again.",
+		&squeeze_worker_naptime,
+		60, 1, INT_MAX,
+		PGC_SIGHUP,
+		GUC_UNIT_S,
+		NULL, NULL, NULL);
+	elog(WARNING, "squeeze loaded: %d", squeeze_worker_naptime);
+}
+
 
 /*
  * Char attribute to construct tuple descriptor for
