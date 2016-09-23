@@ -20,18 +20,6 @@ CREATE TABLE tables (
 	-- particular table.
 	first_check	timestamptz	NOT NULL,
 
-	-- If at least task_interval elapsed since the last task creation and
-        -- there's no task for the table in the queue, add a new one.
-	--
-	-- We could apply task_interval to last_task_finished instead, but
-	-- that would add the task duration as an extra delay to the next
-	-- schedule, making the schedule less predictable. (Of course the
-	-- schedule is shifted anyway if the task processing takes more than
-	-- task_interval.)
-	last_task_created	timestamptz,
-
-	last_task_finished	timestamptz,
-
 	-- The maximum tolerable fraction of dead tuples in the table. Once
 	-- this gets exceeded, a task is created for the table.
 	--
@@ -44,8 +32,47 @@ CREATE TABLE tables (
 	-- TODO Tune the default value.
 	stats_max_age	interval	NOT NULL	DEFAULT '1 hour',
 
-	max_retry	int	NOT NULL	DEFAULT 0
+	max_retry	int		NOT NULL	DEFAULT 0
 );
+
+-- Fields that would normally fit into "tables" but require no attention of
+-- the user are separate. Thus "tables" can be considered an user interface.
+CREATE TABLE tables_internal (
+       table_id	int	NOT NULL	PRIMARY KEY
+       REFERENCES tables ON DELETE CASCADE,
+
+	-- If at least task_interval elapsed since the last task creation and
+        -- there's no task for the table in the queue, add a new one.
+	--
+	-- We could apply task_interval to last_task_finished instead, but
+	-- that would add the task duration as an extra delay to the next
+	-- schedule, making the schedule less predictable. (Of course the
+	-- schedule is shifted anyway if the task processing takes more than
+	-- task_interval.)
+	last_task_created	timestamptz,
+
+	last_task_finished	timestamptz
+);
+
+-- Trigger to keep "tables_internal" in-sync with "tables".
+--
+-- (Deletion is handled by foreign key.)
+CREATE FUNCTION tables_internal_trig_func()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+	INSERT INTO squeeze.tables_internal(table_id)
+	VALUES (NEW.id);
+
+	RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER tables_internal_trig AFTER INSERT
+ON squeeze.tables
+FOR EACH ROW
+EXECUTE PROCEDURE squeeze.tables_internal_trig_func();
 
 -- Task queue. If completed with success, the task is moved into "log" table.
 --
@@ -98,17 +125,19 @@ CREATE FUNCTION add_new_tasks() RETURNS void
 LANGUAGE sql
 AS $$
     WITH tasks_new(id) AS (
-	 UPDATE	squeeze.tables t
+	 UPDATE	squeeze.tables_internal i
 	 SET	last_task_created = now()
-	 FROM	pg_catalog.pg_stat_user_tables s
+	 FROM	pg_catalog.pg_stat_user_tables s,
+		squeeze.tables t
 	 WHERE
 		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
+		i.table_id = t.id AND
 		t.first_check <= now() AND
 		-- Checked too far in the past or never at all?
 		(
-			t.last_task_created + t.task_interval < now()
+			i.last_task_created + t.task_interval < now()
 			OR
-			t.last_task_created IS NULL
+			i.last_task_created IS NULL
 		)
 		AND
 		-- Important threshold exceeded (avoid deletion by zero)?
@@ -126,11 +155,11 @@ AS $$
 		AND
 		-- Each processing makes the current statistics obsolete.
 		(
-			t.last_task_finished ISNULL
+			i.last_task_finished ISNULL
 			OR
-			t.last_task_finished < s.last_analyze
+			i.last_task_finished < s.last_analyze
 			OR
-			t.last_task_finished < s.last_autoanalyze
+			i.last_task_finished < s.last_autoanalyze
 		)
 	 RETURNING t.id
     )
@@ -189,10 +218,10 @@ AS $$
 		WHERE id = a_task_id
 		RETURNING table_id
 	)
-	UPDATE squeeze.tables t
+	UPDATE squeeze.tables_internal t
 	SET last_task_finished = now()
 	FROM deleted d
-	WHERE d.table_id = t.id;
+	WHERE d.table_id = t.table_id;
 $$;
 
 -- Process the currently active task.

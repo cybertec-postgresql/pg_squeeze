@@ -95,9 +95,8 @@ Additional columns can be specified optionally, for example:
   i.e. new task won't be created until the table gets ANALYZEd again. The
   default value of "max_retry" is 0 (i.e. do not retry).
 
-CAUTION! Only the "squeeze.tables" table and only the columns described above
-should be touched by user. If you want to change anything else, make sure you
-perfectly understand what you're doing.
+CAUTION! "squeeze.table" is the only table user should modify. If you want to
+change anything else, make sure you perfectly understand what you are doing.
 
 
 Operation
