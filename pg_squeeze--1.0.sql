@@ -30,12 +30,17 @@ CREATE TABLE tables (
 	-- particular table.
 	first_check	timestamptz	NOT NULL,
 
-	-- The maximum tolerable fraction of dead tuples in the table. Once
-	-- this gets exceeded, a task is created for the table.
+	-- The minimum number of tuples that triggers processing.
 	--
 	-- TODO Tune the default value.
-	max_dead_frac	real	NOT NULL	DEFAULT 0.5,
-	CHECK (max_dead_frac > 0 AND max_dead_frac <= 1),
+	min_dead_tuples	int	NOT NULL	DEFAULT	50,
+
+	-- Fraction of table size to add to min_dead_tuples when deciding
+	-- whether to create a task to squeeze table.
+	--
+	-- TODO Tune the default value.
+	squeeze_scale_factor	real	NOT NULL	DEFAULT 0.5,
+	CHECK (squeeze_scale_factor > 0 AND squeeze_scale_factor <= 1),
 
 	-- If statistics are older than this, no new task is created.
 	--
@@ -150,9 +155,9 @@ AS $$
 			i.last_task_created IS NULL
 		)
 		AND
-		-- Important threshold exceeded (avoid deletion by zero)?
-		(s.n_live_tup + s.n_dead_tup) > 0 AND
-		(s.n_dead_tup::real / (s.n_live_tup + s.n_dead_tup)) > t.max_dead_frac
+		-- Threshold exceeded?
+		s.n_dead_tup >= t.min_dead_tuples +
+			      t.squeeze_scale_factor * (s.n_live_tup + s.n_dead_tup)
 		AND
 		-- Can we still rely on the statistics?
 		(

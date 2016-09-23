@@ -78,10 +78,12 @@ Additional columns can be specified optionally, for example:
   worker" process) must have been executed since the previous task had
   completed. The default value is 1 hour.
 
-* "max_dead_frac" is the maximum fraction (a positive number greater than zero
-  and lower or equal to 1) of "dead tuples" in the table. If this ratio is
-  exceeded, the table becomes candidate for squeezing. The default value is
-  0.5.
+* "min_dead_tuples" is the minimum number of dead tuples to trigger processing
+  of this table. The default value is 50.
+
+* "squeeze_scale_factor" is the fraction of table size to add to
+  "min_dead_tuples" when deciding whether to schedule the next squeeze
+  task. The default value is 0.5.
 
 * "stats_max_age" is the maximum age of statistics (see "last_analyze" and
   "last_autoanalyze" columns of "pg_stat_user_tables" table). If the
