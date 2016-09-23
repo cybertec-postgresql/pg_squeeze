@@ -1,4 +1,3 @@
-#include <unistd.h>
 #include "c.h"
 #include "postgres.h"
 #include "fmgr.h"
