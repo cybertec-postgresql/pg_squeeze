@@ -9,6 +9,7 @@
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "postmaster/bgworker.h"
+#include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
@@ -171,7 +172,17 @@ squeeze_worker_main(Datum main_arg)
 			delay = 0L;
 
 		run_command("SELECT squeeze.start_next_task()", false);
+
+		/* Do the actual work. */
 		run_command("SELECT squeeze.process_current_task()", false);
+
+		/*
+		 * Release the replication slot explicitly, ERROR does not ensure
+		 * that. (PostgresMain does that for regular backend in the main
+		 * loop.)
+		 */
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
 	}
 
 	if (!LockRelease(&tag, ExclusiveLock, false))

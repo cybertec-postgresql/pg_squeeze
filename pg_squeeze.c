@@ -443,11 +443,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
-		TeardownHistoricSnapshot(true);
+		switch_snapshot(NULL);
 	}
 	PG_CATCH();
 	{
-		TeardownHistoricSnapshot(true);
+		switch_snapshot(NULL);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1533,7 +1533,6 @@ switch_snapshot(Snapshot snap_hist)
 	}
 	else
 	{
-		Assert(HistoricSnapshotActive());
 		TeardownHistoricSnapshot(false);
 		/* Revert the hack done above. */
 		FirstSnapshotSet = true;
