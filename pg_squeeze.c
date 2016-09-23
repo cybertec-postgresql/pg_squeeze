@@ -1151,7 +1151,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		namestr = NameStr(form_class->relname);
 		namelen = strlen(namestr);
 		Assert(namelen < NAMEDATALEN);
-		strcpy(NameStr(result->relname), namestr);
+		strcpy(NameStr(res_item->relname), namestr);
 
 		res_item->reltablespace = form_class->reltablespace;
 	}
