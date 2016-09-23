@@ -95,6 +95,23 @@ Additional columns can be specified optionally, for example:
   i.e. new task won't be created until the table gets ANALYZEd again. The
   default value of "max_retry" is 0 (i.e. do not retry).
 
+* "clustering_index" is an existing index of the processed table. Once the
+  processing is finished, tuples of the table will be physically sorted by
+  the key of this index.
+
+* "rel_tablespace" is an existing tablespace the table should be moved
+  into. NULL means that the table should stay where it is.
+
+* "ind_tablespaces" is a two-dimensional array in which each row specifies
+  tablespace mapping of an index. The first and the second columns represent
+  index name and tablespace name respectively. All indexes for which no
+  mapping is specified will stay in the original tablespace.
+
+  Regarding tablespaces, one special case is worth to mention: if tablespace
+  is specified for table but not for indexes, the table gets moved to that
+  tablespace but the indexes stay in the original one (i.e. the tablespace of
+  the table is not the default for indexes as one might expect).
+
 CAUTION! "squeeze.table" is the only table user should modify. If you want to
 change anything else, make sure you perfectly understand what you are doing.
 

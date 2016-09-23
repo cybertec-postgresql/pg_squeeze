@@ -9,6 +9,16 @@ CREATE TABLE tables (
 	tabname		name	NOT NULL,
 	UNIQUE(tabschema, tabname),
 
+	-- Clustering index.
+	clustering_index name,
+
+	-- Tablespace the table should be put into.
+	rel_tablespace 	name,
+
+	-- Index-to-tablespace mappings. Each row of the array is expected to
+	-- consist of 2 columns: index name and target tablespace.
+	ind_tablespaces	name[][],
+
 	-- The minimum time that needs to elapse after task creation before we
 	-- check again if the table is eligible for squeeze. (User might
 	-- prefer squeezing the table at defined time rather than taking an
@@ -232,6 +242,9 @@ AS $$
 DECLARE
 	v_tabschema	name;
 	v_tabname	name;
+	v_cl_index	name;
+	v_rel_tbsp	name;
+	v_ind_tbsps	name[][];
 	v_task_id	int;
 	v_tried		int;
 	v_max_reached	bool;
@@ -242,10 +255,11 @@ DECLARE
 	v_err_msg	text;
 	v_err_detail	text;
 BEGIN
-	SELECT tb.tabschema, tb.tabname, t.id, t.tried,
-		t.tried >= tb.max_retry + 1
-	INTO v_tabschema, v_tabname, v_task_id, v_tried,
-		 v_max_reached
+	SELECT tb.tabschema, tb.tabname, tb.clustering_index,
+tb.rel_tablespace, tb.ind_tablespaces, t.id, t.tried,
+t.tried >= tb.max_retry + 1
+	INTO v_tabschema, v_tabname, v_cl_index, v_rel_tbsp, v_ind_tbsps,
+ v_task_id, v_tried, v_max_reached
 	FROM squeeze.tasks t, squeeze.tables tb
 	WHERE t.table_id = tb.id AND t.active;
 
@@ -272,8 +286,8 @@ BEGIN
 
 	-- Do the actual work.
 	BEGIN
-		-- TODO Pass the missing arguments if appropriate.
-		PERFORM squeeze.squeeze_table(v_tabschema, v_tabname, NULL, NULL, NULL);
+		PERFORM squeeze.squeeze_table(v_tabschema, v_tabname,
+ v_cl_index, v_rel_tbsp, v_ind_tbsps);
 
 		PERFORM squeeze.cleanup_task(v_task_id);
 	EXCEPTION
