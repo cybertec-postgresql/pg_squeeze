@@ -210,16 +210,6 @@ static Form_pg_attribute att_char = &att_char_data;
  * should check (and possibly clear) the option if the function failed in any
  * way.
  */
-/*
- * TODO
- *
- * 1. Move the logic into a separate function so that background worker can
- * call it w/o FMGR.
- *
- * 2. Return status code instead of raising / not-raising ERROR from the
- * function itself and subroutines. (Never forget to uninstall the historic
- * snapshot.)
- */
 extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
 Datum
