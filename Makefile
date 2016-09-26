@@ -1,5 +1,5 @@
 MODULE_big = pg_squeeze
-OBJS = pg_squeeze.o decode_plugin.o worker.o $(WIN32RES)
+OBJS = pg_squeeze.o concurrent.o decode_plugin.o worker.o $(WIN32RES)
 PGFILEDESC = "pg_squeeze - a tool to remove unused space from a relation."
 
 EXTENSION = pg_squeeze

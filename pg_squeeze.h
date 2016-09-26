@@ -1,3 +1,16 @@
+#include "c.h"
+#include "postgres.h"
+#include "fmgr.h"
+#include "miscadmin.h"
+
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "access/relscan.h"
+#include "access/xact.h"
+#include "replication/logical.h"
+#include "utils/inval.h"
+#include "utils/resowner.h"
+#include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
 
 typedef enum
@@ -37,3 +50,11 @@ typedef struct DecodingOutputState
 extern void	_PG_init(void);
 
 extern int squeeze_worker_naptime;
+
+extern void decode_concurrent_changes(LogicalDecodingContext *ctx,
+				      XLogRecPtr *startptr, XLogRecPtr end_of_wal,
+				      ResourceOwner resowner);
+extern void process_concurrent_changes(DecodingOutputState *s,
+									   Relation relation, ScanKey key,
+									   int nkeys, Oid *indexes, int nindexes,
+									   Oid ident_index);
