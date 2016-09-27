@@ -5,11 +5,10 @@
 
 #include "pg_squeeze.h"
 
+#include "executor/executor.h"
 #include "replication/decode.h"
 #include "utils/rel.h"
 
-static void update_indexes(Relation heap, HeapTuple tuple, Oid *indexes,
-						   int nindexes);
 
 void
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
@@ -66,6 +65,63 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 	PG_END_TRY();
 }
 
+IndexInsertState *
+get_index_insert_state(Relation	relation, Oid ident_index_id)
+{
+	EState	*estate;
+	int	i;
+	IndexInsertState	*result;
+
+	result = (IndexInsertState *) palloc0(sizeof(IndexInsertState));
+	estate = CreateExecutorState();
+	result->econtext = GetPerTupleExprContext(estate);
+
+	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
+	InitResultRelInfo(result->rri, relation,  0, 0);
+	ExecOpenIndices(result->rri, false);
+
+	/*
+	 * Find the relcache entry of the identity index so that we spend no extra
+	 * effort to open / close it.
+	 */
+	for (i = 0; i < result->rri->ri_NumIndices; i++)
+	{
+		IndexInfo	*ii;
+		Relation	ind_rel;
+
+		/*
+		 * We don't need ExecInsertIndexTuples() to check exclusion
+		 * constraints - the source relation is responsible for those.
+		 */
+		ii = result->rri->ri_IndexRelationInfo[i];
+		ii->ii_ExclusionOps = NULL;
+		ii->ii_ExclusionProcs = NULL;
+		ii->ii_ExclusionStrats = NULL;
+
+		ind_rel = result->rri->ri_IndexRelationDescs[i];
+		if (ind_rel->rd_id == ident_index_id)
+			result->ident_index = ind_rel;
+	}
+	if (result->ident_index == NULL)
+		elog(ERROR, "Failed to open identity index");
+
+	/* Only initialize fields needed by ExecInsertIndexTuples(). */
+	estate->es_result_relations = estate->es_result_relation_info =
+		result->rri;
+	estate->es_num_result_relations = 1;
+	result->estate = estate;
+
+	return result;
+}
+
+void
+free_index_insert_state(IndexInsertState *iistate)
+{
+	ExecCloseIndices(iistate->rri);
+	FreeExecutorState(iistate->estate);
+	pfree(iistate->rri);
+	pfree(iistate);
+}
 
 /*
  * Process changes that happened during the initial load.
@@ -83,8 +139,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
  */
 void
 process_concurrent_changes(DecodingOutputState *s, Relation relation,
-						   ScanKey key, int nkeys, Oid *indexes, int nindexes,
-						   Oid ident_index)
+						   ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot	*slot_data, *slot_metadata;
 	HeapTuple tup_old = NULL;
@@ -95,6 +150,7 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 
 	slot_data = MakeTupleTableSlot();
 	ExecSetSlotDescriptor(slot_data, s->data.tupdesc);
+	iistate->econtext->ecxt_scantuple = slot_data;
 
 	while (tuplestore_gettupleslot(s->metadata.tupstore, true, false,
 								   slot_metadata))
@@ -133,6 +189,8 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 		}
 		else if (change_kind == PG_SQUEEZE_CHANGE_INSERT)
 		{
+			List	*recheck;
+
 			Assert(tup_old == NULL);
 
 			/*
@@ -143,7 +201,19 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 				bistate = GetBulkInsertState();
 
 			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
-			update_indexes(relation, tup, indexes, nindexes);
+
+			/* Update indexes. */
+			recheck = ExecInsertIndexTuples(slot_data, &(tup->t_self),
+											iistate->estate, false, NULL,
+											NIL);
+
+			/*
+			 * If recheck is required, it must have been preformed on the
+			 * source relation by now. (All the logical changes we process
+			 * here are already committed.)
+			 */
+			list_free(recheck);
+
 			pfree(tup);
 		}
 		else if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
@@ -153,7 +223,6 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 			IndexScanDesc	scan;
 			int i;
 			ItemPointerData	ctid;
-			Relation	index;
 
 			if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
@@ -164,9 +233,6 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 				Assert(tup_old == NULL);
 				tup_key = tup;
 			}
-
-			/* No lock, the parent relation is not yet visible to others. */
-			index = index_open(ident_index, NoLock);
 
 			/*
 			 * Find the tuple to be updated or deleted.
@@ -183,8 +249,8 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 			 * the reason to increment the counter). However, heap_update()
 			 * does require CommandCounterIncrement().
 			 */
-			scan = index_beginscan(relation, index, GetTransactionSnapshot(),
-								   nkeys, 0);
+			scan = index_beginscan(relation, iistate->ident_index,
+								   GetTransactionSnapshot(), nkeys, 0);
 
 			index_rescan(scan, key, nkeys, NULL, 0);
 
@@ -206,13 +272,19 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 				elog(ERROR, "Failed to find target tuple");
 			ItemPointerCopy(&tup_exist->t_self, &ctid);
 			index_endscan(scan);
-			index_close(index, NoLock);
 
 			if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
 				simple_heap_update(relation, &ctid, tup);
 				if (!HeapTupleIsHeapOnly(tup))
-					update_indexes(relation, tup, indexes, nindexes);
+				{
+					List	*recheck;
+
+					recheck = ExecInsertIndexTuples(slot_data, &(tup->t_self),
+													iistate->estate, false,
+													NULL, NIL);
+					list_free(recheck);
+				}
 			}
 			else
 				simple_heap_delete(relation, &ctid);
@@ -244,57 +316,4 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 
 	ExecDropSingleTupleTableSlot(slot_data);
 	ExecDropSingleTupleTableSlot(slot_metadata);
-}
-
-/* Insert ctid into all indexes of relation. */
-static void
-update_indexes(Relation heap, HeapTuple tuple, Oid *indexes, int nindexes)
-{
-	int i;
-	Datum	*values_heap;
-	bool	*isnull_heap;
-	int	natts_heap;
-	ItemPointerData	ctid;
-
-	/*
-	 * TODO Find out if FormIndexDatum() works with MinimalTuple. Repeated
-	 * retrieval from slot might not require deforming of the whole heap
-	 * tuple.
-	 */
-	natts_heap = heap->rd_att->natts;
-	values_heap = (Datum *) palloc(natts_heap * sizeof(Datum));
-	isnull_heap = (bool *) palloc(natts_heap * sizeof(bool));
-	heap_deform_tuple(tuple, heap->rd_att, values_heap, isnull_heap);
-	ItemPointerCopy(&tuple->t_self, &ctid);
-
-	for (i = 0; i < nindexes; i++)
-	{
-		Relation rel_ind;
-		Datum *values;
-		bool *isnull;
-		Form_pg_index	ind_form;
-		int	indnatts;
-		int	j;
-
-		rel_ind = index_open(indexes[i], RowExclusiveLock);
-		ind_form = rel_ind->rd_index;
-		indnatts = ind_form->indnatts;
-		values = (Datum *) palloc(indnatts * sizeof(Datum));
-		isnull = (bool *) palloc(indnatts * sizeof(bool));
-		for (j = 0; j < indnatts; j++)
-		{
-			AttrNumber	attno_heap;
-
-			attno_heap = ind_form->indkey.values[j] - 1;
-			values[j] = values_heap[attno_heap];
-			isnull[j] = isnull_heap[attno_heap];
-		}
-		index_insert(rel_ind, values, isnull, &ctid, heap,
-					 ind_form->indisunique);
-		pfree(values);
-		pfree(isnull);
-		index_close(rel_ind, RowExclusiveLock);
-	}
-	pfree(values_heap);
-	pfree(isnull_heap);
 }

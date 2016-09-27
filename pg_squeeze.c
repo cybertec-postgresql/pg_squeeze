@@ -204,6 +204,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	char	replident;
 	ScanKey	ident_key;
 	int	i, ident_key_nentries;
+	IndexInsertState	*iistate;
 	LogicalDecodingContext	*ctx;
 	Snapshot	snap_hist;
 	TupleDesc	tup_desc;
@@ -490,6 +491,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	Assert(OidIsValid(ident_idx_src));
 
+	/*
+	 * Build scan key that we'll use to look for rows to be updated / deleted
+	 * during logical decoding.
+	 */
+	ident_key = build_identity_key(ident_idx_src, rel_src,
+								   &ident_key_nentries);
+
 	/* Find "identity index" of the transient relation. */
 	ident_idx_dst = InvalidOid;
 	for (i = 0; i < nindexes; i++)
@@ -507,12 +515,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 		 */
 		elog(ERROR, "Identity index missing on the transient relation");
 
-	/*
-	 * Build scan key that we'll use to look for rows to be updated / deleted
-	 * during logical decoding.
-	 */
-	ident_key = build_identity_key(ident_idx_src, rel_src,
-								   &ident_key_nentries);
+	/* Executor state to update indexes. */
+	iistate = get_index_insert_state(rel_dst, ident_idx_dst);
 
 	/*
 	 * Flush all WAL records inserted so far (possibly except for the last
@@ -569,7 +573,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/* Process the first batch of concurrent changes. */
 	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
-							   indexes_dst, nindexes, ident_idx_dst);
+							   iistate);
 	tuplestore_clear(dstate->data.tupstore);
 	tuplestore_clear(dstate->metadata.tupstore);
 
@@ -653,9 +657,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/* Process the second batch of concurrent changes. */
 	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
-							   indexes_dst, nindexes, ident_idx_dst);
+							   iistate);
 
 	pfree(ident_key);
+	free_index_insert_state(iistate);
+
 	FreeTupleDesc(tup_desc);
 	tuplestore_end(dstate->data.tupstore);
 	FreeTupleDesc(dstate->metadata.tupdesc);
@@ -1947,14 +1953,35 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 			char	*colname;
 
 			heap_col_id = ind->rd_index->indkey.values[j];
-			if (heap_col_id >= 1)
+			if (heap_col_id > 0)
 			{
 				Form_pg_attribute	att;
 
 				/* Normal attribute. */
 				att = rel_src->rd_att->attrs[heap_col_id - 1];
-				colname = NameStr(att->attname);
+				colname = pstrdup(NameStr(att->attname));
 				collations[j] = att->attcollation;
+			}
+			else if (heap_col_id == 0)
+			{
+				HeapTuple	tuple;
+				Form_pg_attribute	att;
+
+				/*
+				 * Expression column is not present in relcache. What we need
+				 * here is an attribute of the *index* relation.
+				 */
+				tuple = SearchSysCache2(ATTNUM,
+										ObjectIdGetDatum(ind_oid),
+										Int16GetDatum(j + 1));
+				if (!HeapTupleIsValid(tuple))
+					elog(ERROR,
+						 "cache lookup failed for attribute %d of relation %u",
+						 j + 1, ind_oid);
+				att = (Form_pg_attribute) GETSTRUCT(tuple);
+				colname = pstrdup(NameStr(att->attname));
+				collations[j] = att->attcollation;
+				ReleaseSysCache(tuple);
 			}
 			else if (heap_col_id == ObjectIdAttributeNumber)
 			{
@@ -1971,14 +1998,14 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 				else
 					resetStringInfo(col_name_buf);
 				appendStringInfo(col_name_buf, "oid_%d", j);
-				colname = col_name_buf->data;
+				colname = pstrdup(col_name_buf->data);
 				collations[j] = InvalidOid;
 			}
 			else
 				elog(ERROR, "Unexpected column number: %d",
 					 heap_col_id);
 
-			colnames = lappend(colnames, pstrdup(colname));
+			colnames = lappend(colnames, colname);
 		}
 		/*
 		 * Special effort needed for variable length attributes of
