@@ -77,3 +77,4 @@ extern void free_index_insert_state(IndexInsertState *iistate);
 extern void process_concurrent_changes(DecodingOutputState *dstate,
 									   Relation relation, ScanKey key,
 									   int nkeys, IndexInsertState *iistate);
+extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
