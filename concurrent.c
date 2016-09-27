@@ -163,6 +163,12 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	ExecSetSlotDescriptor(slot_data, dstate->data.tupdesc);
 	iistate->econtext->ecxt_scantuple = slot_data;
 
+	/*
+	 * In case functions in the index need the active snapshot and caller
+	 * hasn't set one.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
 	while (tuplestore_gettupleslot(dstate->metadata.tupstore, true, false,
 								   slot_metadata))
 	{
@@ -248,12 +254,6 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			/*
 			 * Find the tuple to be updated or deleted.
 			 *
-			 * XXX Not sure we need PushActiveSnapshot() - as the table is not
-			 * visible to other transactions, the xmin, xmax, xip, etc. fields
-			 * of the snapshot are not important, and CurrentSnapshot->curcid
-			 * should stay consistent with CommandCounterIncrement() even if
-			 * GetSnapshotData() gets called anytime.
-			 *
 			 * XXX As no other transactions are engaged, SnapshotSelf might
 			 * seem to prevent us from wasting values of the command counter
 			 * (as we do not update catalog here, cache invalidation is not
@@ -261,7 +261,7 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			 * does require CommandCounterIncrement().
 			 */
 			scan = index_beginscan(relation, iistate->ident_index,
-								   GetTransactionSnapshot(), nkeys, 0);
+								   GetActiveSnapshot(), nkeys, 0);
 
 			index_rescan(scan, key, nkeys, NULL, 0);
 
@@ -313,9 +313,14 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 		/* If there's any change, make it visible to the next iteration. */
 		if (change_kind != PG_SQUEEZE_CHANGE_UPDATE_OLD)
+		{
 			CommandCounterIncrement();
+			UpdateActiveSnapshotCommandId();
+		}
 		pfree(tup_meta);
 	}
+
+	PopActiveSnapshot();
 
 	/* Cleanup. */
 	if (bistate != NULL)

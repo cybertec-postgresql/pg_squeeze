@@ -464,8 +464,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * while. (Unlike the concurrent changes, which we insert into existing
 	 * indexes.)
 	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
 	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
 										  nindexes, tbsp_info, cat_state);
+	PopActiveSnapshot();
 
 	/* Tablespace info is no longer needed. */
 	free_tablespace_info(tbsp_info);
