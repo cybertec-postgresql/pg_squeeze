@@ -164,7 +164,6 @@ _PG_init(void)
 		PGC_SIGHUP,
 		GUC_UNIT_S,
 		NULL, NULL, NULL);
-	elog(WARNING, "squeeze loaded: %d", squeeze_worker_naptime);
 }
 
 
