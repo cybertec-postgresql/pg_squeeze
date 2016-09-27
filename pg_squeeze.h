@@ -46,6 +46,8 @@ typedef struct DecodingOutputState
 	 * XXX Consider storing multiple values per tuple, to conserve space.
 	 */
 	ChangeStore	metadata;
+
+	ResourceOwner	resowner;
 } DecodingOutputState;
 
 extern void	_PG_init(void);
@@ -67,11 +69,11 @@ typedef struct IndexInsertState
 } IndexInsertState;
 
 extern void decode_concurrent_changes(LogicalDecodingContext *ctx,
-				      XLogRecPtr *startptr, XLogRecPtr end_of_wal,
-				      ResourceOwner resowner);
+									  XLogRecPtr *startptr,
+									  XLogRecPtr end_of_wal);
 extern IndexInsertState *get_index_insert_state(Relation relation,
 												Oid ident_index_id);
 extern void free_index_insert_state(IndexInsertState *iistate);
-extern void process_concurrent_changes(DecodingOutputState *s,
+extern void process_concurrent_changes(DecodingOutputState *dstate,
 									   Relation relation, ScanKey key,
 									   int nkeys, IndexInsertState *iistate);

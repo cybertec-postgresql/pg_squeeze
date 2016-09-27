@@ -116,7 +116,8 @@ typedef struct TablespaceInfo
 } TablespaceInfo;
 
 static void check_prerequisites(Relation rel);
-static LogicalDecodingContext *setup_decoding(void);
+static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
+static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
 static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
 										  Snapshot snapshot);
@@ -209,9 +210,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Snapshot	snap_hist;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
-	DecodingOutputState	*dstate;
 	XLogRecPtr	end_of_wal, startptr;
-	ResourceOwner	resowner_decode;
 	XLogRecPtr	xlog_insert_ptr;
 	int	nindexes;
 	Oid	*indexes_src = NULL, *indexes_dst = NULL;
@@ -254,8 +253,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	relid_src = RelationGetRelid(rel_src);
 
 	/*
-	 * Info to initialize tuple slot to retrieve tuples from tuplestore during
-	 * the initial load.
+	 * Info to create transient table and to initialize tuplestore we'll use
+	 * during logical decoding.
 	 */
 	tup_desc = CreateTupleDescCopy(RelationGetDescr(rel_src));
 
@@ -397,7 +396,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	for (i = 0; i < nindexes; i++)
 		indexes_src[i] = cat_state->indexes[i].oid;
 
-	ctx = setup_decoding();
+	ctx = setup_decoding(relid_src, tup_desc);
 
 	/*
 	 * The first consistent snapshot should be available now. There's no
@@ -527,35 +526,22 @@ squeeze_table(PG_FUNCTION_ARGS)
 	XLogFlush(xlog_insert_ptr);
 
 	/*
-	 * Decode the data changes that occurred while the initial load was in
-	 * progress, and put them into a tuplestore. This is derived from
-	 * pg_logical_slot_get_changes_guts().
-	 *
-	 * TODO Find out what's wrong about letting the plugin immediately write
-	 * into the destination table itself. PG documentation forbids that, but
-	 * I'm not sure if that restriction is still valid and why.
+	 * Since we'll do some more changes, all the WAL records flushed so far
+	 * need to be decoded for sure.
 	 */
-	dstate = palloc0(sizeof(DecodingOutputState));
-	dstate->relid = relid_src;
-	dstate->data.tupstore = tuplestore_begin_heap(false, false, work_mem);
-	dstate->data.tupdesc = tup_desc;
-	dstate->metadata.tupstore = tuplestore_begin_heap(false, false, work_mem);
-	dstate->metadata.tupdesc = CreateTupleDesc(1, false, &att_char);
-
 	end_of_wal = GetFlushRecPtr();
-	ctx->output_writer_private = dstate;
 	startptr = MyReplicationSlot->data.restart_lsn;
 
-	resowner_decode = ResourceOwnerCreate(CurrentResourceOwner,
-										  "logical decoding");
-
 	/*
+	 * Decode the data changes that occurred while the initial load was in
+	 * progress, and put them into a tuplestore.
+	 *
 	 * Even if there amount of concurrent changes might not be significant,
 	 * both initial load and index build could have produced many XLOG records
 	 * that we need to read. Do so before requesting exclusive lock on the
 	 * source relation.
 	 */
-	decode_concurrent_changes(ctx, &startptr, end_of_wal, resowner_decode);
+	decode_concurrent_changes(ctx, &startptr, end_of_wal);
 
 	/*
 	 * Since the build of indexes could have taken long time, many changes
@@ -572,10 +558,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	CommandCounterIncrement();
 
 	/* Process the first batch of concurrent changes. */
-	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
+	process_concurrent_changes((DecodingOutputState *) ctx->output_writer_private,
+							   rel_dst, ident_key, ident_key_nentries,
 							   iistate);
-	tuplestore_clear(dstate->data.tupstore);
-	tuplestore_clear(dstate->metadata.tupstore);
 
 	/*
 	 * This (supposedly cheap) special check should avoid one particular
@@ -653,19 +638,24 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Decode the changes that might have taken place while we were waiting
 	 * for the lock.
 	 */
-	decode_concurrent_changes(ctx, &startptr, end_of_wal, resowner_decode);
+	decode_concurrent_changes(ctx, &startptr, end_of_wal);
 
 	/* Process the second batch of concurrent changes. */
-	process_concurrent_changes(dstate, rel_dst, ident_key, ident_key_nentries,
+	process_concurrent_changes((DecodingOutputState *) ctx->output_writer_private,
+							   rel_dst, ident_key, ident_key_nentries,
 							   iistate);
+
+	/*
+	 * Done with decoding.
+	 *
+	 * XXX decoding_cleanup() frees tup_desc, although we've used it not only
+	 * for the decoding.
+	 */
+	decoding_cleanup(ctx);
+	ReplicationSlotRelease();
 
 	pfree(ident_key);
 	free_index_insert_state(iistate);
-
-	FreeTupleDesc(tup_desc);
-	tuplestore_end(dstate->data.tupstore);
-	FreeTupleDesc(dstate->metadata.tupdesc);
-	tuplestore_end(dstate->metadata.tupstore);
 
 	/* The destination table is no longer necessary, so close it. */
 	/* XXX (Should have been closed right after
@@ -685,18 +675,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 		pfree(indexes_src);
 		pfree(indexes_dst);
 	}
-
-	/*
-	 * Won't need the slot anymore.
-	 *
-	 * XXX The SPI calls below seem to touch (free?) the current memory
-	 * context. By hiding the current context from those calls we make
-	 * postponing of the cleanup possible, but we need to keep the exclusive
-	 * lock on the relation till the end of transaction anyway, so it wouldn't
-	 * improve concurrency anyway.
-	 */
-	FreeDecodingContext(ctx);
-	ReplicationSlotRelease();
 
 	/*
 	 * The "user_catalog_table" option can be cleared now, but we don't want
@@ -803,9 +781,10 @@ check_prerequisites(Relation rel)
  * and FATAL should lead to cleanup even before the cluster goes down.)
  */
 static LogicalDecodingContext *
-setup_decoding(void)
+setup_decoding(Oid relid, TupleDesc tup_desc)
 {
 	LogicalDecodingContext *ctx;
+	DecodingOutputState	*dstate;
 	MemoryContext oldcontext;
 
 	Assert(!MyReplicationSlot);
@@ -832,10 +811,41 @@ setup_decoding(void)
 									logical_read_local_xlog_page,
 									NULL, NULL);
 	DecodingContextFindStartpoint(ctx);
+
+	/*
+	 * Setup structures to store decoded changes.
+	 *
+	 * TODO Find out what's wrong about letting the plugin immediately write
+	 * into the destination table itself. PG documentation forbids that, but
+	 * I'm not sure if that restriction is still valid and why.
+	 */
+	dstate = palloc0(sizeof(DecodingOutputState));
+	dstate->relid = relid;
+	dstate->data.tupstore = tuplestore_begin_heap(false, false, work_mem);
+	dstate->data.tupdesc = tup_desc;
+	dstate->metadata.tupstore = tuplestore_begin_heap(false, false, work_mem);
+	dstate->metadata.tupdesc = CreateTupleDesc(1, false, &att_char);
+	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
+											"logical decoding");
+	ctx->output_writer_private = dstate;
+
 	MemoryContextSwitchTo(oldcontext);
 	return ctx;
 }
 
+static void
+decoding_cleanup(LogicalDecodingContext *ctx)
+{
+	DecodingOutputState	*dstate;
+
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+	FreeTupleDesc(dstate->data.tupdesc);
+	tuplestore_end(dstate->data.tupstore);
+	FreeTupleDesc(dstate->metadata.tupdesc);
+	tuplestore_end(dstate->metadata.tupstore);
+
+	FreeDecodingContext(ctx);
+}
 
 /*
  * Retrieve the catalog state to be passed later to check_catalog_changes.

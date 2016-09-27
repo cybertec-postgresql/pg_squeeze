@@ -9,11 +9,11 @@
 #include "replication/decode.h"
 #include "utils/rel.h"
 
-
 void
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
-						  XLogRecPtr end_of_wal, ResourceOwner resowner)
+						  XLogRecPtr end_of_wal)
 {
+	DecodingOutputState	*dstate;
 	ResourceOwner	resowner_old;
 
 	/*
@@ -30,8 +30,9 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 	 */
 	InvalidateSystemCaches();
 
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
 	resowner_old = CurrentResourceOwner;
-	CurrentResourceOwner = resowner;
+	CurrentResourceOwner = dstate->resowner;
 
 	PG_TRY();
 	{
@@ -138,7 +139,7 @@ free_index_insert_state(IndexInsertState *iistate)
  * anyway. But this approach might change in the future.)
  */
 void
-process_concurrent_changes(DecodingOutputState *s, Relation relation,
+process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						   ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot	*slot_data, *slot_metadata;
@@ -146,13 +147,13 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 	BulkInsertState bistate = NULL;
 
 	slot_metadata = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(slot_metadata, s->metadata.tupdesc);
+	ExecSetSlotDescriptor(slot_metadata, dstate->metadata.tupdesc);
 
 	slot_data = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(slot_data, s->data.tupdesc);
+	ExecSetSlotDescriptor(slot_data, dstate->data.tupdesc);
 	iistate->econtext->ecxt_scantuple = slot_data;
 
-	while (tuplestore_gettupleslot(s->metadata.tupstore, true, false,
+	while (tuplestore_gettupleslot(dstate->metadata.tupstore, true, false,
 								   slot_metadata))
 	{
 		HeapTuple tup_meta, tup, tup_exist;
@@ -160,7 +161,7 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 		bool	kind_isnull[1];
 		char	change_kind;
 
-		if (!tuplestore_gettupleslot(s->data.tupstore, true, false,
+		if (!tuplestore_gettupleslot(dstate->data.tupstore, true, false,
 									 slot_data))
 			elog(ERROR, "The data and metadata slots do not match.");
 
@@ -310,10 +311,13 @@ process_concurrent_changes(DecodingOutputState *s, Relation relation,
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 
-	if (tuplestore_gettupleslot(s->data.tupstore, true, false,
-								 slot_data))
+	if (tuplestore_gettupleslot(dstate->data.tupstore, true, false,
+								slot_data))
 		elog(ERROR, "The data and metadata slots do not match.");
 
 	ExecDropSingleTupleTableSlot(slot_data);
 	ExecDropSingleTupleTableSlot(slot_metadata);
+
+	tuplestore_clear(dstate->data.tupstore);
+	tuplestore_clear(dstate->metadata.tupstore);
 }
