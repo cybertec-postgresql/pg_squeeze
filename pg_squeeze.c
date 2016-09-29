@@ -732,7 +732,7 @@ index_cat_info_compare(const void *arg1, const void *arg2)
 static void
 check_prerequisites(Relation rel)
 {
-	Form_pg_class	form = rel->rd_rel;
+	Form_pg_class	form = RelationGetForm(rel);
 
 	/* Check the relation first. */
 	if (form->relkind != RELKIND_RELATION)
@@ -759,7 +759,7 @@ check_prerequisites(Relation rel)
 				 errmsg("\"%s\" is mapped relation",
 						RelationGetRelationName(rel))));
 
-	if (rel->rd_id < FirstNormalObjectId)
+	if (RelationGetRelid(rel) < FirstNormalObjectId)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not user relation",
