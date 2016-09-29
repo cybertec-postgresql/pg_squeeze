@@ -14,6 +14,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
+#include "commands/cluster.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "executor/executor.h"
@@ -1590,16 +1591,12 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	{
 		cluster_idx = relation_openrv(cluster_idx_rv, AccessShareLock);
 
-		if (cluster_idx->rd_rel->relkind != RELKIND_INDEX)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("Relation \"%s\" is not an index",
-							cluster_idx_rv->relname)));
-
-		if (cluster_idx->rd_rel->relam != BTREE_AM_OID)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("Only B-tree index can be used for clustering")));
+		/*
+		 * Use the cluster.c API to check if the index can be used for
+		 * clustering.
+		 */
+		check_index_is_clusterable(rel_src, RelationGetRelid(cluster_idx),
+								   false, NoLock);
 
 		/*
 		 * Decide whether index scan or explicit sort should be used.
