@@ -314,7 +314,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 		(replident == REPLICA_IDENTITY_DEFAULT && !OidIsValid(ident_idx_src)))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
-				 (errmsg("Table is not selective"))));
+				 (errmsg("Table \"%s\".\"%s\" has no identity index",
+						 NameStr(*relschema), NameStr(*relname)))));
 
 	/* Change processing w/o index is not a good idea. */
 	if (replident == REPLICA_IDENTITY_FULL)
