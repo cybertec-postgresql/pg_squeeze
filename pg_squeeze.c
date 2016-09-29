@@ -696,7 +696,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* State not needed anymore. */
 	free_catalog_state(cat_state);
 
-	/* Drop the transient table (including indexes and constraints). */
+	/*
+	 * Drop the transient table including indexes (constraints would be
+	 * dropped this way too, but we haven't created any).
+	 */
 	object.classId = RelationRelationId;
 	object.objectSubId = 0;
 	object.objectId = relid_dst;
