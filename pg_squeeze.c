@@ -195,7 +195,6 @@ Datum
 squeeze_table(PG_FUNCTION_ARGS)
 {
 	Name	   relschema, relname;
-	List	*name_list = NIL;
 	RangeVar   *relrv_src;
 	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
@@ -225,10 +224,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 				 (errmsg("Both schema and table name must be specified"))));
 
 	relschema = PG_GETARG_NAME(0);
-	name_list = lappend(name_list, makeString(pstrdup(NameStr(*relschema))));
 	relname = PG_GETARG_NAME(1);
-	name_list = lappend(name_list, makeString(pstrdup(NameStr(*relname))));
-	relrv_src = makeRangeVarFromNameList(name_list);
+	relrv_src = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
 	rel_src = heap_openrv(relrv_src, AccessShareLock);
 
 	check_prerequisites(rel_src);
@@ -340,7 +337,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 		Name	indname;
 
 		indname = PG_GETARG_NAME(2);
-		relrv_cl_idx = makeRangeVar(NULL, pstrdup(NameStr(*indname)), -1);
+		relrv_cl_idx = makeRangeVar(NameStr(*relschema),
+									NameStr(*indname), -1);
 	}
 
 	/*
