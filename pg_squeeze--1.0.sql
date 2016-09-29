@@ -252,7 +252,7 @@ DECLARE
 	v_ind_tbsps	name[][];
 	v_task_id	int;
 	v_tried		int;
-	v_max_reached	bool;
+	v_last_try	bool;
 	v_stmt		text;
 
 	-- Error info to be logged.
@@ -262,30 +262,14 @@ DECLARE
 BEGIN
 	SELECT tb.tabschema, tb.tabname, tb.clustering_index,
 tb.rel_tablespace, tb.ind_tablespaces, t.id, t.tried,
-t.tried >= tb.max_retry + 1
+t.tried >= tb.max_retry
 	INTO v_tabschema, v_tabname, v_cl_index, v_rel_tbsp, v_ind_tbsps,
- v_task_id, v_tried, v_max_reached
+ v_task_id, v_tried, v_last_try
 	FROM squeeze.tasks t, squeeze.tables tb
 	WHERE t.table_id = tb.id AND t.active;
 
 	IF NOT FOUND THEN
 		-- Unexpected deletion by someone else?
-		RETURN;
-	END IF;
-
-	-- If the active task failed too many times, delete it.
-	-- start_next_task() will prepare the next one.
-	IF v_max_reached THEN
-		PERFORM squeeze.cleanup_task(v_task_id);
-
-		-- squeeze_table() resets the storage option on successful
-		-- completion, but here we must do it explicitly.
-		v_stmt := 'ALTER TABLE ' || v_tabschema || '.' ||
-		v_tabname || ' RESET (user_catalog_table)';
-
-		RAISE NOTICE '%', v_stmt;
-		EXECUTE v_stmt;
-
 		RETURN;
 	END IF;
 
@@ -306,10 +290,26 @@ t.tried >= tb.max_retry + 1
 			VALUES (v_tabschema, v_tabname, v_sql_state, v_err_msg,
 				v_err_detail);
 
-			-- Account for the current attempt.
-			UPDATE squeeze.tasks
-			SET tried = tried + 1
-			WHERE id = v_task_id;
+			-- If the active task failed too many times, delete
+			-- it. start_next_task() will prepare the next one.
+			IF v_last_try THEN
+				PERFORM squeeze.cleanup_task(v_task_id);
+
+				-- squeeze_table() resets the storage option
+				-- on successful completion, but here we must
+				-- do it explicitly.
+				v_stmt := 'ALTER TABLE ' || v_tabschema || '.' ||
+				v_tabname || ' RESET (user_catalog_table)';
+
+				EXECUTE v_stmt;
+
+				RETURN;
+			ELSE
+				-- Account for the current attempt.
+				UPDATE squeeze.tasks
+				SET tried = tried + 1
+				WHERE id = v_task_id;
+			END IF;
 	END;
 END;
 $$;
