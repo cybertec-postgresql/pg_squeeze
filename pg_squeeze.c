@@ -789,7 +789,13 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	DecodingOutputState	*dstate;
 	MemoryContext oldcontext;
 
-	Assert(!MyReplicationSlot);
+	/*
+	 * postgres.c should have done the cleanup if the squeeze_table() was
+	 * called interactively, but that does not happen if it was called from
+	 * plpgsql function and the ERROR was trapped.
+	 */
+	if (MyReplicationSlot != NULL)
+		ReplicationSlotRelease();
 
 	/* check_permissions() "inlined", as logicalfuncs.c does not export it.*/
 	if (!superuser() && !has_rolreplication(GetUserId()))
