@@ -140,7 +140,7 @@ static void switch_snapshot(Snapshot snap_hist);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst);
 static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
-								  Oid tablespace);
+								  Oid tablespace, Oid relowner);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes,
 									TablespaceInfo *tbsp_info,
@@ -199,6 +199,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	RangeVar   *relrv_src;
 	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
+	Oid	rel_src_owner;
 	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
 	List	*relsrc_indlist;
@@ -249,6 +250,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	replident = rel_src->rd_rel->relreplident;
 	ident_idx_src = RelationGetReplicaIndex(rel_src);
 	relid_src = RelationGetRelid(rel_src);
+	rel_src_owner = RelationGetForm(rel_src)->relowner;
 
 	/*
 	 * Info to create transient table and to initialize tuplestore we'll use
@@ -407,7 +409,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	snap_hist = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder,
 											InvalidTransactionId);
 
-	relid_dst = create_transient_table(cat_state, tup_desc, tbsp_info->table);
+	relid_dst = create_transient_table(cat_state, tup_desc, tbsp_info->table,
+		rel_src_owner);
 
 	/* The source relation will be needed for the initial load. */
 	rel_src = heap_open(relid_src, AccessShareLock);
@@ -1781,7 +1784,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
  */
 static Oid
 create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
-					   Oid tablespace)
+					   Oid tablespace, Oid relowner)
 {
 	StringInfo	relname;
 	Form_pg_class	form_class;
@@ -1789,6 +1792,21 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 	Oid	result;
 
 	/* As elsewhere in PG core. */
+	if (OidIsValid(tablespace) && tablespace != MyDatabaseTableSpace)
+	{
+		AclResult	aclresult;
+
+		/*
+		 * squeeze_table() must be executed by superuser because it creates
+		 * and drops the replication slot. However it should not be a way to
+		 * do things that the table owner is not allowed to. (For indexes we
+		 * assume they all have the same owner as the table.)
+		 */
+		aclresult = pg_tablespace_aclcheck(tablespace, relowner, ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
+						   get_tablespace_name(tablespace));
+	}
 	if (tablespace == GLOBALTABLESPACE_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
