@@ -117,6 +117,10 @@ Additional columns can be specified optionally, for example:
   tablespace but the indexes stay in the original one (i.e. the tablespace of
   the table is not the default for indexes as one might expect).
 
+* "skip_analyze" indicates that table processing should not be followed by
+  ANALYZE command. The default value is "false", meaning ANALYZE is performed
+  by default.
+
 CAUTION! "squeeze.table" is the only table user should modify. If you want to
 change anything else, make sure you perfectly understand what you are doing.
 

@@ -47,7 +47,10 @@ CREATE TABLE tables (
 	-- TODO Tune the default value.
 	stats_max_age	interval	NOT NULL	DEFAULT '1 hour',
 
-	max_retry	int		NOT NULL	DEFAULT 0
+	max_retry	int		NOT NULL	DEFAULT 0,
+
+	-- No ANALYZE after the processing has completed.
+	skip_analyze	bool		NOT NULL	DEFAULT false
 );
 
 -- Fields that would normally fit into "tables" but require no attention of
@@ -253,6 +256,7 @@ DECLARE
 	v_task_id	int;
 	v_tried		int;
 	v_last_try	bool;
+	v_skip_analyze	bool;
 	v_stmt		text;
 
 	-- Error info to be logged.
@@ -262,9 +266,9 @@ DECLARE
 BEGIN
 	SELECT tb.tabschema, tb.tabname, tb.clustering_index,
 tb.rel_tablespace, tb.ind_tablespaces, t.id, t.tried,
-t.tried >= tb.max_retry
+t.tried >= tb.max_retry, tb.skip_analyze
 	INTO v_tabschema, v_tabname, v_cl_index, v_rel_tbsp, v_ind_tbsps,
- v_task_id, v_tried, v_last_try
+ v_task_id, v_tried, v_last_try, v_skip_analyze
 	FROM squeeze.tasks t, squeeze.tables tb
 	WHERE t.table_id = tb.id AND t.active;
 
@@ -279,6 +283,27 @@ t.tried >= tb.max_retry
  v_cl_index, v_rel_tbsp, v_ind_tbsps);
 
 		PERFORM squeeze.cleanup_task(v_task_id);
+
+		IF NOT v_skip_analyze THEN
+                        -- Analyze the new table, unless user rejects it
+                        -- explicitly.
+			--
+			-- XXX Besides updating planner statistics in general,
+			-- this sets pg_class(relallvisible) to 0, so that
+			-- planner is not too optimistic about this
+			-- figure. The preferrable solution would be to run
+			-- (lazy) VACUUM (with the ANALYZE option) to
+			-- initialize visibility map. However, to make the
+			-- effort worthwile, we shouldn't do it until all
+			-- transactions can see all the changes done by
+			-- squeeze_table() function. What's the most suitable
+			-- way to wait? Asynchronous execution of the VACUUM
+			-- is probably needed in any case.
+                        v_stmt := 'ANALYZE "' || v_tabschema || '"."' ||
+                                v_tabname || '"';
+
+			EXECUTE v_stmt;
+		END IF;
 	EXCEPTION
 		WHEN OTHERS THEN
 			GET STACKED DIAGNOSTICS v_sql_state := RETURNED_SQLSTATE;
