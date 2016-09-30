@@ -323,8 +323,8 @@ t.tried >= tb.max_retry, tb.skip_analyze
 				-- squeeze_table() resets the storage option
 				-- on successful completion, but here we must
 				-- do it explicitly.
-				v_stmt := 'ALTER TABLE ' || v_tabschema || '.' ||
-				v_tabname || ' RESET (user_catalog_table)';
+				v_stmt := 'ALTER TABLE "' || v_tabschema || '"."' ||
+				v_tabname || '" RESET (user_catalog_table)';
 
 				EXECUTE v_stmt;
 
