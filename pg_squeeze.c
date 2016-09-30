@@ -2169,7 +2169,6 @@ swap_relation_files(Oid r1, Oid r2)
 	Oid			relfilenode1,
 		relfilenode2;
 	Oid			swaptemp;
-	char		swptmpchr;
 	CatalogIndexState indstate;
 
 	/* We need writable copies of both pg_class tuples. */
@@ -2198,9 +2197,12 @@ swap_relation_files(Oid r1, Oid r2)
 		relform1->reltablespace = relform2->reltablespace;
 		relform2->reltablespace = swaptemp;
 
-		swptmpchr = relform1->relpersistence;
-		relform1->relpersistence = relform2->relpersistence;
-		relform2->relpersistence = swptmpchr;
+		/*
+		 * Although this condition shouldn't really occur, elog seems wiser
+		 * here than Assert() in this case.
+		 */
+		if (relform1->relpersistence != relform1->relpersistence)
+			elog(ERROR, "relpersistence does not match");
 
 		swaptemp = relform1->reltoastrelid;
 		relform1->reltoastrelid = relform2->reltoastrelid;
