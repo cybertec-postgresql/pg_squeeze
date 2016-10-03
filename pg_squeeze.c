@@ -68,7 +68,10 @@ typedef struct CatalogState
 	/* The relation whose changes we'll check for. */
 	Oid	relid;
 
-	/* Has the source relation the "user_catalog_table" option set? */
+	/*
+	 * Have both the source relation and its TOAST relation the
+	 * "user_catalog_table" option set?
+	 */
 	bool		is_catalog;
 
 	/* Copy of pg_class tuple. */
@@ -92,6 +95,9 @@ typedef struct CatalogState
 	 * check.
 	 */
 	TransactionId		pg_class_xmin;
+
+	/* The same for TOAST relation, if there's one. */
+	TransactionId		toast_xmin;
 
 	/*
 	 * Does at least one index wrong value of indisvalid, indisready or
@@ -148,7 +154,12 @@ static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
 static void swap_relation_files(Oid r1, Oid r2);
-static void clear_user_catalog_option(CatalogState *cat_state);
+static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
+							 Oid toastrelid2);
+static Oid get_toast_index(Oid toastrelid);
+static void set_user_catalog_option_internal(Oid relid);
+static void clear_user_catalog_option_internal(Oid relid);
+static void update_tuple_reloptions(Oid relid, List *changes, bool is_reset);
 
 
 int squeeze_worker_naptime;
@@ -156,6 +167,12 @@ int squeeze_worker_naptime;
 void
 _PG_init(void)
 {
+	/*
+	 * PG core does not support "user_catalog_table" option for TOAST, so add
+	 * it as a custom option.
+	 */
+	add_bool_reloption(RELOPT_KIND_TOAST, "user_catalog_table", "", false);
+
 	DefineCustomIntVariable(
 		"squeeze.worker_naptime",
 		"Sleep time (in seconds) of the squeeze worker.",
@@ -202,6 +219,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Oid	rel_src_owner;
 	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
+	Oid	toastrelid_src, toastrelid_dst;
 	List	*relsrc_indlist;
 	char	replident;
 	ScanKey	ident_key;
@@ -251,6 +269,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	ident_idx_src = RelationGetReplicaIndex(rel_src);
 	relid_src = RelationGetRelid(rel_src);
 	rel_src_owner = RelationGetForm(rel_src)->relowner;
+	toastrelid_src = rel_src->rd_rel->reltoastrelid;
 
 	/*
 	 * Info to create transient table and to initialize tuplestore we'll use
@@ -278,7 +297,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	if (!cat_state->is_catalog)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 (errmsg("\"user_catalog_table\" option not set"))));
+				 (errmsg("Table or its TOAST table do not have \"user_catalog_table\" option set"))));
 	if (cat_state->invalid_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -417,6 +436,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/* NoLock, it's only visible by us. */
 	rel_dst = heap_open(relid_dst, NoLock);
+
+	toastrelid_dst = rel_dst->rd_rel->reltoastrelid;
 
 	/*
 	 * We need at least to know whether the catalog option was never changed,
@@ -668,12 +689,21 @@ squeeze_table(PG_FUNCTION_ARGS)
 	heap_close(rel_dst, NoLock);
 
 	/*
-	 * Exchange storage and indexes between the source and destination
-	 * tables.
+	 * Exchange storage (including TOAST) and indexes between the source and
+	 * destination tables.
 	 */
 	swap_relation_files(relid_src, relid_dst);
+	CommandCounterIncrement();
+
+	/*
+	 * As swap_relation_files() already changed pg_class(reltoastrelid), we
+	 * pass toastrelid_dst for relid_src and vice versa.
+	 */
+	swap_toast_names(relid_src, toastrelid_dst, relid_dst, toastrelid_src);
+
 	for (i = 0; i < nindexes; i++)
 		swap_relation_files(indexes_src[i], indexes_dst[i]);
+	CommandCounterIncrement();
 
 	if (nindexes > 0)
 	{
@@ -683,18 +713,26 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/*
 	 * The "user_catalog_table" option can be cleared now, but we don't want
-	 * to commit the current transaction. Try to find out if it can be done in
-	 * some kind of autonomous transaction (can we ask bgworker to do so at a
-	 * well-defined moment?).
-	 *
-	 * XXX Besides the commit problem, we can hardly do this earlier because
-	 * exclusive lock on relation is kept till commit, so we'd block
-	 * concurrent changes. OTOH it's probably not too urgent to relax vacuum
-	 * constraint for the "reorganized" table - that shouldn't need vacuum for
-	 * some time.
+	 * to commit the current transaction. (VACUUM workers won't notice this
+	 * change until our commit, so they might see just limited amount of
+	 * tuples eligible for processing. That's o.k., as the new relation will
+	 * be visible after commit and that shouldn't contain VACUUMable tuples
+	 * anyway.)
 	 */
-	CommandCounterIncrement();
-	clear_user_catalog_option(cat_state);
+	clear_user_catalog_option_internal(cat_state->relid);
+
+	if (OidIsValid(toastrelid_dst))
+	{
+		/*
+		 * toastrelid_dst points to the TOAST relation that remains. We've
+		 * copied the reloptions from the original TOAST relation, so that no
+		 * information gets lost. All we need to do now is to clear the
+		 * "user_catalog_table" option. (swap_toast_names() provides us with
+		 * AccessExclusiveLock on the relation, but the table shouldn't be
+		 * visible to other backends yet.)
+		 */
+		clear_user_catalog_option_internal(toastrelid_dst);
+	}
 
 	/* State not needed anymore. */
 	free_catalog_state(cat_state);
@@ -878,7 +916,7 @@ get_catalog_state(Oid relid)
 	Snapshot	snapshot;
 	Datum	options_raw;
 	bool	isnull;
-	StdRdOptions *options;
+	StdRdOptions *reloptions;
 	CatalogState	*result;
 
 	/*
@@ -924,11 +962,39 @@ get_catalog_state(Oid relid)
 	result = (CatalogState *) palloc0(sizeof(CatalogState));
 
 	/* The "user_catalog_option" is essential. */
-	options = (StdRdOptions *) extractRelOptions(tuple, desc, NULL);
-	if (options == NULL || !options->user_catalog_table)
+	reloptions = (StdRdOptions *) extractRelOptions(tuple, desc, NULL);
+	if (reloptions == NULL || !reloptions->user_catalog_table)
 	{
 		Assert(!result->is_catalog);
 		return result;
+	}
+
+	/*
+	 * If TOAST relation existsq, we must also keep eye on the catalog option.
+	 */
+	if (form_class->reltoastrelid != InvalidOid)
+	{
+		HeapTuple	tuple_toast;
+		ScanKeyData key_toast[1];
+		SysScanDesc	scan_toast;
+		StdRdOptions	*reloptions_toast;
+
+		ScanKeyInit(&key_toast[0], ObjectIdAttributeNumber,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(form_class->reltoastrelid));
+		scan_toast = systable_beginscan(rel, ClassOidIndexId, true, snapshot,
+										1, key_toast);
+		tuple_toast = systable_getnext(scan_toast);
+
+		reloptions_toast = (StdRdOptions *) extractRelOptions(tuple_toast,
+															  desc, NULL);
+		if (reloptions_toast == NULL || !reloptions_toast->user_catalog_table)
+		{
+			Assert(!result->is_catalog);
+			return result;
+		}
+		result->toast_xmin = HeapTupleHeaderGetXmin(tuple_toast->t_data);
+		systable_endscan(scan_toast);
 	}
 
 	result->relid = relid;
@@ -2328,57 +2394,237 @@ swap_relation_files(Oid r1, Oid r2)
 }
 
 /*
- * Clear the "user_catalog_table" storage option of the source table.
+ * Swap TOAST relation names if needed.
+ *
+ * relid1 represents the relation to stay and toastrelid1 its TOAST relation.
+ * relid2 refer to the transient relation in the same manner.
+ *
+ * The storage of TOAST tables and their indexes have already been swapped.
+ *
+ * On exit we hold AccessExclusiveLock on the TOAST relations and their
+ * indexes.
  */
 static void
-clear_user_catalog_option(CatalogState *cat_state)
+swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
+{
+	char	name[NAMEDATALEN];
+	Oid toastidxid;
+
+	/*
+	 * As we haven't changed tuple descriptor, both relation do or both do not
+	 * have TOAST - see toasting.c:needs_toast_table().
+	 */
+	if (!OidIsValid(toastrelid1))
+	{
+		if (OidIsValid(toastrelid2))
+			elog(ERROR, "Unexpected TOAST relation exists");
+		return;
+	}
+	if (!OidIsValid(toastrelid2))
+		elog(ERROR, "Missing TOAST relation");
+
+	/*
+	 * Added underscore should be enough to keep names unique (at least within
+	 * the pg_toast tablespace). This assumption makes name retrieval
+	 * unnecessary.
+	 */
+	snprintf(name, NAMEDATALEN, "pg_toast_%u_", relid1);
+	RenameRelationInternal(toastrelid2, name, true);
+
+	/*
+	 * XXX While toast_open_indexes (PG core) can retrieve multiple indexes,
+	 * get_toast_index() expects exactly one. If this restriction should be
+	 * released someday, either generate the underscore-terminated names as
+	 * above or copy names of the indexes of toastrel1 (the number of indexes
+	 * should be identical). Order should never be important, as toastrel2
+	 * will eventually be dropped.q
+	 */
+	toastidxid = get_toast_index(toastrelid2);
+	snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
+	RenameRelationInternal(toastidxid, name, true);
+	CommandCounterIncrement();
+
+	/* Now set the desired names on the TOAST stuff of relid1. */
+	snprintf(name, NAMEDATALEN, "pg_toast_%u", relid1);
+	RenameRelationInternal(toastrelid1, name, true);
+	toastidxid = get_toast_index(toastrelid1);
+	snprintf(name, NAMEDATALEN, "pg_toast_%u_index", relid1);
+	RenameRelationInternal(toastidxid, name, true);
+	CommandCounterIncrement();
+
+	/* Do not bother to fix names for relid2 - they'll be dropped anyway. */
+}
+
+/*
+ * The function is called after RenameRelationInternal() which does not
+ * release AccessExclusiveLock.
+ */
+static Oid
+get_toast_index(Oid toastrelid)
+{
+	Relation	toastrel;
+	List	*toastidxs;
+	Oid	result;
+
+	toastrel = heap_open(toastrelid, NoLock);
+	toastidxs = RelationGetIndexList(toastrel);
+
+	if (toastidxs == NIL || list_length(toastidxs) != 1)
+		elog(ERROR, "Unexpected number of TOAST indexes");
+
+	result = linitial_oid(toastidxs);
+	heap_close(toastrel, NoLock);
+
+	return result;
+}
+
+/*
+ * Set or clear "user_catalog_table" storage option.
+ *
+ * ALTER TABLE command can do this for user table, but not for TOAST (unless
+ * "allow_system_table_mods" is set, which we consider dangerous).
+ */
+extern Datum change_user_catalog_option(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(change_user_catalog_option);
+Datum
+change_user_catalog_option(PG_FUNCTION_ARGS)
+{
+	Name	relschema, relname;
+	bool	is_set;
+	RangeVar   *relrv;
+	Relation	rel;
+	Form_pg_class	rel_form;
+	Oid	relid, toastrelid;
+
+	/*
+	 * Check all arguments explicitly. We could define the function as strict,
+	 * but that would silently ignore incorrect invocation.
+	 */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 (errmsg("All arguments must be specified"))));
+
+	relschema = PG_GETARG_NAME(0);
+	relname = PG_GETARG_NAME(1);
+	is_set = PG_GETARG_BOOL(2);
+
+	relrv = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
+	rel = heap_openrv(relrv, AccessExclusiveLock);
+	relid = RelationGetRelid(rel);
+
+	if (is_set)
+		set_user_catalog_option_internal(relid);
+	else
+		clear_user_catalog_option_internal(relid);
+
+
+	/* Handle TOAST relation if there's one. */
+	Assert(!OidIsValid(rel->rd_toastoid));
+	rel_form = RelationGetForm(rel);
+	toastrelid = rel_form->reltoastrelid;
+	if (OidIsValid(toastrelid))
+	{
+		Relation	toastrel;
+
+		toastrel = heap_open(toastrelid, AccessExclusiveLock);
+		if (is_set)
+			set_user_catalog_option_internal(toastrelid);
+		else
+			clear_user_catalog_option_internal(toastrelid);
+		heap_close(toastrel, AccessExclusiveLock);
+	}
+
+	heap_close(rel, AccessExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Set the "user_catalog_table" storage option.
+ *
+ * Caller should hold AccessExclusiveLock on the table.
+ */
+static void
+set_user_catalog_option_internal(Oid relid)
+{
+	DefElem	*def;
+	List	*def_list = NIL;
+
+	def = makeDefElem("user_catalog_table", (Node *) makeString("true"));
+	def_list = lappend(def_list, def);
+
+	update_tuple_reloptions(relid, def_list, false);
+}
+
+/*
+ * Clear the "user_catalog_table" storage option.
+ *
+ * Caller should hold AccessExclusiveLock on the table.
+ */
+static void
+clear_user_catalog_option_internal(Oid relid)
+{
+	DefElem	*def;
+	List	*def_list = NIL;
+
+	def = makeDefElem("user_catalog_table", NULL);
+	def_list = lappend(def_list, def);
+
+	update_tuple_reloptions(relid, def_list, true);
+}
+
+/*
+ * Update pg_class(reloptions) according to "changes".
+ *
+ * Caller should hold AccessExclusiveLock on the relation whose pg_class(id)
+ * he passes.
+ */
+static void
+update_tuple_reloptions(Oid relid, List *changes, bool is_reset)
 {
 	Relation	rel;
 	HeapTuple	tuple, tuple_new;
+	TupleDesc	desc;
 	int	natts;
-	Datum	reloptions;
-	DefElem	*def;
-	List	*def_list = NIL;
 	Datum	*repl_vals;
 	bool	*repl_nulls, *do_repl;
-
-	natts = cat_state->desc_class->natts;
-	Assert(natts == Natts_pg_class);
+	Datum	options;
+	bool	isnull;
 
 	rel = heap_open(RelationRelationId, RowExclusiveLock);
-	/*
-	 * XXX We could have stored a copy of the tuple in cat_state earlier, but
-	 * that wouldn't be visible for update - at least the instance created by
-	 * heap_copytuple().
-	 */
-	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(cat_state->relid));
+	desc = RelationGetDescr(rel);
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	Assert(HeapTupleIsValid(tuple));
 
-	/*
-	 * As for coding, it's simpler to get the reloptions from cat_state.
-	 */
-	reloptions = cat_state->reloptions;
-	def = makeDefElem("user_catalog_table", NULL);
-	def_list = lappend(def_list, def);
-	reloptions = transformRelOptions(reloptions, def_list, NULL, NULL, false,
-									 true);
+	options = fastgetattr(tuple, Anum_pg_class_reloptions, desc, &isnull);
+	Assert(!is_reset || !isnull);
+	if (PointerIsValid(DatumGetPointer(options)))
+		options = (Datum) PG_DETOAST_DATUM(options);
+	else
+		options = (Datum) 0;
 
+	/* Apply the changes */
+	options = transformRelOptions(options, changes, NULL, NULL, false,
+								  is_reset);
+
+	natts = desc->natts;
 	repl_vals = (Datum *) palloc(natts * sizeof(Datum));
 	repl_nulls = (bool *) palloc0(natts * sizeof(bool));
 	do_repl = (bool *) palloc0(natts * sizeof(bool));
 
-	if (reloptions != (Datum) 0)
-		repl_vals[Anum_pg_class_reloptions - 1] = reloptions;
+	if (options != (Datum) 0)
+		repl_vals[Anum_pg_class_reloptions - 1] = options;
 	else
 		repl_nulls[Anum_pg_class_reloptions - 1] = true;
 	do_repl[Anum_pg_class_reloptions - 1] = true;
 
-	tuple_new = heap_modify_tuple(tuple, cat_state->desc_class, repl_vals,
-								  repl_nulls, do_repl);
-
+	/* Store the change. */
+	tuple_new = heap_modify_tuple(tuple, desc, repl_vals, repl_nulls,
+								  do_repl);
 	simple_heap_update(rel, &tuple_new->t_self, tuple_new);
 	CatalogUpdateIndexes(rel, tuple_new);
 
+	/* Cleanup. */
 	ReleaseSysCache(tuple);
 	heap_freetuple(tuple_new);
 	heap_close(rel, RowExclusiveLock);

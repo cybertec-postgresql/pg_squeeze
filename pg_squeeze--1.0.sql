@@ -194,7 +194,6 @@ AS $$
 DECLARE
 	v_tabschema	name;
 	v_tabname	name;
-	v_stmt		text;
 BEGIN
 	PERFORM
 	FROM squeeze.tasks WHERE active;
@@ -217,9 +216,8 @@ BEGIN
 
 	-- squeeze_table() function requires the "user_catalog_option" to be
 	-- set, but cannot do it in its own transaction. So do it now.
-	v_stmt := 'ALTER TABLE ' || v_tabschema || '.' || v_tabname ||
-		' SET (user_catalog_table=true)';
-	EXECUTE v_stmt;
+	PERFORM squeeze.change_user_catalog_option(v_tabschema, v_tabname,
+		true);
 END;
 $$;
 
@@ -323,10 +321,8 @@ t.tried >= tb.max_retry, tb.skip_analyze
 				-- squeeze_table() resets the storage option
 				-- on successful completion, but here we must
 				-- do it explicitly.
-				v_stmt := 'ALTER TABLE "' || v_tabschema || '"."' ||
-				v_tabname || '" RESET (user_catalog_table)';
-
-				EXECUTE v_stmt;
+				PERFORM squeeze.change_user_catalog_option(v_tabschema,
+					v_tabname, false);
 
 				RETURN;
 			ELSE
@@ -339,6 +335,14 @@ t.tried >= tb.max_retry, tb.skip_analyze
 END;
 $$;
 
+CREATE FUNCTION change_user_catalog_option (
+	tabchema	name,
+	tabname		name,
+	is_set	bool
+)
+RETURNS void
+AS 'MODULE_PATHNAME', 'change_user_catalog_option'
+LANGUAGE C;
 
 CREATE FUNCTION squeeze_table(
        tabchema		name,
