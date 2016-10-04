@@ -107,7 +107,12 @@ CREATE TABLE tasks (
 
 	-- How many times did we try to process the task? The common use case
 	-- is that a concurrent DDL broke the processing.
-	tried		int	NOT NULL	DEFAULT 0
+	tried		int	NOT NULL	DEFAULT 0,
+
+	-- The initial value of "autovacuum_enabled" relation option is stored
+	-- here, and will be restored when we're done.
+	autovac		bool	NOT NULL,
+	autovac_toast	bool	NOT NULL
 );
 
 -- Make sure there is at most one active task anytime.
@@ -138,18 +143,28 @@ WHERE	(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
 	);
 
 
+CREATE FUNCTION is_autovacuum_enabled (
+       relid	oid
+)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'is_autovacuum_enabled'
+LANGUAGE C;
+
 -- Create tasks for newly qualifying tables.
 CREATE FUNCTION add_new_tasks() RETURNS void
 LANGUAGE sql
 AS $$
-    WITH tasks_new(id) AS (
+    WITH tasks_new(id, autovac, autovac_toast) AS (
 	 UPDATE	squeeze.tables_internal i
 	 SET	last_task_created = now()
 	 FROM	pg_catalog.pg_stat_user_tables s,
-		squeeze.tables t
+		squeeze.tables t,
+		pg_class c, pg_namespace n
 	 WHERE
 		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
 		i.table_id = t.id AND
+		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
+		c.relname = t.tabname AND
 		t.first_check <= now() AND
 		-- Checked too far in the past or never at all?
 		(
@@ -179,10 +194,11 @@ AS $$
 			OR
 			i.last_task_finished < s.last_autoanalyze
 		)
-	 RETURNING t.id
+	 RETURNING t.id, squeeze.is_autovacuum_enabled(c.oid),
+	 	   squeeze.is_autovacuum_enabled(c.reltoastrelid)
     )
-    INSERT INTO squeeze.tasks(table_id)
-    SELECT	id
+    INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
+    SELECT	id, autovac, autovac_toast
     FROM	tasks_new;
 $$;
 
@@ -216,8 +232,11 @@ BEGIN
 
 	-- squeeze_table() function requires the "user_catalog_option" to be
 	-- set, but cannot do it in its own transaction. So do it now.
-	PERFORM squeeze.change_user_catalog_option(v_tabschema, v_tabname,
-		true);
+	--
+	-- Also disable autovacuum for the table and its TOAST relation. As
+	-- we're gonna "squeeze" the table, VACUUM no longer makes sense.
+	PERFORM squeeze.set_reloptions(v_tabschema, v_tabname, true, false,
+		false);
 END;
 $$;
 
@@ -253,6 +272,8 @@ DECLARE
 	v_ind_tbsps	name[][];
 	v_task_id	int;
 	v_tried		int;
+	v_autovac	bool;
+	v_autovac_toast bool;
 	v_last_try	bool;
 	v_skip_analyze	bool;
 	v_stmt		text;
@@ -264,9 +285,9 @@ DECLARE
 BEGIN
 	SELECT tb.tabschema, tb.tabname, tb.clustering_index,
 tb.rel_tablespace, tb.ind_tablespaces, t.id, t.tried,
-t.tried >= tb.max_retry, tb.skip_analyze
+t.tried >= tb.max_retry, tb.skip_analyze, t.autovac, t.autovac_toast
 	INTO v_tabschema, v_tabname, v_cl_index, v_rel_tbsp, v_ind_tbsps,
- v_task_id, v_tried, v_last_try, v_skip_analyze
+ v_task_id, v_tried, v_last_try, v_skip_analyze, v_autovac, v_autovac_toast
 	FROM squeeze.tasks t, squeeze.tables tb
 	WHERE t.table_id = tb.id AND t.active;
 
@@ -278,7 +299,7 @@ t.tried >= tb.max_retry, tb.skip_analyze
 	-- Do the actual work.
 	BEGIN
 		PERFORM squeeze.squeeze_table(v_tabschema, v_tabname,
- v_cl_index, v_rel_tbsp, v_ind_tbsps);
+ v_cl_index, v_rel_tbsp, v_ind_tbsps, v_autovac, v_autovac_toast);
 
 		PERFORM squeeze.cleanup_task(v_task_id);
 
@@ -318,11 +339,12 @@ t.tried >= tb.max_retry, tb.skip_analyze
 			IF v_last_try THEN
 				PERFORM squeeze.cleanup_task(v_task_id);
 
-				-- squeeze_table() resets the storage option
-				-- on successful completion, but here we must
-				-- do it explicitly.
-				PERFORM squeeze.change_user_catalog_option(v_tabschema,
-					v_tabname, false);
+				-- squeeze_table() resets the options on
+				-- successful completion, but here we must do
+				-- it explicitly on error.
+				PERFORM squeeze.set_reloptions(v_tabschema,
+					v_tabname, false, v_autovac,
+					v_autovac_toast);
 
 				RETURN;
 			ELSE
@@ -335,13 +357,15 @@ t.tried >= tb.max_retry, tb.skip_analyze
 END;
 $$;
 
-CREATE FUNCTION change_user_catalog_option (
+CREATE FUNCTION set_reloptions (
 	tabchema	name,
 	tabname		name,
-	is_set	bool
+	user_cat	bool,
+	autovac		bool,
+	autovac_toast	bool
 )
 RETURNS void
-AS 'MODULE_PATHNAME', 'change_user_catalog_option'
+AS 'MODULE_PATHNAME', 'set_reloptions'
 LANGUAGE C;
 
 CREATE FUNCTION squeeze_table(
@@ -349,7 +373,9 @@ CREATE FUNCTION squeeze_table(
        tabname		name,
        clustering_index name,
        rel_tablespace 	name,
-       ind_tablespaces	name[][])
+       ind_tablespaces	name[][],
+       autovac		bool,
+       autovac_toast	bool)
 RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_table'
 LANGUAGE C;
