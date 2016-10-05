@@ -5,6 +5,7 @@
 #include "pgstat.h"
 #include "access/xact.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "postmaster/bgworker.h"
@@ -24,7 +25,8 @@ extern void squeeze_worker_main(Datum main_arg);
 static void squeeze_worker_sighup(SIGNAL_ARGS);
 static void squeeze_worker_sigterm(SIGNAL_ARGS);
 
-static bool run_command(char *command, bool check_result);
+static void run_command(char *command);
+static int64 get_task_count(void);
 
 PG_FUNCTION_INFO_V1(start_worker);
 Datum
@@ -96,6 +98,7 @@ squeeze_worker_main(Datum main_arg)
 	LOCKTAG		tag;
 	LockAcquireResult	lock_res;
 	long	delay;
+	int64	ntasks;
 
 	pqsignal(SIGHUP, squeeze_worker_sighup);
 	pqsignal(SIGTERM, squeeze_worker_sigterm);
@@ -143,6 +146,9 @@ squeeze_worker_main(Datum main_arg)
 					 MyDatabaseId)));
 	Assert(lock_res == LOCKACQUIRE_OK);
 
+	delay = 0L;
+	ntasks = get_task_count();
+
 	while (!got_sigterm)
 	{
 		int	rc;
@@ -160,9 +166,18 @@ squeeze_worker_main(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		run_command("SELECT squeeze.add_new_tasks()", false);
+		/*
+		 * Only try to add rows to "tasks" table if performed enough loops to
+		 * process the number we got last time.
+		 */
+		if (ntasks == 0)
+		{
+			run_command("SELECT squeeze.add_new_tasks()");
+			ntasks = get_task_count();
+			elog(DEBUG1, "pg_squeeze: %zd tasks added to queue", ntasks);
+		}
 
-		if (!run_command("SELECT id FROM squeeze.tasks LIMIT 1", true))
+		if (ntasks == 0)
 		{
 			/*
 			 * As there's no urgent work, wait some time.
@@ -179,20 +194,31 @@ squeeze_worker_main(Datum main_arg)
 			continue;
 		}
 		else
+		{
+			run_command("SELECT squeeze.start_next_task()");
+
+			/* Do the actual work. */
+			run_command("SELECT squeeze.process_current_task()");
+
+			/*
+			 * Release the replication slot explicitly, ERROR does not ensure
+			 * that. (PostgresMain does that for regular backend in the main
+			 * loop.)
+			 */
+			if (MyReplicationSlot != NULL)
+				ReplicationSlotRelease();
+
+			/*
+			 * We don't know if processing succeeded. This variable should
+			 * only minimize the number of calls of get_task_count().
+			 */
+			ntasks--;
+
+			/*
+			 * No reason to wait until ntasks is checked for zero value again.
+			 */
 			delay = 0L;
-
-		run_command("SELECT squeeze.start_next_task()", false);
-
-		/* Do the actual work. */
-		run_command("SELECT squeeze.process_current_task()", false);
-
-		/*
-		 * Release the replication slot explicitly, ERROR does not ensure
-		 * that. (PostgresMain does that for regular backend in the main
-		 * loop.)
-		 */
-		if (MyReplicationSlot != NULL)
-			ReplicationSlotRelease();
+		}
 	}
 
 	if (!LockRelease(&tag, ExclusiveLock, false))
@@ -223,14 +249,12 @@ squeeze_worker_sigterm(SIGNAL_ARGS)
 }
 
 /*
- * If check_result is true, the return value tells whether at least one row
- * was retrieved.
+ * Run an SQL command that does not return any value.
  */
-static bool
-run_command(char *command, bool check_result)
+static void
+run_command(char *command)
 {
 	int	ret;
-	int result = false;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -242,13 +266,54 @@ run_command(char *command, bool check_result)
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "SELECT command failed: %s", command);
 
-	if (check_result && SPI_processed > 0)
-		result = true;
-
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+
+/* Return the number pending tasks, i.e. of rows of squeeze.tasks table. */
+static int64
+get_task_count(void)
+{
+	int	ret;
+	Datum	res_datum;
+	bool	isnull;
+	int64	result;
+	char	*command = "SELECT count(*) FROM squeeze.tasks";
+#ifdef USE_ASSERT_CHECKING
+	Oid	restype;
+#endif
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, command);
+
+	ret = SPI_execute(command, true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "SELECT command failed: %s", command);
+
+	Assert(SPI_tuptable->tupdesc != NULL);
+#ifdef USE_ASSERT_CHECKING
+	restype = SPI_gettypeid(SPI_tuptable->tupdesc, 1);
+	Assert(restype == INT8OID);
+#endif
+
+	Assert(SPI_processed == 1);
+	Assert(SPI_tuptable->vals != NULL);
+	res_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
+							  &isnull);
+	Assert(!isnull);
+
+	result = DatumGetInt64(res_datum);
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
 
 	return result;
