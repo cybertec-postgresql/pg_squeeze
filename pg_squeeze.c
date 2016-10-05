@@ -1302,6 +1302,8 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 static void
 check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 {
+	Oid	toast_relid;
+
 	/*
 	 * No DDL should be compatible with this lock mode. (Not sure if this
 	 * condition will ever fire.)
@@ -1310,6 +1312,8 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 		return;
 
 	/*
+	 * First the source relation itself.
+	 *
 	 * Only AccessExclusiveLock guarantees that the pg_class entry hasn't
 	 * changed. By lowering this threshold we'd perhaps skip unnecessary check
 	 * sometimes (e.g. change of pg_class(relhastriggers) is unimportant), but
@@ -1318,6 +1322,25 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 	 * unconditionally.
 	 */
 	check_pg_class_changes(state->relid, state->pg_class_xmin, lock_held);
+
+	/*
+	 * If TOAST relation exists, check it too.
+	 *
+	 * It's questionable whether change of the pg_class of the TOAST relation
+	 * should ever be expected. Let's do it to guard user against accidental
+	 * misuse of the set_reloptions() function. In contrast, we don't check
+	 * changes of TOAST indexes or attributes - these should not happen unless
+	 * allow_system_table_mods GUC is set deliberately.
+	 */
+	toast_relid = state->form_class->reltoastrelid;
+	if (OidIsValid(toast_relid))
+	{
+		/*
+		 * Lock on the relation does not imply lock on its TOAST, so assume
+		 * NoLock.
+		 */
+		check_pg_class_changes(toast_relid, state->toast_xmin, NoLock);
+	}
 
 	/*
 	 * Index change does not necessarily require lock of the parent relation,
