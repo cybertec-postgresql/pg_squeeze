@@ -1758,22 +1758,45 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	while (true)
 	{
 		HeapTuple	tup_in;
-		int	i = 0;
+		int	i;
 		Size	data_size;
 
 		if (!use_sort)
 			data_size = 0;
 
 		/* Sorting cannot be split into batches. */
-		for (; use_sort || (data_size / 1024) < maintenance_work_mem; i++)
+		for (i = 0; use_sort || (data_size / 1024) < maintenance_work_mem;
+			 i++)
 		{
 			tup_in = use_sort || cluster_idx == NULL ?
 				heap_getnext(heap_scan, ForwardScanDirection) :
 				index_getnext(index_scan, ForwardScanDirection);
+
 			if (tup_in != NULL)
 			{
+				bool	flattened = false;
+
+				/*
+				 * Even though special snapshot is used to retrieve values
+				 * from TOAST relation (see toast_fetch_datum), we'd better
+				 * flatten the tuple and thus retrieve the TOAST while the
+				 * historic snapshot is active. One particular reason is that
+				 * tuptoaster.c does access catalog.
+				 */
+				if (HeapTupleHasExternal(tup_in))
+				{
+					tup_in = toast_flatten_tuple(tup_in,
+												 RelationGetDescr(rel_src));
+					flattened = true;
+				}
+
 				if (use_sort)
+				{
 					tuplesort_putheaptuple(tuplesort, tup_in);
+					/* tuplesort should have copied the tuple. */
+					if (flattened)
+						pfree(tup_in);
+				}
 				else
 				{
 					if (i == batch_max_size)
@@ -1783,7 +1806,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 							repalloc(tuples,
 									 batch_max_size * sizeof(HeapTuple));
 					}
-					tuples[i] = heap_copytuple(tup_in);
+					if (!flattened)
+						tup_in = heap_copytuple(tup_in);
+					tuples[i] = tup_in;
 					data_size += HEAPTUPLESIZE + tup_in->t_len;
 				}
 			}

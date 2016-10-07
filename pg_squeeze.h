@@ -6,6 +6,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/relscan.h"
+#include "access/tuptoaster.h"
 #include "access/xact.h"
 #include "nodes/execnodes.h"
 #include "replication/logical.h"

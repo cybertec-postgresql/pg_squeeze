@@ -5,7 +5,6 @@
 
 #include "pg_squeeze.h"
 
-#include "access/tuptoaster.h"
 #include "executor/executor.h"
 #include "replication/decode.h"
 #include "utils/rel.h"
