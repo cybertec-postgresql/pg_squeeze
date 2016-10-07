@@ -40,71 +40,7 @@ PG_MODULE_MAGIC;
 #define	REPL_SLOT_NAME		"pg_squeeze_slot"
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
-/*
- * Information on source relation index, used to build the index on the
- * transient relation. To avoid repeated retrieval of the pg_index fields we
- * also add pg_class(xmin) and pass the same structure to
- * check_catalog_changes().
- */
-typedef struct IndexCatInfo
-{
-	Oid	oid;					/* pg_index(indexrelid) */
-	NameData	relname;		/* pg_class(relname) */
-	Oid	reltablespace;			/* pg_class(reltablespace) */
-	TransactionId		xmin;	/* pg_index(xmin) */
-	TransactionId		pg_class_xmin; /* pg_class(xmin) of the index (not the
-										* parent relation) */
-} IndexCatInfo;
-
 static int index_cat_info_compare(const void *arg1, const void *arg2);
-
-/*
- * Information to check whether an "incompatible" catalog change took
- * place. Such a change prevents us from completing processing of the current
- * table.
- */
-typedef struct CatalogState
-{
-	/* The relation whose changes we'll check for. */
-	Oid	relid;
-
-	/*
-	 * Have both the source relation and its TOAST relation the
-	 * "user_catalog_table" option set?
-	 */
-	bool		is_catalog;
-
-	/* Copy of pg_class tuple. */
-	Form_pg_class	form_class;
-
-	/* Copy of pg_class tuple descriptor. */
-	TupleDesc	desc_class;
-
-	/* Copy of pg_class(reloptions). */
-	Datum	reloptions;
-
-	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
-	TransactionId	*attr_xmins;
-
-	/* Likewise, per-index info. */
-	int		relninds;
-	IndexCatInfo	*indexes;
-
-	/*
-	 * xmin of the pg_class tuple of the source relation during the initial
-	 * check.
-	 */
-	TransactionId		pg_class_xmin;
-
-	/* The same for TOAST relation, if there's one. */
-	TransactionId		toast_xmin;
-
-	/*
-	 * Does at least one index wrong value of indisvalid, indisready or
-	 * indislive?
-	 */
-	bool	invalid_index;
-} CatalogState;
 
 /* Index-to-tablespace mapping. */
 typedef struct IndexTablespace
@@ -131,7 +67,6 @@ static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
 static IndexCatInfo *get_index_info(Oid relid, int *relninds,
 									bool *found_invalid, bool invalid_check_only,
 									Snapshot snapshot);
-static void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
 static void check_attribute_changes(Oid relid, TransactionId	*attrs, int relnatts);
 static void check_index_changes(Oid relid, IndexCatInfo *indexes,
 								int relninds);
@@ -158,7 +93,6 @@ static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
 static Oid get_toast_index(Oid toastrelid);
 static void update_reloptions(Oid relid, bool user_cat, bool autovac);
-
 
 int squeeze_worker_naptime;
 
@@ -492,6 +426,12 @@ squeeze_table(PG_FUNCTION_ARGS)
 										  nindexes, tbsp_info, cat_state);
 	PopActiveSnapshot();
 
+	/*
+	 * Make the identity index of the transient table visible, for the sake of
+	 * concurrent UPDATEs and DELETEs.
+	 */
+	CommandCounterIncrement();
+
 	/* Tablespace info is no longer needed. */
 	free_tablespace_info(tbsp_info);
 
@@ -558,34 +498,16 @@ squeeze_table(PG_FUNCTION_ARGS)
 	startptr = MyReplicationSlot->data.restart_lsn;
 
 	/*
-	 * Decode the data changes that occurred while the initial load was in
-	 * progress, and put them into a tuplestore.
+	 * Decode and apply the data changes that occurred while the initial load
+	 * was in progress.
 	 *
-	 * Even if there amount of concurrent changes might not be significant,
-	 * both initial load and index build could have produced many XLOG records
-	 * that we need to read. Do so before requesting exclusive lock on the
-	 * source relation.
+	 * Even if the amount of concurrent changes of our source table might not
+	 * be significant, both initial load and index build could have produced
+	 * many XLOG records that we need to read. Do so before requesting
+	 * exclusive lock on the source relation.
 	 */
-	decode_concurrent_changes(ctx, &startptr, end_of_wal);
-
-	/*
-	 * Since the build of indexes could have taken long time, many changes
-	 * could have happen in the source relation in between. We want to process
-	 * them before requesting exclusive lock, but first make sure the changes
-	 * are applicable.
-	 */
-	check_catalog_changes(cat_state, NoLock);
-
-	/*
-	 * Make the identity index of the transient table visible, for the sake of
-	 * concurrent UPDATEs and DELETEs.
-	 */
-	CommandCounterIncrement();
-
-	/* Process the first batch of concurrent changes. */
-	process_concurrent_changes((DecodingOutputState *) ctx->output_writer_private,
-							   rel_dst, ident_key, ident_key_nentries,
-							   iistate);
+	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
+							   ident_key, ident_key_nentries, iistate);
 
 	/*
 	 * This (supposedly cheap) special check should avoid one particular
@@ -660,15 +582,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 	end_of_wal = GetFlushRecPtr();
 
 	/*
-	 * Decode the changes that might have taken place while we were waiting
+	 * Process the changes that might have taken place while we were waiting
 	 * for the lock.
 	 */
-	decode_concurrent_changes(ctx, &startptr, end_of_wal);
-
-	/* Process the second batch of concurrent changes. */
-	process_concurrent_changes((DecodingOutputState *) ctx->output_writer_private,
-							   rel_dst, ident_key, ident_key_nentries,
-							   iistate);
+	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
+							   ident_key, ident_key_nentries, iistate);
 
 	/*
 	 * Done with decoding.
@@ -880,6 +798,7 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tupdesc = tup_desc;
 	dstate->nchanges_max = 1024;
 	dstate->nchanges = 0;
+	dstate->data_size = 0;
 
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
 											"logical decoding");
@@ -1295,7 +1214,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
  * XXX It's worth checking AlterTableGetLockLevel() each time we adopt a new
  * version of PG core.
  */
-static void
+void
 check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 {
 	Oid	toast_relid;

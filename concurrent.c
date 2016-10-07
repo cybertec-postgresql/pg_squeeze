@@ -9,6 +9,13 @@
 #include "replication/decode.h"
 #include "utils/rel.h"
 
+static bool decode_concurrent_changes(LogicalDecodingContext *ctx,
+									  XLogRecPtr *startptr,
+									  XLogRecPtr end_of_wal);
+static void apply_concurrent_changes(DecodingOutputState *dstate,
+									 Relation relation, ScanKey key,
+									 int nkeys, IndexInsertState *iistate);
+
 static void plugin_startup(LogicalDecodingContext *ctx,
 						   OutputPluginOptions *opt, bool is_init);
 static void plugin_shutdown(LogicalDecodingContext *ctx);
@@ -22,6 +29,40 @@ static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
 
 void
+process_concurrent_changes(LogicalDecodingContext *ctx,
+						   XLogRecPtr *startptr, XLogRecPtr end_of_wal,
+						   CatalogState	*cat_state,
+						   Relation rel_dst, ScanKey ident_key,
+						   int ident_key_nentries, IndexInsertState *iistate)
+{
+	DecodingOutputState	*dstate;
+	bool	done;
+
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+	done = false;
+	while(!done)
+	{
+		done = decode_concurrent_changes(ctx, startptr, end_of_wal);
+
+		if (dstate->nchanges == 0)
+			continue;
+
+		/* Make sure the changes are still applicable. */
+		check_catalog_changes(cat_state, NoLock);
+
+		apply_concurrent_changes(dstate, rel_dst, ident_key,
+								 ident_key_nentries, iistate);
+	}
+}
+
+/*
+ * Decode logical changes from the XLOG sequence specified by *starptr and
+ * end_of_wal.
+ *
+ * Returns true iff done (for now), i.e. no changes within given limits can be
+ * decoded.
+ */
+static bool
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 						  XLogRecPtr end_of_wal)
 {
@@ -48,9 +89,10 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 
 	PG_TRY();
 	{
-		while ((*startptr != InvalidXLogRecPtr && *startptr < end_of_wal) ||
-			   (ctx->reader->EndRecPtr != InvalidXLogRecPtr &&
-				ctx->reader->EndRecPtr < end_of_wal))
+		while (((*startptr != InvalidXLogRecPtr && *startptr < end_of_wal) ||
+				(ctx->reader->EndRecPtr != InvalidXLogRecPtr &&
+				 ctx->reader->EndRecPtr < end_of_wal)) &&
+			   (dstate->data_size < maintenance_work_mem))
 		{
 			XLogRecord *record;
 			char	   *errm = NULL;
@@ -76,68 +118,17 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-}
-
-IndexInsertState *
-get_index_insert_state(Relation	relation, Oid ident_index_id)
-{
-	EState	*estate;
-	int	i;
-	IndexInsertState	*result;
-
-	result = (IndexInsertState *) palloc0(sizeof(IndexInsertState));
-	estate = CreateExecutorState();
-	result->econtext = GetPerTupleExprContext(estate);
-
-	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
-	InitResultRelInfo(result->rri, relation,  0, 0);
-	ExecOpenIndices(result->rri, false);
 
 	/*
-	 * Find the relcache entry of the identity index so that we spend no extra
-	 * effort to open / close it.
+	 * The check for InvalidXLogRecPtr covers the (probably impossible) case
+	 * that *startptr is initially equal to end_of_val.
 	 */
-	for (i = 0; i < result->rri->ri_NumIndices; i++)
-	{
-		IndexInfo	*ii;
-		Relation	ind_rel;
-
-		/*
-		 * We don't need ExecInsertIndexTuples() to check exclusion
-		 * constraints - the source relation is responsible for those.
-		 */
-		ii = result->rri->ri_IndexRelationInfo[i];
-		ii->ii_ExclusionOps = NULL;
-		ii->ii_ExclusionProcs = NULL;
-		ii->ii_ExclusionStrats = NULL;
-
-		ind_rel = result->rri->ri_IndexRelationDescs[i];
-		if (ind_rel->rd_id == ident_index_id)
-			result->ident_index = ind_rel;
-	}
-	if (result->ident_index == NULL)
-		elog(ERROR, "Failed to open identity index");
-
-	/* Only initialize fields needed by ExecInsertIndexTuples(). */
-	estate->es_result_relations = estate->es_result_relation_info =
-		result->rri;
-	estate->es_num_result_relations = 1;
-	result->estate = estate;
-
-	return result;
-}
-
-void
-free_index_insert_state(IndexInsertState *iistate)
-{
-	ExecCloseIndices(iistate->rri);
-	FreeExecutorState(iistate->estate);
-	pfree(iistate->rri);
-	pfree(iistate);
+	return ctx->reader->EndRecPtr == InvalidXLogRecPtr ||
+		ctx->reader->EndRecPtr >= end_of_wal;
 }
 
 /*
- * Process changes that happened during the initial load.
+ * Apply changes that happened during the initial load.
  *
  * Scan key is passed by caller, so it does not have to be constructed
  * multiple times.
@@ -150,9 +141,9 @@ free_index_insert_state(IndexInsertState *iistate)
  * create constraints, so relation->rd_replidindex field would be empty
  * anyway. But this approach might change in the future.)
  */
-void
-process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
-						   ScanKey key, int nkeys, IndexInsertState *iistate)
+static void
+apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
+						 ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot	*slot;
 	int	i;
@@ -312,6 +303,7 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		}
 	}
 	dstate->nchanges = 0;
+	dstate->data_size = 0;
 
 	PopActiveSnapshot();
 
@@ -319,6 +311,64 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 	ExecDropSingleTupleTableSlot(slot);
+}
+
+IndexInsertState *
+get_index_insert_state(Relation	relation, Oid ident_index_id)
+{
+	EState	*estate;
+	int	i;
+	IndexInsertState	*result;
+
+	result = (IndexInsertState *) palloc0(sizeof(IndexInsertState));
+	estate = CreateExecutorState();
+	result->econtext = GetPerTupleExprContext(estate);
+
+	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
+	InitResultRelInfo(result->rri, relation,  0, 0);
+	ExecOpenIndices(result->rri, false);
+
+	/*
+	 * Find the relcache entry of the identity index so that we spend no extra
+	 * effort to open / close it.
+	 */
+	for (i = 0; i < result->rri->ri_NumIndices; i++)
+	{
+		IndexInfo	*ii;
+		Relation	ind_rel;
+
+		/*
+		 * We don't need ExecInsertIndexTuples() to check exclusion
+		 * constraints - the source relation is responsible for those.
+		 */
+		ii = result->rri->ri_IndexRelationInfo[i];
+		ii->ii_ExclusionOps = NULL;
+		ii->ii_ExclusionProcs = NULL;
+		ii->ii_ExclusionStrats = NULL;
+
+		ind_rel = result->rri->ri_IndexRelationDescs[i];
+		if (ind_rel->rd_id == ident_index_id)
+			result->ident_index = ind_rel;
+	}
+	if (result->ident_index == NULL)
+		elog(ERROR, "Failed to open identity index");
+
+	/* Only initialize fields needed by ExecInsertIndexTuples(). */
+	estate->es_result_relations = estate->es_result_relation_info =
+		result->rri;
+	estate->es_num_result_relations = 1;
+	result->estate = estate;
+
+	return result;
+}
+
+void
+free_index_insert_state(IndexInsertState *iistate)
+{
+	ExecCloseIndices(iistate->rri);
+	FreeExecutorState(iistate->estate);
+	pfree(iistate->rri);
+	pfree(iistate);
 }
 
 void
@@ -502,4 +552,5 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 	change = &dstate->changes[dstate->nchanges++];
 	change->kind = kind;
 	change->tuple = tuple;
+	dstate->data_size += HEAPTUPLESIZE + tuple->t_len;
 }
