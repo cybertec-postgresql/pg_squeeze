@@ -520,8 +520,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * cause deadlock by requesting exclusive lock. Fortunately we should
 	 * recognize this scenario by checking pg_index.
 	 */
-	ind_info = get_index_info(relid_src, NULL, &invalid_index, true,
-							  NULL);
+	ind_info = get_index_info(relid_src, NULL, &invalid_index, true, NULL);
 	if (invalid_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
