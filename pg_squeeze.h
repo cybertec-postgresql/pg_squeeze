@@ -12,7 +12,6 @@
 #include "utils/inval.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
-#include "utils/tuplestore.h"
 
 typedef enum
 {
@@ -20,32 +19,38 @@ typedef enum
 	PG_SQUEEZE_CHANGE_UPDATE_OLD,
 	PG_SQUEEZE_CHANGE_UPDATE_NEW,
 	PG_SQUEEZE_CHANGE_DELETE
-} ChangeKind;
+} ConcurrentChangeKind;
 
-typedef struct ChangeStore
+typedef struct ConcurrentChange
 {
-	TupleDesc	tupdesc;
-	Tuplestorestate	*tupstore;
-} ChangeStore;
+	/* The actual data. */
+	HeapTuple	tuple;
+
+	/* See the enum above. */
+	ConcurrentChangeKind	kind;
+} ConcurrentChange;
 
 typedef struct DecodingOutputState
 {
 	/* The relation whose changes we're decoding. */
 	Oid	relid;
 
-	/* The actual data decoded. */
-	ChangeStore	data;
+	/* Tuple descriptor used by output plugin to form tuples. */
+	TupleDesc	tupdesc;
 
 	/*
-	 * One byte per regular data item, telling what kind of change it
-	 * represents. An in-memory array would be a little bit easier to
-	 * implement, but in that case we'd have to pay special attention to
-	 * extreme cases (in terms of number of changes), while tuplestore stores
-	 * data to disk in transparent way.
+	 * Change storage.
 	 *
-	 * XXX Consider storing multiple values per tuple, to conserve space.
+	 * We cannot use tuplestore because it only seems to support "minimal
+	 * tuple", and so we'd be unable to transfer OID (system) column.
 	 */
-	ChangeStore	metadata;
+	ConcurrentChange	*changes;
+
+	/* Number of changes currently stored. */
+	int	nchanges;
+
+	/* The size of "changes" array. */
+	int	nchanges_max;
 
 	ResourceOwner	resowner;
 } DecodingOutputState;

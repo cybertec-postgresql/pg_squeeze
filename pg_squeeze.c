@@ -183,19 +183,6 @@ _PG_init(void)
 		NULL, NULL, NULL);
 }
 
-
-/*
- * Char attribute to construct tuple descriptor for
- * DecodingOutputState.metadata.
- */
-static FormData_pg_attribute att_char_data = {
-	0, {"change_kind"}, CHAROID, 0, sizeof(char),
-	1, 0, -1, -1,
-	true, 'p', 'c', true, false, false, true, 0, InvalidOid
-};
-
-static Form_pg_attribute att_char = &att_char_data;
-
 /*
  * SQL interface to squeeze one table interactively.
  *
@@ -890,15 +877,26 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	 */
 	dstate = palloc0(sizeof(DecodingOutputState));
 	dstate->relid = relid;
-	dstate->data.tupstore = tuplestore_begin_heap(false, false, work_mem);
-	dstate->data.tupdesc = tup_desc;
-	dstate->metadata.tupstore = tuplestore_begin_heap(false, false, work_mem);
-	dstate->metadata.tupdesc = CreateTupleDesc(1, false, &att_char);
+	dstate->tupdesc = tup_desc;
+	dstate->nchanges_max = 1024;
+	dstate->nchanges = 0;
+
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
 											"logical decoding");
-	ctx->output_writer_private = dstate;
 
 	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Allocate the array in the same context that the output plugin will
+	 * use. (XXX Alternatively we could pass our current context to the plugin
+	 * via dstate, but there seems to be no advantage.)
+	 */
+	oldcontext = MemoryContextSwitchTo(ctx->context);
+	dstate->changes = (ConcurrentChange *)
+		palloc0(dstate->nchanges_max * sizeof(ConcurrentChange));
+	MemoryContextSwitchTo(oldcontext);
+
+	ctx->output_writer_private = dstate;
 	return ctx;
 }
 
@@ -908,10 +906,8 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 	DecodingOutputState	*dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
-	FreeTupleDesc(dstate->data.tupdesc);
-	tuplestore_end(dstate->data.tupstore);
-	FreeTupleDesc(dstate->metadata.tupdesc);
-	tuplestore_end(dstate->metadata.tupstore);
+	FreeTupleDesc(dstate->tupdesc);
+	pfree(dstate->changes);
 
 	FreeDecodingContext(ctx);
 }

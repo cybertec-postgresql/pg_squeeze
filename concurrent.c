@@ -5,6 +5,7 @@
 
 #include "pg_squeeze.h"
 
+#include "access/tuptoaster.h"
 #include "executor/executor.h"
 #include "replication/decode.h"
 #include "utils/rel.h"
@@ -18,6 +19,8 @@ static void plugin_commit_txn(LogicalDecodingContext *ctx,
 							  ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
 static void plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 						  Relation rel, ReorderBufferChange *change);
+static void store_change(LogicalDecodingContext *ctx,
+						 ConcurrentChangeKind kind, HeapTuple tuple);
 
 void
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
@@ -152,16 +155,18 @@ void
 process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						   ScanKey key, int nkeys, IndexInsertState *iistate)
 {
-	TupleTableSlot	*slot_data, *slot_metadata;
+	TupleTableSlot	*slot;
+	int	i;
 	HeapTuple tup_old = NULL;
 	BulkInsertState bistate = NULL;
 
-	slot_metadata = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(slot_metadata, dstate->metadata.tupdesc);
+	if (dstate->nchanges == 0)
+		return;
 
-	slot_data = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(slot_data, dstate->data.tupdesc);
-	iistate->econtext->ecxt_scantuple = slot_data;
+	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
+	slot = MakeTupleTableSlot();
+	ExecSetSlotDescriptor(slot, dstate->tupdesc);
+	iistate->econtext->ecxt_scantuple = slot;
 
 	/*
 	 * In case functions in the index need the active snapshot and caller
@@ -169,42 +174,31 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	while (tuplestore_gettupleslot(dstate->metadata.tupstore, true, false,
-								   slot_metadata))
+	for (i = 0; i < dstate->nchanges; i++)
 	{
-		HeapTuple tup_meta, tup, tup_exist;
-		Datum	kind_value[1];
-		bool	kind_isnull[1];
-		char	change_kind;
-
-		if (!tuplestore_gettupleslot(dstate->data.tupstore, true, false,
-									 slot_data))
-			elog(ERROR, "The data and metadata slots do not match.");
-
-		/* Find out of what kind current change is. */
-		tup_meta = ExecCopySlotTuple(slot_metadata);
-		heap_deform_tuple(tup_meta, slot_metadata->tts_tupleDescriptor,
-						  kind_value, kind_isnull);
-		Assert(!kind_isnull[0]);
-		change_kind = DatumGetChar(kind_value[0]);
+		HeapTuple tup, tup_exist;
+		ConcurrentChange	*change = &dstate->changes[i];
 
 		/*
 		 * Do not keep buffer pinned for insert if the current change is
 		 * something else.
 		 */
-		if (change_kind != PG_SQUEEZE_CHANGE_INSERT && bistate != NULL)
+		if (change->kind != PG_SQUEEZE_CHANGE_INSERT && bistate != NULL)
 		{
 			FreeBulkInsertState(bistate);
 			bistate = NULL;
 		}
 
-		tup = ExecCopySlotTuple(slot_data);
-		if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_OLD)
+		tup = change->tuple;
+		change->tuple = NULL;
+		ExecStoreTuple(tup, slot, InvalidBuffer, false);
+
+		if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_OLD)
 		{
 			Assert(tup_old == NULL);
 			tup_old = tup;
 		}
-		else if (change_kind == PG_SQUEEZE_CHANGE_INSERT)
+		else if (change->kind == PG_SQUEEZE_CHANGE_INSERT)
 		{
 			List	*recheck;
 
@@ -220,7 +214,7 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
 
 			/* Update indexes. */
-			recheck = ExecInsertIndexTuples(slot_data, &(tup->t_self),
+			recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
 											iistate->estate, false, NULL,
 											NIL);
 
@@ -233,15 +227,15 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 			pfree(tup);
 		}
-		else if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
-				 change_kind == PG_SQUEEZE_CHANGE_DELETE)
+		else if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
+				 change->kind == PG_SQUEEZE_CHANGE_DELETE)
 		{
 			HeapTuple	tup_key;
 			IndexScanDesc	scan;
 			int i;
 			ItemPointerData	ctid;
 
-			if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
+			if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
 				tup_key = tup_old != NULL ? tup_old : tup;
 			}
@@ -284,14 +278,14 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			ItemPointerCopy(&tup_exist->t_self, &ctid);
 			index_endscan(scan);
 
-			if (change_kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
+			if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
 				simple_heap_update(relation, &ctid, tup);
 				if (!HeapTupleIsHeapOnly(tup))
 				{
 					List	*recheck;
 
-					recheck = ExecInsertIndexTuples(slot_data, &(tup->t_self),
+					recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
 													iistate->estate, false,
 													NULL, NIL);
 					list_free(recheck);
@@ -309,32 +303,23 @@ process_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			pfree(tup);
 		}
 		else
-			elog(ERROR, "Unrecognized kind of change: %d", change_kind);
+			elog(ERROR, "Unrecognized kind of change: %d", change->kind);
 
 		/* If there's any change, make it visible to the next iteration. */
-		if (change_kind != PG_SQUEEZE_CHANGE_UPDATE_OLD)
+		if (change->kind != PG_SQUEEZE_CHANGE_UPDATE_OLD)
 		{
 			CommandCounterIncrement();
 			UpdateActiveSnapshotCommandId();
 		}
-		pfree(tup_meta);
 	}
+	dstate->nchanges = 0;
 
 	PopActiveSnapshot();
 
 	/* Cleanup. */
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
-
-	if (tuplestore_gettupleslot(dstate->data.tupstore, true, false,
-								slot_data))
-		elog(ERROR, "The data and metadata slots do not match.");
-
-	ExecDropSingleTupleTableSlot(slot_data);
-	ExecDropSingleTupleTableSlot(slot_metadata);
-
-	tuplestore_clear(dstate->data.tupstore);
-	tuplestore_clear(dstate->metadata.tupstore);
+	ExecDropSingleTupleTableSlot(slot);
 }
 
 void
@@ -402,16 +387,12 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				 Relation relation, ReorderBufferChange *change)
 {
 	DecodingOutputState	*dstate;
-	Datum	values[1];
-	bool	isnull[1];
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
 	/* Only interested in one particular relation. */
 	if (relation->rd_id != dstate->relid)
 		return;
-
-	isnull[0] = false;
 
 	/* Decode entry depending on its type */
 	switch (change->action)
@@ -430,14 +411,7 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				if (newtuple == NULL)
 					elog(ERROR, "Incomplete insert info.");
 
-				/* Store the tuple itself ... */
-				tuplestore_puttuple(dstate->data.tupstore, newtuple);
-
-				/* ... and the info on the change kind. */
-				values[0] = CharGetDatum(PG_SQUEEZE_CHANGE_INSERT);
-				tuplestore_putvalues(dstate->metadata.tupstore,
-									 dstate->metadata.tupdesc,
-									 values, isnull);
+				store_change(ctx, PG_SQUEEZE_CHANGE_INSERT, newtuple);
 			}
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
@@ -453,21 +427,9 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					elog(ERROR, "Incomplete update info.");
 
 				if (oldtuple != NULL)
-				{
-					tuplestore_puttuple(dstate->data.tupstore, oldtuple);
+					store_change(ctx, PG_SQUEEZE_CHANGE_UPDATE_OLD, oldtuple);
 
-					values[0] = CharGetDatum(PG_SQUEEZE_CHANGE_UPDATE_OLD);
-					tuplestore_putvalues(dstate->metadata.tupstore,
-										 dstate->metadata.tupdesc,
-										 values, isnull);
-				}
-
-				tuplestore_puttuple(dstate->data.tupstore, newtuple);
-
-				values[0] = CharGetDatum(PG_SQUEEZE_CHANGE_UPDATE_NEW);
-				tuplestore_putvalues(dstate->metadata.tupstore,
-									 dstate->metadata.tupdesc,
-									 values, isnull);
+				store_change(ctx, PG_SQUEEZE_CHANGE_UPDATE_NEW, newtuple);
 			}
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
@@ -480,12 +442,7 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				if (oldtuple == NULL)
 					elog(ERROR, "Incomplete delete info.");
 
-				tuplestore_puttuple(dstate->data.tupstore, oldtuple);
-
-				values[0] = CharGetDatum(PG_SQUEEZE_CHANGE_DELETE);
-				tuplestore_putvalues(dstate->metadata.tupstore,
-									 dstate->metadata.tupdesc,
-									 values, isnull);
+				store_change(ctx, PG_SQUEEZE_CHANGE_DELETE, oldtuple);
 			}
 			break;
 		default:
@@ -493,4 +450,57 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			Assert(0);
 			break;
 	}
+}
+
+/* Store concurrent data change. */
+static void
+store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
+			 HeapTuple tuple)
+{
+	DecodingOutputState	*dstate;
+	ConcurrentChange	*change;
+	MemoryContext	oldcontext;
+
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	/* Make sure there's enough space for the new change. */
+	if (dstate->nchanges >= dstate->nchanges_max)
+	{
+		Size	size;
+		int	i;
+
+		Assert(dstate->nchanges == dstate->nchanges_max);
+
+		dstate->nchanges_max *= 2;
+		size = dstate->nchanges_max * sizeof(ConcurrentChange);
+		oldcontext = MemoryContextSwitchTo(ctx->context);
+		dstate->changes = (ConcurrentChange *) repalloc(dstate->changes, size);
+
+		/*
+		 * As the "tuple" field is used to indicate whether the array element is
+		 * used, all the new elements it must have it initially.
+		 */
+		for (i = dstate->nchanges; i < dstate->nchanges_max; i++)
+			dstate->changes[i].tuple = NULL;
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	/*
+	 * ReorderBufferCommit() stores the TOAST chunks in its private memory
+	 * context ands frees them after having called apply_change(). Therefore
+	 * we need to copy the tuple, including TOAST, into a memory context
+	 * available to decode_concurrent_changes().
+	 */
+	oldcontext = MemoryContextSwitchTo(ctx->context);
+	if (HeapTupleHasExternal(tuple))
+		tuple = toast_flatten_tuple(tuple, dstate->tupdesc);
+	else
+		/* Need a copy anyway. */
+		tuple = heap_copytuple(tuple);
+	MemoryContextSwitchTo(oldcontext);
+
+	change = &dstate->changes[dstate->nchanges++];
+	change->kind = kind;
+	change->tuple = tuple;
 }
