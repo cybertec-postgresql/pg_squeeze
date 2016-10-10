@@ -27,6 +27,7 @@ static void plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 						  Relation rel, ReorderBufferChange *change);
 static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
+static HeapTuple get_changed_tuple(ConcurrentChange *change);
 
 void
 process_concurrent_changes(LogicalDecodingContext *ctx,
@@ -68,6 +69,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 {
 	DecodingOutputState	*dstate;
 	ResourceOwner	resowner_old;
+	Size	maintenance_wm_bytes;
 
 	/*
 	 * Invalidate the "present" cache before moving to "(recent) history".
@@ -89,10 +91,12 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 
 	PG_TRY();
 	{
+		maintenance_wm_bytes = (Size) maintenance_work_mem * 1024L;
+
 		while (((*startptr != InvalidXLogRecPtr && *startptr < end_of_wal) ||
 				(ctx->reader->EndRecPtr != InvalidXLogRecPtr &&
 				 ctx->reader->EndRecPtr < end_of_wal)) &&
-			   (dstate->data_size < maintenance_work_mem))
+			   (dstate->data_size < maintenance_wm_bytes))
 		{
 			XLogRecord *record;
 			char	   *errm = NULL;
@@ -146,7 +150,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						 ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot	*slot;
-	int	i;
 	HeapTuple tup_old = NULL;
 	BulkInsertState bistate = NULL;
 
@@ -164,10 +167,24 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	for (i = 0; i < dstate->nchanges; i++)
+	while (tuplestore_gettupleslot(dstate->tstore, true, false,
+								   dstate->tsslot))
 	{
-		HeapTuple tup, tup_exist;
-		ConcurrentChange	*change = &dstate->changes[i];
+		HeapTuple tup_change, tup, tup_exist;
+		char	*change_raw;
+		ConcurrentChange	*change;
+		bool	isnull[1];
+		Datum	values[1];
+
+		/* Get the change from the single-column tuple. */
+		tup_change = ExecFetchSlotTuple(dstate->tsslot);
+		heap_deform_tuple(tup_change, dstate->tupdesc_change, values, isnull);
+		Assert(!isnull[0]);
+
+		/* This is bytea, but char* is easier to work with. */
+		change_raw = (char *) DatumGetByteaP(values[0]);
+
+		change = (ConcurrentChange *) (change_raw + MAXALIGN(VARHDRSZ));
 
 		/*
 		 * Do not keep buffer pinned for insert if the current change is
@@ -179,9 +196,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			bistate = NULL;
 		}
 
-		tup = change->tuple;
-		change->tuple = NULL;
-		ExecStoreTuple(tup, slot, InvalidBuffer, false);
+		tup = get_changed_tuple(change);
 
 		if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_OLD)
 		{
@@ -204,6 +219,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
 
 			/* Update indexes. */
+			ExecStoreTuple(tup, slot, InvalidBuffer, false);
 			recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
 											iistate->estate, false, NULL,
 											NIL);
@@ -275,6 +291,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 				{
 					List	*recheck;
 
+					ExecStoreTuple(tup, slot, InvalidBuffer, false);
 					recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
 													iistate->estate, false,
 													NULL, NIL);
@@ -302,6 +319,8 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			UpdateActiveSnapshotCommandId();
 		}
 	}
+
+	tuplestore_clear(dstate->tstore);
 	dstate->nchanges = 0;
 	dstate->data_size = 0;
 
@@ -507,50 +526,95 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 			 HeapTuple tuple)
 {
 	DecodingOutputState	*dstate;
+	char	*change_raw;
 	ConcurrentChange	*change;
 	MemoryContext	oldcontext;
+	bool	flattened = false;
+	Size	size;
+	Datum	values[1];
+	bool	isnull[1];
+	char	*dst;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
-	/* Make sure there's enough space for the new change. */
-	if (dstate->nchanges >= dstate->nchanges_max)
-	{
-		Size	size;
-		int	i;
-
-		Assert(dstate->nchanges == dstate->nchanges_max);
-
-		dstate->nchanges_max *= 2;
-		size = dstate->nchanges_max * sizeof(ConcurrentChange);
-		oldcontext = MemoryContextSwitchTo(ctx->context);
-		dstate->changes = (ConcurrentChange *) repalloc(dstate->changes, size);
-
-		/*
-		 * As the "tuple" field is used to indicate whether the array element is
-		 * used, all the new elements it must have it initially.
-		 */
-		for (i = dstate->nchanges; i < dstate->nchanges_max; i++)
-			dstate->changes[i].tuple = NULL;
-
-		MemoryContextSwitchTo(oldcontext);
-	}
-
 	/*
 	 * ReorderBufferCommit() stores the TOAST chunks in its private memory
-	 * context ands frees them after having called apply_change(). Therefore
-	 * we need to copy the tuple, including TOAST, into a memory context
-	 * available to decode_concurrent_changes().
+	 * context and frees them after having called apply_change(). Therefore we
+	 * need flat copy (including TOAST) that we eventually copy into the
+	 * memory context which is available to decode_concurrent_changes().
 	 */
-	oldcontext = MemoryContextSwitchTo(ctx->context);
 	if (HeapTupleHasExternal(tuple))
+	{
+		/*
+		 * toast_flatten_tuple_to_datum() might be more convenient but we
+		 * don't want the decompression it does.
+		 */
 		tuple = toast_flatten_tuple(tuple, dstate->tupdesc);
-	else
-		/* Need a copy anyway. */
-		tuple = heap_copytuple(tuple);
+		flattened = true;
+	}
+
+	/* TODO elog(ERROR) if the tuple does not fit varlena. */
+	size = MAXALIGN(VARHDRSZ) + sizeof(ConcurrentChange) + tuple->t_len;
+
+	oldcontext = MemoryContextSwitchTo(ctx->context);
+	change_raw = (char *) palloc(size);
 	MemoryContextSwitchTo(oldcontext);
 
-	change = &dstate->changes[dstate->nchanges++];
+	SET_VARSIZE(change_raw, size);
+	change = (ConcurrentChange *) (change_raw + MAXALIGN(VARHDRSZ));
+
+	/*
+	 * Copy the tuple.
+	 *
+	 * CAUTION: change->tup_data.t_data must be fixed on retrieval!
+	 */
+	memcpy(&change->tup_data, tuple, sizeof(HeapTupleData));
+	dst = (char *) change + sizeof(ConcurrentChange);
+	memcpy(dst, tuple->t_data, tuple->t_len);
+
+	/* The other field. */
 	change->kind = kind;
-	change->tuple = tuple;
-	dstate->data_size += HEAPTUPLESIZE + tuple->t_len;
+
+	/* The data has been copied. */
+	if (flattened)
+		pfree(tuple);
+
+	/* Store as tuple of 1 bytea column. */
+	values[0] = PointerGetDatum(change_raw);
+	isnull[0] = false;
+	tuplestore_putvalues(dstate->tstore, dstate->tupdesc_change,
+						 values, isnull);
+
+	/* Accounting. */
+	dstate->nchanges++;
+	dstate->data_size += size;
+
+	/* Cleanup. */
+	pfree(change_raw);
+}
+
+/*
+ * Retrieve tuple from a change structure. As for the change, no alignment is
+ * assumed.
+ */
+static HeapTuple
+get_changed_tuple(ConcurrentChange *change)
+{
+	HeapTupleData	tup_data;
+	HeapTuple	result;
+	char	*src;
+
+	/*
+	 * Ensure alignment before accessing the fields. (This is why we can't use
+	 * heap_copytuple() instead of this function.)
+	 */
+	memcpy(&tup_data, &change->tup_data, sizeof(HeapTupleData));
+
+	result = (HeapTuple) palloc(HEAPTUPLESIZE + tup_data.t_len);
+	memcpy(result, &tup_data, sizeof(HeapTupleData));
+	result->t_data = (HeapTupleHeader) ((char *) result + HEAPTUPLESIZE);
+	src = (char *) change + sizeof(ConcurrentChange);
+	memcpy(result->t_data, src, result->t_len);
+
+	return result;
 }

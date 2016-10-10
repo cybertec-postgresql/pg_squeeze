@@ -25,11 +25,17 @@ typedef enum
 
 typedef struct ConcurrentChange
 {
-	/* The actual data. */
-	HeapTuple	tuple;
-
 	/* See the enum above. */
 	ConcurrentChangeKind	kind;
+
+	/*
+	 * The actual tuple.
+	 *
+	 * The tuple data follows the ConcurrentChange structure. Before use make
+	 * sure the tuple is correctly aligned (ConcurrentChange can be stored as
+	 * bytea) and that tuple->t_data is fixed.
+	 */
+	HeapTupleData	tup_data;
 } ConcurrentChange;
 
 typedef struct DecodingOutputState
@@ -37,31 +43,38 @@ typedef struct DecodingOutputState
 	/* The relation whose changes we're decoding. */
 	Oid	relid;
 
-	/* Tuple descriptor used by output plugin to form tuples. */
-	TupleDesc	tupdesc;
-
 	/*
-	 * Change storage.
-	 *
-	 * TODO Store the flattened tuples in a tuplestore as Datums (the actual
-	 * tuple can't be inserted since tuplestore only seems to support "minimal
-	 * tuple", and so we'd be unable to transfer OID system column). The
-	 * problem of purely in-memory storage is the output plugin receives all
-	 * changes when commit record is decoded, so huge transactions cannot be
-	 * processed in multiple steps. Even then we should try not to process all
-	 * transactions at once, so that the tuplestore does not have to use disk
-	 * too often. While doing so, should use the "data_size" field of this
-	 * structure or some internal field of the tuplestore?
+	 * Decoded changes are stored here. Although we try to avoid excessive
+	 * batches, it can happen that the changes need to be stored to disk. The
+	 * tuplestore does this transparently.
 	 */
-	ConcurrentChange	*changes;
+	Tuplestorestate *tstore;
 
-	/* Number of changes currently stored. */
+	/* The current number of changes in tstore. */
 	int	nchanges;
 
-	/* The size of "changes" array. */
-	int	nchanges_max;
+	/*
+	 * Descriptor to store the ConcurrentChange structure serialized
+	 * (bytea). We can't store the tuple directly because tuplestore only
+	 * supports minimum tuple and we may need to transfer OID system column
+	 * from the output plugin. Also we need to transfer the change kind, so
+	 * it's better to put everything in the structure than to use 2
+	 * tuplestores "in parallel".
+	 */
+	TupleDesc	tupdesc_change;
 
-	/* Total amount of space used by "change tuples". */
+	/* Tuple descriptor needed to update indexes. */
+	TupleDesc	tupdesc;
+
+	/* Slot to retrieve data from tstore. */
+	TupleTableSlot	*tsslot;
+
+	/*
+	 * Total amount of space used by "change tuples". We use this field to
+	 * minimize the likelihood that tstore will have to be spilled to
+	 * disk. (Such a spilling should only be necessary for huge transactions,
+	 * because decoding of these cannot be split into multiple steps.)
+	 */
 	Size	data_size;
 
 	ResourceOwner	resowner;

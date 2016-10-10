@@ -794,24 +794,21 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	 */
 	dstate = palloc0(sizeof(DecodingOutputState));
 	dstate->relid = relid;
+	dstate->tstore = tuplestore_begin_heap(false, false,
+										   maintenance_work_mem);
 	dstate->tupdesc = tup_desc;
-	dstate->nchanges_max = 1024;
-	dstate->nchanges = 0;
-	dstate->data_size = 0;
 
+	/* Initialize the descriptor to store the changes ... */
+	dstate->tupdesc_change = CreateTemplateTupleDesc(1, false);
+	TupleDescInitEntry(dstate->tupdesc_change, 1, NULL, BYTEAOID, -1, 0);
+	/* ... as well as the corresponding slot. */
+	dstate->tsslot = MakeTupleTableSlot();
+	ExecSetSlotDescriptor(dstate->tsslot, dstate->tupdesc_change);
+
+	dstate->data_size = 0;
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
 											"logical decoding");
 
-	MemoryContextSwitchTo(oldcontext);
-
-	/*
-	 * Allocate the array in the same context that the output plugin will
-	 * use. (XXX Alternatively we could pass our current context to the plugin
-	 * via dstate, but there seems to be no advantage.)
-	 */
-	oldcontext = MemoryContextSwitchTo(ctx->context);
-	dstate->changes = (ConcurrentChange *)
-		palloc0(dstate->nchanges_max * sizeof(ConcurrentChange));
 	MemoryContextSwitchTo(oldcontext);
 
 	ctx->output_writer_private = dstate;
@@ -824,8 +821,11 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 	DecodingOutputState	*dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	ExecDropSingleTupleTableSlot(dstate->tsslot);
+	FreeTupleDesc(dstate->tupdesc_change);
 	FreeTupleDesc(dstate->tupdesc);
-	pfree(dstate->changes);
+	tuplestore_end(dstate->tstore);
 
 	FreeDecodingContext(ctx);
 }
