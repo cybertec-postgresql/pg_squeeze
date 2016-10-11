@@ -122,6 +122,8 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 	}
 	PG_END_TRY();
 
+	elog(DEBUG1, "Decoded %.0f changes.", dstate->nchanges);
+
 	/*
 	 * The check for InvalidXLogRecPtr covers the (probably impossible) case
 	 * that *startptr is initially equal to end_of_val.
@@ -151,6 +153,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	TupleTableSlot	*slot;
 	HeapTuple tup_old = NULL;
 	BulkInsertState bistate = NULL;
+	double	ninserts, nupdates, ndeletes;
 
 	if (dstate->nchanges == 0)
 		return;
@@ -166,6 +169,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
+	ninserts = 0;
+	nupdates = 0;
+	ndeletes = 0;
 	while (tuplestore_gettupleslot(dstate->tstore, true, false,
 								   dstate->tsslot))
 	{
@@ -229,8 +235,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			 * here are already committed.)
 			 */
 			list_free(recheck);
-
 			pfree(tup);
+
+			ninserts++;
 		}
 		else if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
 				 change->kind == PG_SQUEEZE_CHANGE_DELETE)
@@ -296,9 +303,14 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 													NULL, NIL);
 					list_free(recheck);
 				}
+
+				nupdates++;
 			}
 			else
+			{
 				simple_heap_delete(relation, &ctid);
+				ndeletes++;
+			}
 
 			if (tup_old != NULL)
 			{
@@ -318,6 +330,10 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			UpdateActiveSnapshotCommandId();
 		}
 	}
+
+	elog(DEBUG1,
+		 "Concurrent changes applied: %.0f inserts, %.0f updates, %.0f deletes.",
+		 ninserts, nupdates, ndeletes);
 
 	tuplestore_clear(dstate->tstore);
 	dstate->nchanges = 0;

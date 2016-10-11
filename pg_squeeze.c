@@ -1878,6 +1878,8 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 
 	Assert(OidIsValid(result));
 
+	elog(DEBUG1, "Transient relation created: %u", result);
+
 	/* Make sure the transient relation is visible.  */
 	CommandCounterIncrement();
 

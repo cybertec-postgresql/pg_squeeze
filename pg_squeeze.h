@@ -51,7 +51,7 @@ typedef struct DecodingOutputState
 	Tuplestorestate *tstore;
 
 	/* The current number of changes in tstore. */
-	int	nchanges;
+	double	nchanges;
 
 	/*
 	 * Descriptor to store the ConcurrentChange structure serialized
