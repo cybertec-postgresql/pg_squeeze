@@ -173,5 +173,6 @@ extern void process_concurrent_changes(LogicalDecodingContext *ctx,
 									   CatalogState	*cat_state,
 									   Relation rel_dst, ScanKey ident_key,
 									   int ident_key_nentries,
-									   IndexInsertState *iistate);
+									   IndexInsertState *iistate,
+									   LOCKMODE lock_held);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);

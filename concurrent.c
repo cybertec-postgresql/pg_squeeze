@@ -29,12 +29,20 @@ static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
 static HeapTuple get_changed_tuple(ConcurrentChange *change);
 
+/*
+ * Decode and apply concurrent changes. If there are too many of them, split
+ * the processing into multiple iterations so that the intermediate storage
+ * (tuplestore) is not likely to be written to disk.
+ *
+ * See check_catalog_changes() for explanation of lock_held argument.
+ */
 void
 process_concurrent_changes(LogicalDecodingContext *ctx,
 						   XLogRecPtr *startptr, XLogRecPtr end_of_wal,
 						   CatalogState	*cat_state,
 						   Relation rel_dst, ScanKey ident_key,
-						   int ident_key_nentries, IndexInsertState *iistate)
+						   int ident_key_nentries, IndexInsertState *iistate,
+						   LOCKMODE lock_held)
 {
 	DecodingOutputState	*dstate;
 	bool	done;
@@ -49,7 +57,7 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 			continue;
 
 		/* Make sure the changes are still applicable. */
-		check_catalog_changes(cat_state, NoLock);
+		check_catalog_changes(cat_state, lock_held);
 
 		apply_concurrent_changes(dstate, rel_dst, ident_key,
 								 ident_key_nentries, iistate);

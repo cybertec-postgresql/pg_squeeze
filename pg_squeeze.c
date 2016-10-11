@@ -507,7 +507,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * exclusive lock on the source relation.
 	 */
 	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
-							   ident_key, ident_key_nentries, iistate);
+							   ident_key, ident_key_nentries, iistate,
+							   NoLock);
 
 	/*
 	 * This (supposedly cheap) special check should avoid one particular
@@ -567,6 +568,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Check the source relation for DDLs once again. If this check passes, no
 	 * DDL can break the process anymore. NoLock must be passed because the
 	 * relation was really unlocked for some period since the last check.
+	 *
+	 * It makes sense to do this immediately after having acquired the
+	 * exclusive lock(s), so we don't waste any effort if the source table is
+	 * no longer compatible.
 	 */
 	check_catalog_changes(cat_state, NoLock);
 
@@ -583,9 +588,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/*
 	 * Process the changes that might have taken place while we were waiting
 	 * for the lock.
+	 *
+	 * AccessExclusiveLock effectively disables catalog checks - we've already
+	 * performed them above.
 	 */
 	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
-							   ident_key, ident_key_nentries, iistate);
+							   ident_key, ident_key_nentries, iistate,
+							   AccessExclusiveLock);
 
 	/*
 	 * Done with decoding.
