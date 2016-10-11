@@ -11,10 +11,12 @@
 
 static bool decode_concurrent_changes(LogicalDecodingContext *ctx,
 									  XLogRecPtr *startptr,
-									  XLogRecPtr end_of_wal);
+									  XLogRecPtr end_of_wal,
+									  struct timeval *must_complete);
 static void apply_concurrent_changes(DecodingOutputState *dstate,
 									 Relation relation, ScanKey key,
 									 int nkeys, IndexInsertState *iistate);
+static bool processing_time_elapsed(struct timeval *tv);
 
 static void plugin_startup(LogicalDecodingContext *ctx,
 						   OutputPluginOptions *opt, bool is_init);
@@ -35,14 +37,17 @@ static HeapTuple get_changed_tuple(ConcurrentChange *change);
  * (tuplestore) is not likely to be written to disk.
  *
  * See check_catalog_changes() for explanation of lock_held argument.
+ *
+ * Returns true if must_complete is NULL or if managed to complete by the time
+ * *must_complete indicates.
  */
-void
+bool
 process_concurrent_changes(LogicalDecodingContext *ctx,
 						   XLogRecPtr *startptr, XLogRecPtr end_of_wal,
 						   CatalogState	*cat_state,
 						   Relation rel_dst, ScanKey ident_key,
 						   int ident_key_nentries, IndexInsertState *iistate,
-						   LOCKMODE lock_held)
+						   LOCKMODE lock_held, struct timeval *must_complete)
 {
 	DecodingOutputState	*dstate;
 	bool	done;
@@ -51,7 +56,12 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 	done = false;
 	while(!done)
 	{
-		done = decode_concurrent_changes(ctx, startptr, end_of_wal);
+		done = decode_concurrent_changes(ctx, startptr, end_of_wal,
+										 must_complete);
+
+		if (processing_time_elapsed(must_complete))
+			/* Caller is responsible for applying the changes. */
+			return false;
 
 		if (dstate->nchanges == 0)
 			continue;
@@ -59,9 +69,16 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 		/* Make sure the changes are still applicable. */
 		check_catalog_changes(cat_state, lock_held);
 
+		/*
+		 * XXX Consider if it's possible to check *must_complete and stop
+		 * processing partway through. Partial cleanup of the tuplestore seems
+		 * non-trivial.
+		 */
 		apply_concurrent_changes(dstate, rel_dst, ident_key,
 								 ident_key_nentries, iistate);
 	}
+
+	return true;
 }
 
 /*
@@ -73,7 +90,8 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
  */
 static bool
 decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
-						  XLogRecPtr end_of_wal)
+						  XLogRecPtr end_of_wal,
+						  struct timeval *must_complete)
 {
 	DecodingOutputState	*dstate;
 	ResourceOwner	resowner_old;
@@ -103,7 +121,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 		while (((*startptr != InvalidXLogRecPtr && *startptr < end_of_wal) ||
 				(ctx->reader->EndRecPtr != InvalidXLogRecPtr &&
 				 ctx->reader->EndRecPtr < end_of_wal)) &&
-			   (dstate->data_size < maintenance_wm_bytes))
+			   dstate->data_size < maintenance_wm_bytes)
 		{
 			XLogRecord *record;
 			char	   *errm = NULL;
@@ -116,6 +134,9 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 
 			if (record != NULL)
 				LogicalDecodingProcessRecord(ctx, ctx->reader);
+
+			if (processing_time_elapsed(must_complete))
+				break;
 
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -353,6 +374,20 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 	ExecDropSingleTupleTableSlot(slot);
+}
+
+static bool
+processing_time_elapsed(struct timeval *tv)
+{
+	struct timeval	now;
+
+	if (tv == NULL)
+		return false;
+
+	gettimeofday(&now, NULL);
+
+	return now.tv_sec + USECS_PER_SEC * now.tv_usec >
+		tv->tv_sec + USECS_PER_SEC * tv->tv_usec;
 }
 
 IndexInsertState *

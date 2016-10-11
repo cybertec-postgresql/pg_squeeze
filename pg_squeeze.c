@@ -88,6 +88,14 @@ static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									CatalogState *cat_state);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
+static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
+								Relation rel_dst, ScanKey ident_key,
+								int ident_key_nentries,
+								IndexInsertState *iistate,
+								CatalogState *cat_state,
+								LogicalDecodingContext *ctx,
+								XLogRecPtr	*startptr,
+								struct timeval *must_complete);
 static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
@@ -95,6 +103,15 @@ static Oid get_toast_index(Oid toastrelid);
 static void update_reloptions(Oid relid, bool user_cat, bool autovac);
 
 int squeeze_worker_naptime;
+
+/*
+ * The maximum time to hold AccessExclusiveLock during the final
+ * processing. Note that it only process_concurrent_changes() execution time
+ * is included here. The very last steps like swap_relation_files() and
+ * swap_toast_names() shouldn't get blocked and it'd be wrong to consider them
+ * a reason to abort otherwise completed processing.
+ */
+int squeeze_max_xlock_time = 0;
 
 void
 _PG_init(void)
@@ -114,6 +131,18 @@ _PG_init(void)
 		60, 1, INT_MAX,
 		PGC_SIGHUP,
 		GUC_UNIT_S,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"squeeze.max_xlock_time",
+		"The maximum time the processed table may be locked exclusively.",
+		"The source table is locked exclusively during the final stage of "
+		"processing. If the lock time should exceed this value, the lock is "
+		"released and the final stage is retried a few more times.",
+		&squeeze_max_xlock_time,
+		0, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_MS,
 		NULL, NULL, NULL);
 }
 
@@ -157,6 +186,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	TablespaceInfo	*tbsp_info;
 	ObjectAddress	object;
 	bool	autovac;
+	struct timeval t_end;
+	struct timeval *must_complete = NULL;
+	bool	source_finalized;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -508,7 +540,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 */
 	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
 							   ident_key, ident_key_nentries, iistate,
-							   NoLock);
+							   NoLock, NULL);
 
 	/*
 	 * This (supposedly cheap) special check should avoid one particular
@@ -529,72 +561,41 @@ squeeze_table(PG_FUNCTION_ARGS)
 	else
 		pfree(ind_info);
 
-	/*
-	 * Lock the source table exclusively last time, to finalize the work.
-	 *
-	 * On pg_repack: before taking the exclusive lock, pg_repack extension is
-	 * more restrictive in waiting for other transactions to complete. That
-	 * might reduce the likelihood of MVCC-unsafe behavior that PG core admits
-	 * in some cases
-	 * (https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html) but
-	 * can't completely avoid it anyway. On the other hand, pg_squeeze only
-	 * waits for completion of transactions which performed write (i.e. do
-	 * have XID assigned) - this is a side effect of bringing our replication
-	 * slot into consistent state.
-	 *
-	 * As pg_repack shows, extra effort makes little sense here, because some
-	 * other transactions still can start before the exclusive lock on the
-	 * source relation is acquired. In particular, if transaction A starts in
-	 * this period and commits a change, transaction B can miss it if the next
-	 * steps are as follows: 1. transaction B took a snapshot (e.g. it has
-	 * REPEATABLE READ isolation level), 2. pg_repack took the exclusive
-	 * relation lock and finished its work, 3. transaction B acquired shared
-	 * lock and performed its scan. (And of course, waiting for transactions
-	 * A, B, ... to complete while holding the exclusive lock can cause
-	 * deadlocks.)
-	 */
-	LockRelationOid(relid_src, AccessExclusiveLock);
+	if (squeeze_max_xlock_time > 0)
+	{
+		int64 msec;
+		struct timeval t_start;
+
+		gettimeofday(&t_start, NULL);
+		msec = 1000 * t_start.tv_sec + t_start.tv_usec / 1000;
+		msec += squeeze_max_xlock_time;
+		t_end.tv_sec = msec / 1000;
+		t_end.tv_usec = (msec % 1000) * 1000;
+		must_complete = &t_end;
+	}
 
 	/*
-	 * Lock the indexes too, as ALTER INDEX does not need table lock.
+	 * Try a few times to perform the stage that requires exclusive lock on
+	 * the source relation.
 	 *
-	 * The locking will succeed even if the index is no longer there. In that
-	 * case, ERROR will be raised during the catalog check below.
+	 * XXX Not sure the number of attempts should be configurable. If it fails
+	 * several times, admin should either increase squeeze_max_xlock_time or
+	 * disable it.
 	 */
-	for (i = 0; i < nindexes; i++)
-		LockRelationOid(indexes_src[i], AccessExclusiveLock);
-
-	/*
-	 * Check the source relation for DDLs once again. If this check passes, no
-	 * DDL can break the process anymore. NoLock must be passed because the
-	 * relation was really unlocked for some period since the last check.
-	 *
-	 * It makes sense to do this immediately after having acquired the
-	 * exclusive lock(s), so we don't waste any effort if the source table is
-	 * no longer compatible.
-	 */
-	check_catalog_changes(cat_state, NoLock);
-
-	/*
-	 * Flush anything we see in WAL, to make sure that all changes committed
-	 * while we were creating indexes and waiting for the exclusive lock are
-	 * available for decoding. (This should be unnecessary if all backends had
-	 * synchronous_commit set, but we can't rely on this setting.)
-	 */
-	xlog_insert_ptr = GetInsertRecPtr();
-	XLogFlush(xlog_insert_ptr);
-	end_of_wal = GetFlushRecPtr();
-
-	/*
-	 * Process the changes that might have taken place while we were waiting
-	 * for the lock.
-	 *
-	 * AccessExclusiveLock effectively disables catalog checks - we've already
-	 * performed them above.
-	 */
-	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
-							   ident_key, ident_key_nentries, iistate,
-							   AccessExclusiveLock);
+	source_finalized = false;
+	for (i = 0; i < 4; i++)
+	{
+		if (perform_final_merge(relid_src, indexes_src, nindexes,
+								rel_dst, ident_key, ident_key_nentries,
+								iistate, cat_state, ctx, &startptr,
+								must_complete))
+			source_finalized = true;
+			break;
+	}
+	if (!source_finalized)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("\"squeeze_max_xlock_time\" prevented squeeze from completion")));
 
 	/*
 	 * Done with decoding.
@@ -2197,6 +2198,114 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 	return result;
 }
 
+/*
+ * Try to perform the final processing of concurrent data changes of the
+ * source table, which requires an exclusive lock. The return value tells
+ * whether this step succeeded. (If not, caller might want to retry.)
+ */
+static bool
+perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
+					Relation rel_dst, ScanKey ident_key,
+					int ident_key_nentries, IndexInsertState *iistate,
+					CatalogState *cat_state,
+					LogicalDecodingContext *ctx, XLogRecPtr	*startptr,
+					struct timeval *must_complete)
+{
+	bool	success;
+	XLogRecPtr	xlog_insert_ptr, end_of_wal;
+	int	i;
+
+	/*
+	 * Lock the source table exclusively last time, to finalize the work.
+	 *
+	 * On pg_repack: before taking the exclusive lock, pg_repack extension is
+	 * more restrictive in waiting for other transactions to complete. That
+	 * might reduce the likelihood of MVCC-unsafe behavior that PG core admits
+	 * in some cases
+	 * (https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html) but
+	 * can't completely avoid it anyway. On the other hand, pg_squeeze only
+	 * waits for completion of transactions which performed write (i.e. do
+	 * have XID assigned) - this is a side effect of bringing our replication
+	 * slot into consistent state.
+	 *
+	 * As pg_repack shows, extra effort makes little sense here, because some
+	 * other transactions still can start before the exclusive lock on the
+	 * source relation is acquired. In particular, if transaction A starts in
+	 * this period and commits a change, transaction B can miss it if the next
+	 * steps are as follows: 1. transaction B took a snapshot (e.g. it has
+	 * REPEATABLE READ isolation level), 2. pg_repack took the exclusive
+	 * relation lock and finished its work, 3. transaction B acquired shared
+	 * lock and performed its scan. (And of course, waiting for transactions
+	 * A, B, ... to complete while holding the exclusive lock can cause
+	 * deadlocks.)
+	 */
+	LockRelationOid(relid_src, AccessExclusiveLock);
+
+	/*
+	 * Lock the indexes too, as ALTER INDEX does not need table lock.
+	 *
+	 * The locking will succeed even if the index is no longer there. In that
+	 * case, ERROR will be raised during the catalog check below.
+	 */
+	for (i = 0; i < nindexes; i++)
+		LockRelationOid(indexes_src[i], AccessExclusiveLock);
+
+	/*
+	 * Check the source relation for DDLs once again. If this check passes, no
+	 * DDL can break the process anymore. NoLock must be passed because the
+	 * relation was really unlocked for some period since the last check.
+	 *
+	 * It makes sense to do this immediately after having acquired the
+	 * exclusive lock(s), so we don't waste any effort if the source table is
+	 * no longer compatible.
+	 */
+	check_catalog_changes(cat_state, NoLock);
+
+	/*
+	 * Flush anything we see in WAL, to make sure that all changes committed
+	 * while we were creating indexes and waiting for the exclusive lock are
+	 * available for decoding. (This should be unnecessary if all backends had
+	 * synchronous_commit set, but we can't rely on this setting.)
+	 */
+	xlog_insert_ptr = GetInsertRecPtr();
+	XLogFlush(xlog_insert_ptr);
+	end_of_wal = GetFlushRecPtr();
+
+	/*
+	 * Process the changes that might have taken place while we were waiting
+	 * for the lock.
+	 *
+	 * AccessExclusiveLock effectively disables catalog checks - we've already
+	 * performed them above.
+	 */
+	success = process_concurrent_changes(ctx, startptr, end_of_wal,
+										 cat_state, rel_dst, ident_key,
+										 ident_key_nentries, iistate,
+										 AccessExclusiveLock, must_complete);
+	if (!success)
+	{
+		/* Unlock the relations and indexes. */
+		for (i = 0; i < nindexes; i++)
+			UnlockRelationOid(indexes_src[i], AccessExclusiveLock);
+
+		UnlockRelationOid(relid_src, AccessExclusiveLock);
+
+		/*
+		 * Take time to reach end_of_wal.
+		 *
+		 * XXX DecodingOutputState may contain some changes. The corner case
+		 * that the data_size has already reached maintenance_work_mem so the
+		 * first change we decode now will make it spill to disk is too low to
+		 * justify calling apply_concurrent_changes() separately.
+		 */
+		process_concurrent_changes(ctx, startptr, end_of_wal,
+								   cat_state, rel_dst, ident_key,
+								   ident_key_nentries, iistate,
+								   AccessExclusiveLock, NULL);
+	}
+
+	return success;
+}
 
 /*
  * Derived from swap_relation_files() in PG core, but removed anything we

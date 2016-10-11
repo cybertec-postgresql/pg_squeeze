@@ -167,12 +167,13 @@ extern void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
 extern IndexInsertState *get_index_insert_state(Relation relation,
 												Oid ident_index_id);
 extern void free_index_insert_state(IndexInsertState *iistate);
-extern void process_concurrent_changes(LogicalDecodingContext *ctx,
+extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 									   XLogRecPtr *startptr,
 									   XLogRecPtr end_of_wal,
 									   CatalogState	*cat_state,
 									   Relation rel_dst, ScanKey ident_key,
 									   int ident_key_nentries,
 									   IndexInsertState *iistate,
-									   LOCKMODE lock_held);
+									   LOCKMODE lock_held,
+									   struct timeval *must_complete);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
