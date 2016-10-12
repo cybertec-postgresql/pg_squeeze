@@ -576,6 +576,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 			source_finalized = true;
 			break;
 		}
+		else
+			elog(DEBUG1,
+				 "Exclusive lock on table %u had to be released.", relid_src);
 	}
 	if (!source_finalized)
 		ereport(ERROR,
