@@ -10,6 +10,7 @@
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "nodes/execnodes.h"
+#include "postmaster/bgworker.h"
 #include "replication/logical.h"
 #include "utils/inval.h"
 #include "utils/resowner.h"
@@ -177,3 +178,8 @@ extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 									   LOCKMODE lock_held,
 									   struct timeval *must_complete);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
+
+extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
+										bgworker_main_type bgw_main, Oid db,
+										Oid user, Oid notify_pid);
+extern void squeeze_worker_main(Datum main_arg);

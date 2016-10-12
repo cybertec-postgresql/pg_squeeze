@@ -132,7 +132,7 @@ change anything else, make sure you perfectly understand what you are doing.
 Enable / disable table processing
 ---------------------------------
 
-To enable automated processing, run this statement:
+To enable automated processing, run this statement as superuser:
 
 	SELECT squeeze.start_worker();
 
@@ -153,6 +153,31 @@ understand what you're doing.
 When there's no work to do, the worker sleeps before checking again. The delay
 is controlled by GUC parameter "squeeze.worker_naptime". It's measured in
 seconds and the default value is 1 minute.
+
+If you want the background worker to start automatically during startup of the
+whole PostgreSQL cluster, add entries like this to postgresql.conf file
+
+	squeeze.worker_autostart = '16965 23238'
+	squeeze.worker_role = 50678
+
+Here, 16965 and 23238 stand for database OIDs that you can retrieve from
+pg_catalog.pg_database catalog. For example:
+
+	SELECT oid FROM pg_catalog.pg_database WHERE datname='mydb';
+
+Similarly, 50678 is role id that you get from pg_catalog.pg_authid catalog:
+
+	SELECT oid FROM pg_catalog.pg_authid WHERE rolname='postgres';
+
+Next time the cluster is started, one worker will be launched for
+"my_database" and one for "your_database". If you take this approach, note
+that any worker started this way will either reject to start or will stop
+without doing any work if
+
+     1. The "pg_squeeze" extension does not exist in the database it runs on.
+
+     2. squeeze.worker_role parameter is not set or it specifies role which
+     does not have the superuser privileges.
 
 
 Control the impact on other backends

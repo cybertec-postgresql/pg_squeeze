@@ -112,6 +112,20 @@ int squeeze_worker_naptime;
  */
 int squeeze_max_xlock_time = 0;
 
+/*
+ * List of database OIDs for which the background worker should start started
+ * during cluster startup. (We require OIDs because there seems to be now good
+ * way to pass list of database name w/o adding restrictions on character set
+ * characters.)
+ */
+char *squeeze_worker_autostart = NULL;
+
+/*
+ * OID of the role on behalf of which automatically-started worker connects to
+ * database(s).
+ */
+int squeeze_worker_role = 0;
+
 void
 _PG_init(void)
 {
@@ -120,6 +134,33 @@ _PG_init(void)
 	 * it as a custom option.
 	 */
 	add_bool_reloption(RELOPT_KIND_TOAST, "user_catalog_table", "", false);
+
+	DefineCustomStringVariable(
+		"squeeze.worker_autostart",
+		"OIDs of databases for which squeeze worker starts automatically.",
+		"Comma-separated list for which squeeze worker starts as soon as "
+		"the cluster startup has completed.",
+		&squeeze_worker_autostart,
+		false,
+		PGC_POSTMASTER,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"squeeze.worker_role",
+		"OID of role that background worker uses to connect to database.",
+		"If background worker was launched automatically on cluster startup, "
+		"it uses this role to initiate database connection(s).",
+		&squeeze_worker_role,
+		/*
+		 * 1 would be more convenient as the minimum, but we need to preserve
+		 * the value 0 as boot value - that indicates that the parameter is
+		 * not set at all. (User has no reason to set 0 explicitly.)
+		 */
+		0, 0, INT_MAX,
+		PGC_POSTMASTER,
+		0,
+		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"squeeze.worker_naptime",
@@ -131,6 +172,38 @@ _PG_init(void)
 		PGC_SIGHUP,
 		GUC_UNIT_S,
 		NULL, NULL, NULL);
+
+	if (squeeze_worker_autostart)
+	{
+		BackgroundWorker worker;
+		Oid	role;
+		Datum	d;
+		oidvector	*oidvec;
+		int	i;
+
+		if (squeeze_worker_role == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_ZERO_LENGTH_CHARACTER_STRING),
+					 (errmsg("\"squeeze.worker_role\" is invalid or not set"))));
+
+		role = (Oid) squeeze_worker_role;
+		d = DirectFunctionCall1(oidvectorin,
+								CStringGetDatum(squeeze_worker_autostart));
+
+		/*
+		 * oidvector is stored as varlena, use DatumGetByteaP() for
+		 * convenience.
+		 */
+		oidvec = (oidvector *) DatumGetByteaP(d);
+
+		/* Register the workers one after another. */
+		for (i = 0; i < oidvec->dim1; i++)
+		{
+			squeeze_initialize_bgworker(&worker, squeeze_worker_main,
+										oidvec->values[i], role, 0);
+			RegisterBackgroundWorker(&worker);
+		}
+	}
 
 	DefineCustomIntVariable(
 		"squeeze.max_xlock_time",

@@ -399,7 +399,7 @@ LANGUAGE C;
 
 CREATE FUNCTION start_worker()
 RETURNS int
-AS 'MODULE_PATHNAME', 'start_worker'
+AS 'MODULE_PATHNAME', 'squeeze_start_worker'
 LANGUAGE C;
 
 -- Stop "squeeze worker" if it's currently running.

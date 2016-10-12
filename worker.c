@@ -8,7 +8,6 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
-#include "postmaster/bgworker.h"
 #include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -20,21 +19,17 @@
 
 extern Datum start_worker(PG_FUNCTION_ARGS);
 
-extern void squeeze_worker_main(Datum main_arg);
-
 static void squeeze_worker_sighup(SIGNAL_ARGS);
 static void squeeze_worker_sigterm(SIGNAL_ARGS);
 
 static void run_command(char *command);
 static int64 get_task_count(void);
 
-PG_FUNCTION_INFO_V1(start_worker);
+PG_FUNCTION_INFO_V1(squeeze_start_worker);
 Datum
-start_worker(PG_FUNCTION_ARGS)
+squeeze_start_worker(PG_FUNCTION_ARGS)
 {
 	BackgroundWorker worker;
-	Oid	user_id;
-	char	*c;
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
 	pid_t		pid;
@@ -48,24 +43,8 @@ start_worker(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to start squeeze worker"))));
 
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-		BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	worker.bgw_main = NULL;
-	sprintf(worker.bgw_library_name, "pg_squeeze");
-	sprintf(worker.bgw_function_name, "squeeze_worker_main");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "squeeze worker");
-	worker.bgw_main_arg = (Datum) 0;
-
-	/* Store connection info. */
-	c = (char *) &worker.bgw_extra;
-	memcpy(c, &MyDatabaseId, sizeof(Oid));
-	c += sizeof(Oid);
-	user_id = GetUserId();
-	memcpy(c, &user_id, sizeof(Oid));
-
-	worker.bgw_notify_pid = MyProcPid;
+	squeeze_initialize_bgworker(&worker, NULL, MyDatabaseId, GetUserId(),
+								MyProcPid);
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		PG_RETURN_NULL();
@@ -85,6 +64,32 @@ start_worker(PG_FUNCTION_ARGS)
 	Assert(status == BGWH_STARTED);
 
 	PG_RETURN_INT32(pid);
+}
+
+void
+squeeze_initialize_bgworker(BackgroundWorker *worker,
+							bgworker_main_type bgw_main, Oid db, Oid user,
+							Oid notify_pid)
+{
+	char	*c;
+
+	worker->bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker->bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker->bgw_restart_time = BGW_NEVER_RESTART;
+	worker->bgw_main = bgw_main;
+	sprintf(worker->bgw_library_name, "pg_squeeze");
+	sprintf(worker->bgw_function_name, "squeeze_worker_main");
+	snprintf(worker->bgw_name, BGW_MAXLEN, "squeeze worker %u", db);
+	worker->bgw_main_arg = (Datum) 0;
+
+	/* Store connection info. */
+	c = (char *) &worker->bgw_extra;
+	memcpy(c, &db, sizeof(Oid));
+	c += sizeof(Oid);
+	memcpy(c, &user, sizeof(Oid));
+
+	worker->bgw_notify_pid = notify_pid;
 }
 
 static volatile sig_atomic_t got_sighup = false;
@@ -111,12 +116,7 @@ squeeze_worker_main(Datum main_arg)
 	c += sizeof(Oid);
 	memcpy(&user_id, c, sizeof(Oid));
 
-	elog(DEBUG1, "squeeze worker tries to connect to the database as %u user",
-		user_id);
-
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id);
-	elog(DEBUG1, "squeeze worker connected to the database as %u user",
-		 user_id);
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
