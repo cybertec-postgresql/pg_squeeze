@@ -118,6 +118,17 @@ CREATE TABLE tasks (
 -- Make sure there is at most one active task anytime.
 CREATE UNIQUE INDEX ON tasks(active) WHERE active;
 
+-- Each successfully completed processing of a table is recorded here.
+CREATE TABLE log (
+	tabschema	name	NOT NULL,
+	tabname		name	NOT NULL,
+	started		timestamptz	NOT NULL,
+	finished	timestamptz	NOT NULL
+);
+
+-- XXX Some other indexes might be useful. Analyze the typical use later.
+CREATE INDEX ON log(started);
+
 CREATE TABLE errors (
 	id		bigserial	NOT NULL	PRIMARY KEY,
 	occurred	timestamptz	NOT NULL	DEFAULT now(),
@@ -277,6 +288,7 @@ DECLARE
 	v_last_try	bool;
 	v_skip_analyze	bool;
 	v_stmt		text;
+	v_start		timestamptz;
 
 	-- Error info to be logged.
 	v_sql_state	text;
@@ -298,8 +310,13 @@ t.tried >= tb.max_retry, tb.skip_analyze, t.autovac, t.autovac_toast
 
 	-- Do the actual work.
 	BEGIN
+		v_start := clock_timestamp();
+
 		PERFORM squeeze.squeeze_table(v_tabschema, v_tabname,
  v_cl_index, v_rel_tbsp, v_ind_tbsps, v_autovac, v_autovac_toast);
+
+		INSERT INTO squeeze.log(tabschema, tabname, started, finished)
+		VALUES (v_tabschema, v_tabname, v_start, clock_timestamp());
 
 		PERFORM squeeze.cleanup_task(v_task_id);
 
