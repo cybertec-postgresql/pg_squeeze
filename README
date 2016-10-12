@@ -47,7 +47,11 @@ Installation
 Register table for regular processing
 -------------------------------------
 
-To make the "pg_squeeze" extension aware of a table, you need to insert a
+First, make sure that your table has either primary key or unique
+constraint. This is necessary to process changes other transactions might do
+while "pg_squeeze" is doing its work.
+
+To make the "pg_squeeze" extension aware of the table, you need to insert a
 record into "squeeze.tables" table. Once added, statistics of the table are
 checked periodically. Whenever the table meets criteria to be "squeezed", a
 "task" is added to a queue. The tasks are processed sequentially, in the order
