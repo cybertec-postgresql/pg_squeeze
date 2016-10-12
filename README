@@ -44,8 +44,8 @@ Installation
    CREATE EXTENSION pg_squeeze;
 
 
-Configuration
--------------
+Register table for regular processing
+-------------------------------------
 
 To make the "pg_squeeze" extension aware of a table, you need to insert a
 record into "squeeze.tables" table. Once added, statistics of the table are
@@ -125,8 +125,8 @@ CAUTION! "squeeze.table" is the only table user should modify. If you want to
 change anything else, make sure you perfectly understand what you are doing.
 
 
-Operation
----------
+Enable / disable table processing
+---------------------------------
 
 To enable automated processing, run this statement:
 
@@ -149,6 +149,26 @@ understand what you're doing.
 When there's no work to do, the worker sleeps before checking again. The delay
 is controlled by GUC parameter "squeeze.worker_naptime". It's measured in
 seconds and the default value is 1 minute.
+
+
+Control the impact on other backends
+------------------------------------
+
+Although the table being squeezed is available for both read and write
+operations by other transactions most of the time, exclusive lock is needed to
+finalize the processing. If pg_squeeze occasionally seems to block access to
+tables too much, consider setting "squeeze.max_xlock_time" GUC parameter. For
+example
+
+	SET squeeze.max_xlock_time TO 100;
+
+tells that the exclusive lock shouldn't be held for more than 0.1 second (100
+milliseconds). If more time is needed for the final stage, pg_squeeze releases
+the exclusive lock, processes changes committed by other transactions in
+between and tries the final stage again. Error is reported if the lock
+duration is exceeded a few more times. If that happens, you should either
+increase the setting or schedule processing of the problematic table to a
+different daytime, when the write activity is lower.
 
 
 Monitoring
