@@ -16,7 +16,7 @@ static bool decode_concurrent_changes(LogicalDecodingContext *ctx,
 static void apply_concurrent_changes(DecodingOutputState *dstate,
 									 Relation relation, ScanKey key,
 									 int nkeys, IndexInsertState *iistate);
-static bool processing_time_elapsed(struct timeval *tv);
+static bool processing_time_elapsed(struct timeval *utmost);
 
 static void plugin_startup(LogicalDecodingContext *ctx,
 						   OutputPluginOptions *opt, bool is_init);
@@ -377,17 +377,22 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 }
 
 static bool
-processing_time_elapsed(struct timeval *tv)
+processing_time_elapsed(struct timeval *utmost)
 {
 	struct timeval	now;
 
-	if (tv == NULL)
+	if (utmost == NULL)
 		return false;
 
 	gettimeofday(&now, NULL);
 
-	return now.tv_sec + USECS_PER_SEC * now.tv_usec >
-		tv->tv_sec + USECS_PER_SEC * tv->tv_usec;
+	if (now.tv_sec < utmost->tv_sec)
+		return false;
+
+	if (now.tv_sec > utmost->tv_sec)
+		return true;
+
+	return now.tv_usec >= utmost->tv_usec;
 }
 
 IndexInsertState *

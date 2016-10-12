@@ -94,8 +94,7 @@ static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 								IndexInsertState *iistate,
 								CatalogState *cat_state,
 								LogicalDecodingContext *ctx,
-								XLogRecPtr	*startptr,
-								struct timeval *must_complete);
+								XLogRecPtr	*startptr);
 static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
@@ -186,8 +185,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	TablespaceInfo	*tbsp_info;
 	ObjectAddress	object;
 	bool	autovac;
-	struct timeval t_end;
-	struct timeval *must_complete = NULL;
 	bool	source_finalized;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
@@ -561,19 +558,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	else
 		pfree(ind_info);
 
-	if (squeeze_max_xlock_time > 0)
-	{
-		int64 msec;
-		struct timeval t_start;
-
-		gettimeofday(&t_start, NULL);
-		msec = 1000 * t_start.tv_sec + t_start.tv_usec / 1000;
-		msec += squeeze_max_xlock_time;
-		t_end.tv_sec = msec / 1000;
-		t_end.tv_usec = (msec % 1000) * 1000;
-		must_complete = &t_end;
-	}
-
 	/*
 	 * Try a few times to perform the stage that requires exclusive lock on
 	 * the source relation.
@@ -587,10 +571,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 	{
 		if (perform_final_merge(relid_src, indexes_src, nindexes,
 								rel_dst, ident_key, ident_key_nentries,
-								iistate, cat_state, ctx, &startptr,
-								must_complete))
+								iistate, cat_state, ctx, &startptr))
+		{
 			source_finalized = true;
 			break;
+		}
 	}
 	if (!source_finalized)
 		ereport(ERROR,
@@ -2208,12 +2193,13 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 					Relation rel_dst, ScanKey ident_key,
 					int ident_key_nentries, IndexInsertState *iistate,
 					CatalogState *cat_state,
-					LogicalDecodingContext *ctx, XLogRecPtr	*startptr,
-					struct timeval *must_complete)
+					LogicalDecodingContext *ctx, XLogRecPtr	*startptr)
 {
 	bool	success;
 	XLogRecPtr	xlog_insert_ptr, end_of_wal;
 	int	i;
+	struct timeval t_end;
+	struct timeval *t_end_ptr = NULL;
 
 	/*
 	 * Lock the source table exclusively last time, to finalize the work.
@@ -2250,6 +2236,18 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	for (i = 0; i < nindexes; i++)
 		LockRelationOid(indexes_src[i], AccessExclusiveLock);
 
+	if (squeeze_max_xlock_time > 0)
+	{
+		int64 usec;
+		struct timeval t_start;
+
+		gettimeofday(&t_start, NULL);
+		usec = t_start.tv_usec + 1000 * (squeeze_max_xlock_time % 1000);
+		t_end.tv_sec = t_start.tv_sec + usec / USECS_PER_SEC;
+		t_end.tv_usec = usec % USECS_PER_SEC;
+		t_end_ptr = &t_end;
+	}
+
 	/*
 	 * Check the source relation for DDLs once again. If this check passes, no
 	 * DDL can break the process anymore. NoLock must be passed because the
@@ -2281,7 +2279,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	success = process_concurrent_changes(ctx, startptr, end_of_wal,
 										 cat_state, rel_dst, ident_key,
 										 ident_key_nentries, iistate,
-										 AccessExclusiveLock, must_complete);
+										 AccessExclusiveLock, t_end_ptr);
 	if (!success)
 	{
 		/* Unlock the relations and indexes. */
