@@ -109,7 +109,10 @@ squeeze_worker_main(Datum main_arg)
 	pqsignal(SIGTERM, squeeze_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
 
-	/* Retrieve connection info provided by the caller of start_worker(). */
+	/*
+	 * Retrieve connection info provided by the caller of
+	 * squeeze_start_worker().
+	 */
 	Assert(MyBgworkerEntry != NULL);
 	c = MyBgworkerEntry->bgw_extra;
 	memcpy(&database_id, c, sizeof(Oid));

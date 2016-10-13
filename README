@@ -82,18 +82,27 @@ Additional columns can be specified optionally, for example:
   worker" process) must have been executed since the previous task had
   completed. The default value is 1 hour.
 
-* "min_dead_tuples" is the minimum number of dead tuples to trigger processing
-  of this table. The default value is 50.
+* "free_space_extra" is the minimum percentage of "extra free space" needed to
+  trigger processing of the table. The "extra" adjective refers to the fact
+  that free space derived from "fillfactor" is not reason to squeeze the
+  table.
 
-* "squeeze_scale_factor" is the fraction of table size to add to
-  "min_dead_tuples" when deciding whether to schedule the next squeeze
-  task. The default value is 0.5.
+  For example, if "fillfactor" is equal to 60, then at least 40 percent of
+  each page should stay free during normal operation. If you want to ensure
+  that 70 percent of free space makes pg_squeeze interested in the tabe, set
+  "free_space_extra" to 30.
 
-* "stats_max_age" is the maximum age of statistics (see "last_analyze" and
-  "last_autoanalyze" columns of "pg_stat_user_tables" table). If the
-  statistics is older than this, the corresponding table won't be squeezed
-  even if its values of "min_dead_tuples" and "squeeze_scale_factor" indicate
-  it should be. The default value is 1 hour.
+  Default value of "free_space_extra" is 50.
+
+* In addition to the criterion above, the table must consist of at least
+  "min_pages" pages (page size is usually 8 kB) to be eligible for
+  processing. The default value is 64.
+
+* "stats_max_age" is the maximum age of statistics (see "last_vacuum" and
+  "last_autovacuum" columns of "pg_stat_user_tables" table). If the statistics
+  is older than this, the corresponding table won't be squeezed even if its
+  values of "min_dead_tuples" and "squeeze_scale_factor" indicate it should
+  be. The default value is 1 hour.
 
 * "max_retry" is the maximum number of extra attempts to squeeze a table if
   the first processing of the corresponding task failed. Typical reason to

@@ -24,7 +24,10 @@
 #include "optimizer/planner.h"
 #include "replication/logicalfuncs.h"
 #include "replication/snapbuild.h"
+#include "storage/bufmgr.h"
+#include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "storage/smgr.h"
 #include "storage/standbydefs.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -2856,3 +2859,83 @@ is_autovacuum_enabled(PG_FUNCTION_ARGS)
 
 	PG_RETURN_BOOL(result);
 }
+
+/*
+ * Retrieve the "fillfactor" storage option in a convenient way, so we don't
+ * have to parse pg_class(reloptions) value at SQL level.
+ */
+extern Datum get_heap_fillfactor(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(get_heap_fillfactor);
+Datum
+get_heap_fillfactor(PG_FUNCTION_ARGS)
+{
+	Oid	relid;
+	Relation	rel;
+	int	fillfactor;
+
+	relid = PG_GETARG_OID(0);
+	/*
+	 * XXX Not sure we need stronger lock - there are still occasions for
+	 * others to change the fillfactor (or even drop the relation) after this
+	 * function has returned.
+	 */
+	rel = heap_open(relid, AccessShareLock);
+	fillfactor = RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR);
+	heap_close(rel, AccessShareLock);
+	PG_RETURN_INT32(fillfactor);
+}
+
+/*
+ * Return fraction of free space in a relation, as indicated by FSM.
+ */
+extern Datum get_heap_freespace(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(get_heap_freespace);
+Datum
+get_heap_freespace(PG_FUNCTION_ARGS)
+{
+	Oid	relid;
+	Relation	rel;
+	BlockNumber	blkno, nblocks;
+	Size	free, total;
+	float8	result;
+	bool fsm_exists = true;
+
+	relid = PG_GETARG_OID(0);
+	rel = heap_open(relid, AccessShareLock);
+	nblocks = RelationGetNumberOfBlocks(rel);
+
+	/* NULL makes more sense than zero free space. */
+	if (nblocks == 0)
+	{
+		heap_close(rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	free = 0;
+	total = 0;
+	for (blkno = 0; blkno < nblocks; blkno++)
+	{
+		free += GetRecordedFreeSpace(rel, blkno);
+		total += BLCKSZ;
+	}
+
+	/*
+	 * If the relation seems to be full, verify that missing FSM is not the
+	 * reason.
+	 */
+	if (free == 0)
+	{
+		RelationOpenSmgr(rel);
+		if (!smgrexists(rel->rd_smgr, FSM_FORKNUM))
+			fsm_exists = false;
+		RelationCloseSmgr(rel);
+	}
+	heap_close(rel, AccessShareLock);
+
+	if (!fsm_exists)
+		PG_RETURN_NULL();
+
+	result = (float8) free / total;
+	PG_RETURN_FLOAT8(result);
+}
+

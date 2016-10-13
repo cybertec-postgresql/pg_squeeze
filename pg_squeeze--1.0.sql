@@ -30,17 +30,18 @@ CREATE TABLE tables (
 	-- particular table.
 	first_check	timestamptz	NOT NULL,
 
-	-- The minimum number of tuples that triggers processing.
+	-- The minimum percentage of free space that triggers processing, in
+	-- addition to the percentage determined by fillfactor.
 	--
 	-- TODO Tune the default value.
-	min_dead_tuples	int	NOT NULL	DEFAULT	50,
+	free_space_extra int NOT NULL DEFAULT 50,
+	CHECK (free_space_extra >= 0 AND free_space_extra < 100),
 
-	-- Fraction of table size to add to min_dead_tuples when deciding
-	-- whether to create a task to squeeze table.
+	-- The minimum number of pages that triggers processing.
 	--
 	-- TODO Tune the default value.
-	squeeze_scale_factor	real	NOT NULL	DEFAULT 0.5,
-	CHECK (squeeze_scale_factor > 0 AND squeeze_scale_factor <= 1),
+	min_pages	int	NOT NULL	DEFAULT 64,
+	CHECK (min_pages > 0),
 
 	-- If statistics are older than this, no new task is created.
 	--
@@ -143,14 +144,14 @@ CREATE TABLE errors (
 -- Overview of all the registered tables for which the required freshness of
 -- statistics is not met.
 CREATE VIEW unusable_stats AS
-SELECT	t.tabschema, t.tabname, s.last_analyze, s.last_autoanalyze
+SELECT	t.tabschema, t.tabname, s.last_vacuum, s.last_autovacuum
 FROM	squeeze.tables t,
 	pg_catalog.pg_stat_user_tables s
 WHERE	(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
 	(
-		COALESCE(s.last_analyze, s.last_autoanalyze) ISNULL
+		COALESCE(s.last_vacuum, s.last_autovacuum) ISNULL
 		OR
-		COALESCE(s.last_analyze, s.last_autoanalyze) < now() - t.stats_max_age
+		COALESCE(s.last_vacuum, s.last_autovacuum) < now() - t.stats_max_age
 	);
 
 
@@ -159,6 +160,18 @@ CREATE FUNCTION is_autovacuum_enabled (
 )
 RETURNS bool
 AS 'MODULE_PATHNAME', 'is_autovacuum_enabled'
+LANGUAGE C;
+
+CREATE FUNCTION get_heap_fillfactor(a_relid oid)
+RETURNS int
+AS 'MODULE_PATHNAME', 'get_heap_fillfactor'
+VOLATILE
+LANGUAGE C;
+
+CREATE FUNCTION get_heap_freespace(a_relid oid)
+RETURNS double precision
+AS 'MODULE_PATHNAME', 'get_heap_freespace'
+VOLATILE
 LANGUAGE C;
 
 -- Create tasks for newly qualifying tables.
@@ -184,15 +197,17 @@ AS $$
 			i.last_task_created IS NULL
 		)
 		AND
-		-- Threshold exceeded?
-		s.n_dead_tup >= t.min_dead_tuples +
-			      t.squeeze_scale_factor * (s.n_live_tup + s.n_dead_tup)
+		-- Threshold(s) exceeded?
+		100 * squeeze.get_heap_freespace(c.oid) >
+			(100 - squeeze.get_heap_fillfactor(c.oid)) + t.free_space_extra
+		AND
+		c.relpages > t.min_pages
 		AND
 		-- Can we still rely on the statistics?
 		(
-			(s.last_analyze >= now() - t.stats_max_age)
+			(s.last_vacuum >= now() - t.stats_max_age)
 			OR
-			(s.last_autoanalyze >= now() - t.stats_max_age)
+			(s.last_autovacuum >= now() - t.stats_max_age)
 		)
 		-- Ignore tables for which a task currently exists.
 		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks)
@@ -201,9 +216,9 @@ AS $$
 		(
 			i.last_task_finished ISNULL
 			OR
-			i.last_task_finished < s.last_analyze
+			i.last_task_finished < s.last_vacuum
 			OR
-			i.last_task_finished < s.last_autoanalyze
+			i.last_task_finished < s.last_autovacuum
 		)
 	 RETURNING t.id, squeeze.is_autovacuum_enabled(c.oid),
 	 	   squeeze.is_autovacuum_enabled(c.reltoastrelid)
@@ -253,7 +268,7 @@ $$;
 
 -- Delete task and make the table available for task creation again.
 --
--- By adjusting last_task_created make ANALYZE necessary before the next task
+-- By adjusting last_task_created make VACUUM necessary before the next task
 -- can be created for the table.
 CREATE FUNCTION cleanup_task(a_task_id int)
 RETURNS void
