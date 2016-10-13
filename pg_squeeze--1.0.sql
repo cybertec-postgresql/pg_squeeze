@@ -54,6 +54,40 @@ CREATE TABLE tables (
 	skip_analyze	bool		NOT NULL	DEFAULT false
 );
 
+COMMENT ON TABLE tables IS
+	'List of tables registered for regular squeeze.';
+COMMENT ON COLUMN tables.id IS
+	 'Identifier of the registered table (generated column).';
+COMMENT ON COLUMN tables.tabschema IS
+	'Database schema of the registered table.';
+COMMENT ON COLUMN tables.tabname IS
+	'Table registered for regular squeeze.';
+COMMENT ON COLUMN tables.clustering_index IS
+	'Index to control ordering of table rows.';
+COMMENT ON COLUMN tables.rel_tablespace IS
+	'Tablespace into which the registered table should be moved.';
+COMMENT ON COLUMN tables.ind_tablespaces IS
+	'Index-to-tablespace mappings to be applied.';
+COMMENT ON COLUMN tables.task_interval IS
+	'The minimum time between 2 subsequent processings.';
+COMMENT ON COLUMN tables.first_check IS
+	'The earliest possible schedule to process this table.';
+COMMENT ON COLUMN tables.free_space_extra IS
+	'In addition to free space derived from fillfactor, this extra '
+	 'percentage of free space is needed to schedule processing of the '
+	 'table.';
+COMMENT ON COLUMN tables.min_pages IS
+	'Besides meeting the free_space_extra criterion, table must contain '
+	'at least this many pages to be scheduled for squeezee.';
+COMMENT ON COLUMN tables.stats_max_age IS
+	'If statistics are older than this, no new schedule is created for '
+	'the table.';
+COMMENT ON COLUMN tables.max_retry IS
+	'The maximum nmber of times failed processing is retried.';
+COMMENT ON COLUMN tables.skip_analyze IS
+	'Only squeeze the table, without running ANALYZE afterwards.';
+
+
 -- Fields that would normally fit into "tables" but require no attention of
 -- the user are separate. Thus "tables" can be considered an user interface.
 CREATE TABLE tables_internal (
@@ -130,6 +164,17 @@ CREATE TABLE log (
 -- XXX Some other indexes might be useful. Analyze the typical use later.
 CREATE INDEX ON log(started);
 
+COMMENT ON TABLE log IS
+	'Successfully completed squeeze operations.';
+COMMENT ON COLUMN log.tabschema IS
+	 'Database schema of the table processed.';
+COMMENT ON COLUMN log.tabname IS
+	 'Name of the table not squeezed.';
+COMMENT ON COLUMN log.started IS
+	 'When the processing started.';
+COMMENT ON COLUMN log.finished IS
+	 'When the processing finished.';
+
 CREATE TABLE errors (
 	id		bigserial	NOT NULL	PRIMARY KEY,
 	occurred	timestamptz	NOT NULL	DEFAULT now(),
@@ -140,6 +185,23 @@ CREATE TABLE errors (
 	err_msg		text	NOT NULL,
 	err_detail	text
 );
+
+COMMENT ON TABLE errors IS
+	'Failed attempts to squeeze table.';
+COMMENT ON COLUMN errors.id IS
+	 'Identifier of the failure (generated column).';
+COMMENT ON COLUMN errors.occurred IS
+	'Time the errors has occurred.';
+COMMENT ON COLUMN errors.tabschema IS
+	 'Database schema of the table not squeezed.';
+COMMENT ON COLUMN errors.tabname IS
+	 'Name of the table not squeezed.';
+COMMENT ON COLUMN errors.sql_state IS
+	'"SQL state" encountered.';
+COMMENT ON COLUMN errors.err_msg IS
+	'Error message caught.';
+COMMENT ON COLUMN errors.err_detail IS
+	'Detailed error message, if available.';
 
 -- Overview of all the registered tables for which the required freshness of
 -- statistics is not met.
