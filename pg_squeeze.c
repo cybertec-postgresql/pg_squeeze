@@ -435,19 +435,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	}
 	list_free(relsrc_indlist);
 
-	/*
-	 * TODO If the number of columns is non-zero, check if there's at least
-	 * one valid (not dropped).
-	 */
-	if (cat_state->form_class->relnatts < 1)
-		/* XXX Try to find better error code. */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 (errmsg("Table \"%s\" has no valid columns",
-						 relrv_src->relname))));
-
-	/* Therefore the total number of indexes is non-zero. */
 	nindexes = cat_state->relninds;
+
+	/*
+	 * Existence of identity index was checked above, so number of indexes and
+	 * attributes are both non-zero.
+	 */
+	Assert(cat_state->form_class->relnatts >= 1);
 	Assert(nindexes > 0);
 
 	/* Copy the OIDs into a separate array, for convenient use later. */
