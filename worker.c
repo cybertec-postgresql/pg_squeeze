@@ -142,11 +142,13 @@ squeeze_worker_main(Datum main_arg)
 	lock_res = LockAcquire(&tag, ExclusiveLock, false, true);
 
 	if (lock_res == LOCKACQUIRE_NOT_AVAIL)
-		ereport(ERROR,
-				/* XXX Is there more suitable error code? */
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("one squeeze worker is already running on %u database",
-					 MyDatabaseId)));
+	{
+		elog(WARNING,
+			 "one squeeze worker is already running on %u database",
+			 MyDatabaseId);
+
+		proc_exit(0);
+	}
 	Assert(lock_res == LOCKACQUIRE_OK);
 
 	delay = 0L;
