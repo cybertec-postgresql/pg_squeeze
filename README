@@ -43,6 +43,11 @@ Installation
 
    CREATE EXTENSION pg_squeeze;
 
+Note: If you want remove the extension from particular database, make sure the
+database has no "squeeze worker" (see "Enable / disable table processing"
+section) running. Otherwise the DROP EXTENSION command will hang until it's
+cancelled.
+
 
 Register table for regular processing
 -------------------------------------
