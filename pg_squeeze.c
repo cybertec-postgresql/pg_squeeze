@@ -10,6 +10,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
@@ -2387,12 +2388,6 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
  * XXX Unlike PG core, we currently receive neither frozenXid nor cutoffMulti
  * arguments. Instead we only copy these fields from r2 to r1. This should
  * change if we preform regular rewrite instead of INSERT INTO ... SELECT ...
- *
- * TODO Adopt parts of finish_heap_swap(), especially renaming the TOAST
- * tables.
- *
- * TODO Consider if InvokeObjectPostAlterHookArg() should be called on
- * r1. Which call sites in PG core consider themselves as ALTER?
  */
 static void
 swap_relation_files(Oid r1, Oid r2)
@@ -2503,6 +2498,11 @@ swap_relation_files(Oid r1, Oid r2)
 	CatalogIndexInsert(indstate, reltup1);
 	CatalogIndexInsert(indstate, reltup2);
 	CatalogCloseIndexes(indstate);
+
+	InvokeObjectPostAlterHookArg(RelationRelationId, r1, 0,
+								 InvalidOid, true);
+	InvokeObjectPostAlterHookArg(RelationRelationId, r2, 0,
+								 InvalidOid, true);
 
 	if (relform1->reltoastrelid || relform2->reltoastrelid)
 	{
