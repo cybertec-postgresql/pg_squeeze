@@ -73,7 +73,7 @@ Additional columns can be specified optionally, for example:
 
 	INSERT INTO squeeze.tables
 	(tabschema, tabname, first_check, task_interval, squeeze_scale_factor,
-	stats_max_age, max_retry)
+	vacuum_max_age, max_retry)
 	VALUES
 	('public', 'bar', now(), '1 day', 0.9, '2 hours', 2);
 
@@ -94,15 +94,14 @@ Additional columns can be specified optionally, for example:
 
   Default value of "free_space_extra" is 50.
 
-* In addition to the criterion above, the table must consist of at least
-  "min_pages" pages (page size is usually 8 kB) to be eligible for
-  processing. The default value is 64.
+* "min_size" is the minimum disk space in megabytes the table must occupy to
+   be eligible for processing. The default value is 8.
 
-* "stats_max_age" is the maximum age of statistics (see "last_vacuum" and
-  "last_autovacuum" columns of "pg_stat_user_tables" table). If the statistics
-  is older than this, the corresponding table won't be squeezed even if its
-  values of "min_dead_tuples" and "squeeze_scale_factor" indicate it should
-  be. The default value is 1 hour.
+* "vacuum_max_age" is the maximum time since the completion of the last VACUUM
+  to consider the free space map (FSM) fresh. Once this interval has elapsed,
+  the portion of dead tuples might be significant and so more effort than
+  simply checking the FSM needs to be spent to evaluate the potential effect
+  "pg_squeeze". The default value is 1 hour.
 
 * "max_retry" is the maximum number of extra attempts to squeeze a table if
   the first processing of the corresponding task failed. Typical reason to
@@ -211,11 +210,6 @@ different daytime, when the write activity is lower.
 
 Monitoring
 ----------
-
-"squeeze.unusable_stats" view shows registered tables whose statistics are
-older than the value of "stats_max_age" described above. To make a table
-disappear from the view, run ANALYZE or VACUUM ANALYZE on it, or let
-autovaccuum worker do so.
 
 "squeeze.log" table contains one entry per successfully squeezed table.
 

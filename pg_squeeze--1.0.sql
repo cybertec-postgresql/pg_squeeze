@@ -37,16 +37,19 @@ CREATE TABLE tables (
 	free_space_extra int NOT NULL DEFAULT 50,
 	CHECK (free_space_extra >= 0 AND free_space_extra < 100),
 
-	-- The minimum number of pages that triggers processing.
+	-- The minimum size of the table (in megabytes) needed to trigger
+	-- processing.
 	--
 	-- TODO Tune the default value.
-	min_pages	int	NOT NULL	DEFAULT 64,
-	CHECK (min_pages > 0),
+	min_size	real	NOT NULL	DEFAULT 8,
+	CHECK (min_size > 0.0),
 
-	-- If statistics are older than this, no new task is created.
+	-- If at most this interval elapsed since the last VACUUM, try to use
+	-- FSM to estimate free space. Otherwise (or if there's no FSM), use
+	-- squeeze.pgstattuple_approx() function.
 	--
 	-- TODO Tune the default value.
-	stats_max_age	interval	NOT NULL	DEFAULT '1 hour',
+	vacuum_max_age	interval	NOT NULL	DEFAULT '1 hour',
 
 	max_retry	int		NOT NULL	DEFAULT 0,
 
@@ -76,12 +79,12 @@ COMMENT ON COLUMN tables.free_space_extra IS
 	'In addition to free space derived from fillfactor, this extra '
 	 'percentage of free space is needed to schedule processing of the '
 	 'table.';
-COMMENT ON COLUMN tables.min_pages IS
-	'Besides meeting the free_space_extra criterion, table must contain '
-	'at least this many pages to be scheduled for squeezee.';
-COMMENT ON COLUMN tables.stats_max_age IS
-	'If statistics are older than this, no new schedule is created for '
-	'the table.';
+COMMENT ON COLUMN tables.min_size IS
+	'Besides meeting the free_space_extra criterion, the table size must '
+	'be at least this many MBs to be scheduled for squeezee.';
+COMMENT ON COLUMN tables.vacuum_max_age IS
+	'If less than this elapsed since the last VACUUM, try to use FSM to '
+	'estimate the amount of free space.';
 COMMENT ON COLUMN tables.max_retry IS
 	'The maximum nmber of times failed processing is retried.';
 COMMENT ON COLUMN tables.skip_analyze IS
@@ -91,11 +94,23 @@ COMMENT ON COLUMN tables.skip_analyze IS
 -- Fields that would normally fit into "tables" but require no attention of
 -- the user are separate. Thus "tables" can be considered an user interface.
 CREATE TABLE tables_internal (
-       table_id	int	NOT NULL	PRIMARY KEY
-       REFERENCES tables ON DELETE CASCADE,
+	table_id	int	NOT NULL	PRIMARY KEY
+	REFERENCES tables ON DELETE CASCADE,
+
+	-- pg_class(oid) of the table. It's an auxiliary field that lets us
+	-- avoid repeated retrieval of the field in add_new_tasks().
+	class_id	oid,
+
+	-- Likewise.
+	class_id_toast	oid,
+
+	-- The latest known free space. Note that it includes dead tuples,
+	-- since these are eliminated by squeeze_table() function.
+	free_space	double precision,
 
 	-- If at least task_interval elapsed since the last task creation and
-        -- there's no task for the table in the queue, add a new one.
+        -- there's no task for the table in the queue, consider adding a new
+	-- one.
 	--
 	-- We could apply task_interval to last_task_finished instead, but
 	-- that would add the task duration as an extra delay to the next
@@ -203,20 +218,6 @@ COMMENT ON COLUMN errors.err_msg IS
 COMMENT ON COLUMN errors.err_detail IS
 	'Detailed error message, if available.';
 
--- Overview of all the registered tables for which the required freshness of
--- statistics is not met.
-CREATE VIEW unusable_stats AS
-SELECT	t.tabschema, t.tabname, s.last_vacuum, s.last_autovacuum
-FROM	squeeze.tables t,
-	pg_catalog.pg_stat_user_tables s
-WHERE	(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
-	(
-		COALESCE(s.last_vacuum, s.last_autovacuum) ISNULL
-		OR
-		COALESCE(s.last_vacuum, s.last_autovacuum) < now() - t.stats_max_age
-	);
-
-
 CREATE FUNCTION is_autovacuum_enabled (
        relid	oid
 )
@@ -236,17 +237,35 @@ AS 'MODULE_PATHNAME', 'get_heap_freespace'
 VOLATILE
 LANGUAGE C;
 
+CREATE FUNCTION pgstattuple_approx(IN reloid regclass,
+    OUT table_len BIGINT,               -- physical table length in bytes
+    OUT scanned_percent FLOAT8,         -- what percentage of the table's pages was scanned
+    OUT approx_tuple_count BIGINT,      -- estimated number of live tuples
+    OUT approx_tuple_len BIGINT,        -- estimated total length in bytes of live tuples
+    OUT approx_tuple_percent FLOAT8,    -- live tuples in % (based on estimate)
+    OUT dead_tuple_count BIGINT,        -- exact number of dead tuples
+    OUT dead_tuple_len BIGINT,          -- exact total length in bytes of dead tuples
+    OUT dead_tuple_percent FLOAT8,      -- dead tuples in % (based on estimate)
+    OUT approx_free_space BIGINT,       -- estimated free space in bytes
+    OUT approx_free_percent FLOAT8)     -- free space in % (based on estimate)
+AS 'MODULE_PATHNAME', 'squeeze_pgstattuple_approx'
+LANGUAGE C STRICT PARALLEL SAFE;
+
 -- Create tasks for newly qualifying tables.
 CREATE FUNCTION add_new_tasks() RETURNS void
 LANGUAGE sql
 AS $$
-    WITH tasks_new(id, autovac, autovac_toast) AS (
-	 UPDATE	squeeze.tables_internal i
-	 SET	last_task_created = now()
-	 FROM	pg_catalog.pg_stat_user_tables s,
+	-- The previous estimates are obsolete now.
+	UPDATE squeeze.tables_internal
+	SET free_space = NULL, class_id = NULL, class_id_toast = NULL;
+
+	-- Mark tables that we're interested in.
+	UPDATE	squeeze.tables_internal i
+	SET class_id = c.oid, class_id_toast = c.reltoastrelid
+	FROM	pg_catalog.pg_stat_user_tables s,
 		squeeze.tables t,
 		pg_class c, pg_namespace n
-	 WHERE
+	WHERE
 		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
 		i.table_id = t.id AND
 		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
@@ -258,36 +277,57 @@ AS $$
 			OR
 			i.last_task_created IS NULL
 		)
-		AND
-		-- Threshold(s) exceeded?
-		100 * squeeze.get_heap_freespace(c.oid) >
-			(100 - squeeze.get_heap_fillfactor(c.oid)) + t.free_space_extra
-		AND
-		c.relpages > t.min_pages
-		AND
-		-- Can we still rely on the statistics?
-		(
-			(s.last_vacuum >= now() - t.stats_max_age)
-			OR
-			(s.last_autovacuum >= now() - t.stats_max_age)
-		)
 		-- Ignore tables for which a task currently exists.
-		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks)
+		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks);
+
+	-- If VACUUM completed recenly enough, we consider the percentage of
+	-- dead tuples negligible and so retrieve the free space from FSM.
+	UPDATE	squeeze.tables_internal i
+	SET free_space = 100 * squeeze.get_heap_freespace(i.class_id)
+	FROM	pg_catalog.pg_stat_user_tables s,
+		squeeze.tables t
+	WHERE
+		i.class_id NOTNULL AND
+		i.table_id = t.id AND
+		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
+		(
+			(s.last_vacuum >= now() - t.vacuum_max_age)
+			OR
+			(s.last_autovacuum >= now() - t.vacuum_max_age)
+		)
 		AND
-		-- Each processing makes the current statistics obsolete.
+		-- Each processing makes the previous VACUUM unimportant.
 		(
 			i.last_task_finished ISNULL
 			OR
 			i.last_task_finished < s.last_vacuum
 			OR
 			i.last_task_finished < s.last_autovacuum
-		)
-	 RETURNING t.id, squeeze.is_autovacuum_enabled(c.oid),
-	 	   squeeze.is_autovacuum_enabled(c.reltoastrelid)
-    )
-    INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
-    SELECT	id, autovac, autovac_toast
-    FROM	tasks_new;
+		);
+
+	-- If VACUUM didn't run recently or there's no FSM, take the more
+	-- expensive approach. (Use WITH as LATERAL doesn't work for UPDATE.)
+	WITH t_approx(table_id, free_space) AS (
+		SELECT	i.table_id, a.approx_free_percent + a.dead_tuple_percent
+		FROM	squeeze.tables_internal i,
+			squeeze.pgstattuple_approx(i.class_id) AS a
+		WHERE i.class_id NOTNULL AND i.free_space ISNULL)
+	UPDATE squeeze.tables_internal i
+	SET	free_space = a.free_space
+	FROM	t_approx a
+	WHERE	i.table_id = a.table_id;
+
+	-- Create a new task for each table having more free space than
+	-- needed.
+	INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
+	SELECT	id, squeeze.is_autovacuum_enabled(i.class_id),
+		squeeze.is_autovacuum_enabled(i.class_id_toast)
+	FROM	squeeze.tables_internal i,
+		squeeze.tables t
+	WHERE	i.class_id NOTNULL AND t.id = i.table_id AND i.free_space >
+		((100 - squeeze.get_heap_fillfactor(i.class_id)) + t.free_space_extra)
+		AND
+		pg_catalog.pg_relation_size(i.class_id, 'main') > t.min_size * 1048576;
 $$;
 
 -- Mark the next task as active.
