@@ -856,10 +856,6 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 
 	/*
 	 * Setup structures to store decoded changes.
-	 *
-	 * TODO Find out what's wrong about letting the plugin immediately write
-	 * into the destination table itself. PG documentation forbids that, but
-	 * I'm not sure if that restriction is still valid and why.
 	 */
 	dstate = palloc0(sizeof(DecodingOutputState));
 	dstate->relid = relid;
@@ -1611,11 +1607,6 @@ free_tablespace_info(TablespaceInfo *tbsp_info)
  *
  * Caution: Caller is responsible for calling TeardownHistoricSnapshot()
  * anytime ERROR is raised while the historic snapshot is active.
- *
- * TODO
- *
- * If the unused argument of TeardownHistoricSnapshot() is clarified, pass it
- * to this function too.
  */
 static void
 switch_snapshot(Snapshot snap_hist)
