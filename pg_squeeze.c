@@ -1786,6 +1786,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				}
 				else
 				{
+					CHECK_FOR_INTERRUPTS();
+
 					if (i == batch_max_size)
 					{
 						batch_max_size *= 2;
@@ -1835,6 +1837,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		{
 			HeapTuple	tup_out;
 			bool	should_free = false;;
+
+			CHECK_FOR_INTERRUPTS();
 
 			if (use_sort)
 				tup_out = tuplesort_getheaptuple(tuplesort, true,

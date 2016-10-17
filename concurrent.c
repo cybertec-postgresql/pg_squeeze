@@ -56,6 +56,8 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 	done = false;
 	while(!done)
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		done = decode_concurrent_changes(ctx, startptr, end_of_wal,
 										 must_complete);
 
