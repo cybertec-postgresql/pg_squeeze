@@ -41,7 +41,7 @@
 
 PG_MODULE_MAGIC;
 
-#define	REPL_SLOT_NAME		"pg_squeeze_slot"
+#define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 static int index_cat_info_compare(const void *arg1, const void *arg2);
@@ -819,6 +819,7 @@ check_prerequisites(Relation rel)
 static LogicalDecodingContext *
 setup_decoding(Oid relid, TupleDesc tup_desc)
 {
+	StringInfo	buf;
 	LogicalDecodingContext *ctx;
 	DecodingOutputState	*dstate;
 	MemoryContext oldcontext;
@@ -842,7 +843,15 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	/* Make sure there's no conflict with the SPI and its contexts. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 
-	ReplicationSlotCreate(REPL_SLOT_NAME, true, RS_EPHEMERAL);
+	/*
+	 * Each database has a separate background worker, so multiple squeezes
+	 * can be in progress anytime. Thus the slot name should be
+	 * database-specific.
+	 */
+	buf = makeStringInfo();
+	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
+	appendStringInfo(buf, "%u", MyDatabaseId);
+	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL);
 
 	/*
 	 * Neither prepare_write nor do_write callback is useful for us: we don't
