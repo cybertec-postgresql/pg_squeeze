@@ -144,6 +144,9 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 		}
 		InvalidateSystemCaches();
 		CurrentResourceOwner = resowner_old;
+
+		if (ctx->reader->EndRecPtr != InvalidXLogRecPtr)
+			LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 	}
 	PG_CATCH();
 	{
