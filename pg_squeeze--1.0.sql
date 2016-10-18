@@ -150,7 +150,8 @@ EXECUTE PROCEDURE squeeze.tables_internal_trig_func();
 CREATE TABLE tasks (
 	id		serial	NOT NULL	PRIMARY KEY,
 
-	table_id	int	NOT NULL	REFERENCES tables,
+	table_id	int	NOT NULL	REFERENCES tables
+	ON DELETE CASCADE,
 
 	-- Is this the task the next call of process() function will pick?
 	active		bool	NOT NULL	DEFAULT false,
