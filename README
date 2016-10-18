@@ -223,6 +223,17 @@ usual problem reported here is that someone changed definition (e.g. added or
 removed column) of the table whose processing was just in progress.
 
 
+Unregister table
+----------------
+
+If particular table should no longer be subject to periodical squeeze, simply
+delete the corresponding row from "squeeze.tables" table.
+
+It's also a good practice to unregister table that you're going to drop,
+although the background worker does unregister non-existing tables
+periodically.
+
+
 Note on Concurrency
 -------------------
 
