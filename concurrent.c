@@ -193,8 +193,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		return;
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
-	slot = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(slot, dstate->tupdesc);
+	slot = MakeSingleTupleTableSlot(dstate->tupdesc);
 	iistate->econtext->ecxt_scantuple = slot;
 
 	/*
