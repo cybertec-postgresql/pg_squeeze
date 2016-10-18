@@ -275,6 +275,7 @@ run_command(char *command)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	pgstat_report_stat(false);
 	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
@@ -319,6 +320,7 @@ get_task_count(void)
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+	pgstat_report_stat(false);
 	pgstat_report_activity(STATE_IDLE, NULL);
 
 	return result;
