@@ -363,8 +363,15 @@ BEGIN
 	--
 	-- Also disable autovacuum for the table and its TOAST relation. As
 	-- we're gonna "squeeze" the table, VACUUM no longer makes sense.
+	--
+	-- (The join to pg_class and pg_namespace should ensure that we don't
+	-- cause ERROR if someone happened to drop the table w/o unregistering
+	-- it firs.)
 	PERFORM squeeze.set_reloptions(v_tabschema, v_tabname, true, false,
-		false);
+		false)
+	FROM	pg_class c, pg_namespace n
+	WHERE	c.relname = v_tabname AND c.relnamespace = n.oid AND
+		n.nspname = v_tabschema;
 END;
 $$;
 
@@ -429,6 +436,10 @@ t.tried >= tb.max_retry, tb.skip_analyze, t.autovac, t.autovac_toast
 	BEGIN
 		v_start := clock_timestamp();
 
+		-- Do the actual processing.
+		--
+		-- If someone dropped the table in between, the exception
+		-- handler below should log the error and cleanup the task.
 		PERFORM squeeze.squeeze_table(v_tabschema, v_tabname,
  v_cl_index, v_rel_tbsp, v_ind_tbsps, v_autovac, v_autovac_toast);
 
@@ -476,9 +487,17 @@ t.tried >= tb.max_retry, tb.skip_analyze, t.autovac, t.autovac_toast
 				-- squeeze_table() resets the options on
 				-- successful completion, but here we must do
 				-- it explicitly on error.
+				--
+				-- (Join to catalog tables should ensure that
+				-- no ERROR is raised here if the table was
+				-- dropped recently.)
 				PERFORM squeeze.set_reloptions(v_tabschema,
 					v_tabname, false, v_autovac,
-					v_autovac_toast);
+					v_autovac_toast)
+				FROM	pg_class c, pg_namespace n
+				WHERE	c.relname = v_tabname AND
+					c.relnamespace = n.oid AND
+					n.nspname = v_tabschema;
 
 				RETURN;
 			ELSE
