@@ -490,7 +490,7 @@ t.tried >= tb.max_retry, tb.skip_analyze, t.autovac, t.autovac_toast
 			GET STACKED DIAGNOSTICS v_err_msg := MESSAGE_TEXT;
 			GET STACKED DIAGNOSTICS v_err_detail := PG_EXCEPTION_DETAIL;
 
-			INSERT INTO squeeze.errors (tabschema, tabname,
+			INSERT INTO squeeze.errors(tabschema, tabname,
 				sql_state, err_msg, err_detail)
 			VALUES (v_tabschema, v_tabname, v_sql_state, v_err_msg,
 				v_err_detail);
