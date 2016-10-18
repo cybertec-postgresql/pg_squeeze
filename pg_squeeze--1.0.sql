@@ -252,6 +252,21 @@ CREATE FUNCTION pgstattuple_approx(IN reloid regclass,
 AS 'MODULE_PATHNAME', 'squeeze_pgstattuple_approx'
 LANGUAGE C STRICT PARALLEL SAFE;
 
+-- Unregister dropped tables. (CASCADE behaviour ensures deletion of the
+-- related records in "tables_internal" and "tasks" tables.)
+CREATE FUNCTION cleanup_tables() RETURNS void
+LANGUAGE sql
+AS $$
+	DELETE
+	FROM squeeze.tables t
+	WHERE (t.tabschema, t.tabname) NOT IN (
+		SELECT n.nspname, c.relname
+		FROM
+			pg_class c
+			JOIN pg_namespace n
+			ON c.relnamespace = n.oid);
+$$;
+
 -- Create tasks for newly qualifying tables.
 CREATE FUNCTION add_new_tasks() RETURNS void
 LANGUAGE sql

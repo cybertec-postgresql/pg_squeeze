@@ -177,6 +177,12 @@ squeeze_worker_main(Datum main_arg)
 		 */
 		if (ntasks == 0)
 		{
+			/*
+			 * Unregister dropped tables instead of creating new tasks for
+			 * them.
+			 */
+			run_command("SELECT squeeze.cleanup_tables()");
+
 			run_command("SELECT squeeze.add_new_tasks()");
 			ntasks = get_task_count();
 			elog(DEBUG1, "pg_squeeze: %zd tasks added to queue", ntasks);
