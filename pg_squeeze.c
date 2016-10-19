@@ -2473,24 +2473,18 @@ swap_relation_files(Oid r1, Oid r2)
 		relform1->relminmxid = cutoffMulti;
 	}
 
-	/* swap size statistics too, since new rel has freshly-updated stats */
-	{
-		int32		swap_pages;
-		float4		swap_tuples;
-		int32		swap_allvisible;
-
-		swap_pages = relform1->relpages;
-		relform1->relpages = relform2->relpages;
-		relform2->relpages = swap_pages;
-
-		swap_tuples = relform1->reltuples;
-		relform1->reltuples = relform2->reltuples;
-		relform2->reltuples = swap_tuples;
-
-		swap_allvisible = relform1->relallvisible;
-		relform1->relallvisible = relform2->relallvisible;
-		relform2->relallvisible = swap_allvisible;
-	}
+	/*
+	 * Adjust pg_class fields of the relation (relform2 can be ignored as the
+	 * transient relation will get dropped.)
+	 *
+	 * There's no reason to expect relallvisible to be non-zero. The next
+	 * VACUUM should fix it.
+	 *
+	 * As for relpages and reltuples, neither includes concurrent changes (are
+	 * those worth any calculation?), so leave the original values. The next
+	 * ANALYZE will fix them.
+	 */
+	relform1->relallvisible = 0;
 
 	simple_heap_update(relRelation, &reltup1->t_self, reltup1);
 	simple_heap_update(relRelation, &reltup2->t_self, reltup2);
