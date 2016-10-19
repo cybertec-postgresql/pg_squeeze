@@ -66,12 +66,12 @@ static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
-static TransactionId *get_attribute_xmins(Oid relid, int relnatts,
-										  Snapshot snapshot);
+static TransactionId *get_attribute_xmins(Oid relid, int relnatts);
 static IndexCatInfo *get_index_info(Oid relid, int *relninds,
-									bool *found_invalid, bool invalid_check_only,
-									Snapshot snapshot);
-static void check_attribute_changes(Oid relid, TransactionId	*attrs, int relnatts);
+									bool *found_invalid,
+									bool invalid_check_only);
+static void check_attribute_changes(Oid relid, TransactionId *attrs,
+									int relnatts);
 static void check_index_changes(Oid relid, IndexCatInfo *indexes,
 								int relninds);
 static void free_catalog_state(CatalogState *state);
@@ -621,7 +621,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * cause deadlock by requesting exclusive lock. Fortunately we should
 	 * recognize this scenario by checking pg_index.
 	 */
-	ind_info = get_index_info(relid_src, NULL, &invalid_index, true, NULL);
+	ind_info = get_index_info(relid_src, NULL, &invalid_index, true);
 	if (invalid_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -918,7 +918,6 @@ get_catalog_state(Oid relid)
 	TupleDesc	desc;
 	SysScanDesc scan;
 	ScanKeyData key[1];
-	Snapshot	snapshot;
 	Datum	options_raw;
 	bool	isnull;
 	StdRdOptions *reloptions;
@@ -931,24 +930,9 @@ get_catalog_state(Oid relid)
 	rel = heap_open(RelationRelationId, AccessShareLock);
 	desc = CreateTupleDescCopy(RelationGetDescr(rel));
 
-	/*
-	 * The relation is not a real catalog relation, but GetCatalogSnapshot()
-	 * does exactly what we need, i.e. retrieves the most recent snapshot. If
-	 * changing this, make sure that isolation level has no impact on the
-	 * snapshot "freshness".
-	 *
-	 * The same snapshot is used for all the catalog scans in this function,
-	 * but it's not critical at the moment. If someone manages to change
-	 * attribute or index concurrently (shouldn't happen at least for
-	 * attributes because AccessShareLock should currently be held on the
-	 * source relation), the first call of check_catalog_changes() will reveal
-	 * the change.
-	 */
-	snapshot = GetCatalogSnapshot(relid);
-
 	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel, ClassOidIndexId, true, snapshot, 1, key);
+	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
 	tuple = systable_getnext(scan);
 
 	/*
@@ -975,7 +959,7 @@ get_catalog_state(Oid relid)
 	}
 
 	/*
-	 * If TOAST relation existsq, we must also keep eye on the catalog option.
+	 * If TOAST relation exists, we must also keep eye on the catalog option.
 	 */
 	if (form_class->reltoastrelid != InvalidOid)
 	{
@@ -987,7 +971,7 @@ get_catalog_state(Oid relid)
 		ScanKeyInit(&key_toast[0], ObjectIdAttributeNumber,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(form_class->reltoastrelid));
-		scan_toast = systable_beginscan(rel, ClassOidIndexId, true, snapshot,
+		scan_toast = systable_beginscan(rel, ClassOidIndexId, true, NULL,
 										1, key_toast);
 		tuple_toast = systable_getnext(scan_toast);
 
@@ -1027,16 +1011,14 @@ get_catalog_state(Oid relid)
 	 * not change from "true" to "false", but let's be cautious anyway.)
 	 */
 	result->indexes = get_index_info(relid, &result->relninds,
-									 &result->invalid_index, false,
-									 snapshot);
+									 &result->invalid_index, false);
 
 	/* If any index is "invalid", no more catalog information is needed. */
 	if (result->invalid_index)
 		return result;
 
 	if (form_class->relnatts > 0)
-		result->attr_xmins = get_attribute_xmins(relid, form_class->relnatts,
-												 snapshot);
+		result->attr_xmins = get_attribute_xmins(relid, form_class->relnatts);
 
 	/* Cleanup. */
 	systable_endscan(scan);
@@ -1051,7 +1033,7 @@ get_catalog_state(Oid relid)
  * checks.)
  */
 static TransactionId *
-get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
+get_attribute_xmins(Oid relid, int relnatts)
 {
 	Relation	rel;
 	ScanKeyData key[2];
@@ -1061,8 +1043,7 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 	int	n = 0;
 
 	rel = heap_open(AttributeRelationId, AccessShareLock);
-	if (snapshot == NULL)
-		snapshot = GetCatalogSnapshot(relid);
+
 	ScanKeyInit(&key[0], Anum_pg_attribute_attrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
@@ -1071,7 +1052,7 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
 				Anum_pg_attribute_attnum,
 				BTGreaterStrategyNumber, F_INT2GT,
 				Int16GetDatum(0));
-	scan = systable_beginscan(rel, AttributeRelidNumIndexId, true, snapshot,
+	scan = systable_beginscan(rel, AttributeRelidNumIndexId, true, NULL,
 							  2, key);
 	result = (TransactionId *) palloc(relnatts * sizeof(TransactionId));
 	while ((tuple = systable_getnext(scan)) != NULL)
@@ -1116,11 +1097,10 @@ get_attribute_xmins(Oid relid, int relnatts, Snapshot snapshot)
  */
 static IndexCatInfo *
 get_index_info(Oid relid, int *relninds, bool *found_invalid,
-			   bool invalid_check_only, Snapshot snapshot)
+			   bool invalid_check_only)
 {
 	Relation	rel;
 	ScanKeyData key[1];
-	bool		snap_received;
 	SysScanDesc scan;
 	HeapTuple	tuple;
 	IndexCatInfo		*result;
@@ -1136,15 +1116,10 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	*found_invalid = false;
 
 	rel = heap_open(IndexRelationId, AccessShareLock);
-	if (snapshot != NULL)
-		snap_received = true;
-	if (!snap_received)
-		snapshot = GetCatalogSnapshot(relid);
 	ScanKeyInit(&key[0], Anum_pg_index_indrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel, IndexIndrelidIndexId, true, snapshot,
-							  1, key);
+	scan = systable_beginscan(rel, IndexIndrelidIndexId, true, NULL, 1, key);
 
 	result = (IndexCatInfo *) palloc(relninds_max * sizeof(IndexCatInfo));
 	while ((tuple = systable_getnext(scan)) != NULL)
@@ -1214,12 +1189,11 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	pfree(oids_d);
 
 	rel = heap_open(RelationRelationId, AccessShareLock);
-	if (!snap_received)
-		snapshot = GetCatalogSnapshot(relid);
+
 	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
 				F_OIDEQ, PointerGetDatum(oids_a));
 	key[0].sk_flags |= SK_SEARCHARRAY;
-	scan = systable_beginscan(rel, ClassOidIndexId, true, snapshot, 1, key);
+	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
 	i = 0;
 	mismatch = false;
 	while ((tuple = systable_getnext(scan)) != NULL)
@@ -1348,7 +1322,6 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 static void
 check_pg_class_changes(Oid relid, TransactionId xmin, LOCKMODE lock_held)
 {
-	Snapshot	snapshot;
 	ScanKeyData key[1];
 	HeapTuple	pg_class_tuple = NULL;
 	Relation	pg_class_rel;
@@ -1356,14 +1329,12 @@ check_pg_class_changes(Oid relid, TransactionId xmin, LOCKMODE lock_held)
 	SysScanDesc pg_class_scan;
 	TransactionId		pg_class_xmin;
 
-	/* This part is identical to the beginning of get_catalog_state(). */
 	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(relid));
 	pg_class_rel = heap_open(RelationRelationId, AccessShareLock);
 	pg_class_desc = CreateTupleDescCopy(RelationGetDescr(pg_class_rel));
-	snapshot = GetCatalogSnapshot(relid);
 	pg_class_scan = systable_beginscan(pg_class_rel, ClassOidIndexId,
-									   true, snapshot, 1, key);
+									   true, NULL, 1, key);
 	pg_class_tuple = systable_getnext(pg_class_scan);
 
 	/* As the relation might not be locked, it could have disappeared. */
@@ -1418,7 +1389,7 @@ check_attribute_changes(Oid relid, TransactionId *attrs, int relnatts)
 		return;
 	}
 
-	attrs_new = get_attribute_xmins(relid, relnatts, NULL);
+	attrs_new = get_attribute_xmins(relid, relnatts);
 	for (i = 0; i < relnatts; i++)
 	{
 		if (!TransactionIdEquals(attrs[i], attrs_new[i]))
@@ -1443,8 +1414,7 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 		return;
 	}
 
-	inds_new = get_index_info(relid, &relninds_new, &invalid_index, false,
-							  NULL);
+	inds_new = get_index_info(relid, &relninds_new, &invalid_index, false);
 
 	/*
 	 * If this field was set to true, no attention was paid to the other
