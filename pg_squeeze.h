@@ -92,10 +92,6 @@ typedef struct IndexInsertState
 	EState	*estate;
 	ExprContext	*econtext;
 
-	/*
-	 * This field is not necessary for index updates, but it's convenient
-	 * to open / close it along with the other indexes.
-	 */
 	Relation	ident_index;
 } IndexInsertState;
 

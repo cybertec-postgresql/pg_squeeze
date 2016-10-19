@@ -185,12 +185,18 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						 ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot	*slot;
+	Form_pg_index ident_form;
+	int2vector	*ident_indkey;
 	HeapTuple tup_old = NULL;
 	BulkInsertState bistate = NULL;
 	double	ninserts, nupdates, ndeletes;
 
 	if (dstate->nchanges == 0)
 		return;
+
+	/* Info needed to retrieve key values from heap tuple. */
+	ident_form = iistate->ident_index->rd_index;
+	ident_indkey = &ident_form->indkey;
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc);
@@ -309,10 +315,12 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			{
 				ScanKey	entry;
 				bool	isnull;
+				int16	attno_heap;
 
 				entry = &scan->keyData[i];
+				attno_heap = ident_indkey->values[i];
 				entry->sk_argument = heap_getattr(tup_key,
-												  entry->sk_attno,
+												  attno_heap,
 												  relation->rd_att,
 												  &isnull);
 				Assert(!isnull);

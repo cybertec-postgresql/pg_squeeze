@@ -244,7 +244,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Oid	ident_idx_src, ident_idx_dst;
 	Oid	relid_src, relid_dst;
 	Oid	toastrelid_src, toastrelid_dst;
-	List	*relsrc_indlist;
 	char	replident;
 	ScanKey	ident_key;
 	int	i, ident_key_nentries;
@@ -290,22 +289,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	check_prerequisites(rel_src);
 
 	/*
-	 * Refresh the index list.
-	 *
-	 * Although our processing of the list shouldn't cause invalidation of
-	 * this particular relcache entry (RelationGetIndexList() comment mentions
-	 * invalidation due to cache lookup, but we'll only lookup tablespaces and
-	 * index relations) it seems at least cleaner to use the returned copy, as
-	 * opposed to rel_src->rd_indexlist. Thus we can eventually free it
-	 * explicitly.
+	 * Retrieve the useful info while holding lock on the relation.
 	 */
-	relsrc_indlist = RelationGetIndexList(rel_src);
-
-	/*
-	 * Retrieve other useful info while holding lock on the relation.
-	 */
-	replident = rel_src->rd_rel->relreplident;
 	ident_idx_src = RelationGetReplicaIndex(rel_src);
+	replident = rel_src->rd_rel->relreplident;
 	relid_src = RelationGetRelid(rel_src);
 	rel_src_owner = RelationGetForm(rel_src)->relowner;
 	toastrelid_src = rel_src->rd_rel->reltoastrelid;
@@ -437,7 +424,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 		resolve_index_tablepaces(tbsp_info, cat_state, ind_tbsp);
 	}
-	list_free(relsrc_indlist);
 
 	nindexes = cat_state->relninds;
 
@@ -590,7 +576,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * incomplete page, see GetInsertRecPtr), to minimize the amount of data
 	 * we need to flush while holding exclusive lock on the source table.
 	 */
-	xlog_insert_ptr = GetInsertRecPtr();
+ 	xlog_insert_ptr = GetInsertRecPtr();
 	XLogFlush(xlog_insert_ptr);
 
 	/*
@@ -1934,6 +1920,11 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 	 * Constraints are not created because each data change must be committed
 	 * in the source table before we see it during initial load or via logical
 	 * decoding.
+	 *
+	 * Values of some arguments (e.g. oidislocal, oidinhcount) are unimportant
+	 * since the transient table and its catalog entries will eventually get
+	 * dropped. On the other hand, we do not change catalog regarding the
+	 * source relation.
 	 */
 	form_class = cat_state->form_class;
 	result = heap_create_with_catalog(
@@ -2226,17 +2217,27 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 	{
 		ScanKey	entry;
 		int16	relattno;
-		TupleDesc	desc;
 		Form_pg_attribute	att;
 		Oid	opfamily, opno, opcode;
 
 		entry = &result[i];
 		relattno = ident_idx->indkey.values[i];
-		desc = rel_src->rd_att;
-		att = desc->attrs[relattno - 1];
+		if (relattno >= 1)
+		{
+			TupleDesc	desc;
+
+			desc = rel_src->rd_att;
+			att = desc->attrs[relattno - 1];
+		} else if (relattno == ObjectIdAttributeNumber)
+			att = SystemAttributeDefinition(relattno,
+											rel_src->rd_rel->relhasoids);
+		else
+			elog(ERROR, "Unexpected attribute number %d in index", relattno);
+
 		opfamily = ident_idx_rel->rd_opfamily[i];
 		opno = get_opfamily_member(opfamily, att->atttypid, att->atttypid,
 								   BTEqualStrategyNumber);
+
 		if (!OidIsValid(opno))
 			elog(ERROR, "Failed to find = operator for type %u",
 				 att->atttypid);
@@ -2247,7 +2248,7 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 
 		/* Initialize everything but argument. */
 		ScanKeyInit(entry,
-					relattno,
+					i + 1,
 					BTEqualStrategyNumber, opcode,
 					(Datum) NULL);
 		entry->sk_collation = att->attcollation;
