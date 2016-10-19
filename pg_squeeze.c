@@ -539,6 +539,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	free_tablespace_info(tbsp_info);
 
 	/*
+	 * Build scan key that we'll use to look for rows to be updated / deleted
+	 * during logical decoding.
+	 */
+	ident_key = build_identity_key(ident_idx_src, rel_src,
+								   &ident_key_nentries);
+
+	/*
 	 * As we'll need to take exclusive lock later, release the shared one.
 	 *
 	 * Note: PG core code shouldn't actually participate in such a deadlock,
@@ -557,13 +564,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Valid identity index should exist now, see the identity checks above.
 	 */
 	Assert(OidIsValid(ident_idx_src));
-
-	/*
-	 * Build scan key that we'll use to look for rows to be updated / deleted
-	 * during logical decoding.
-	 */
-	ident_key = build_identity_key(ident_idx_src, rel_src,
-								   &ident_key_nentries);
 
 	/* Find "identity index" of the transient relation. */
 	ident_idx_dst = InvalidOid;
