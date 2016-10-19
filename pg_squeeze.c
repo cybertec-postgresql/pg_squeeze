@@ -326,6 +326,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * GetOldestXmin() treats the table like catalog one as soon as it sees
 	 * the new catalog_min published.
 	 *
+	 * Not all index changes do conflict with the AccessShareLock - see
+	 * get_index_info() for explanation.
+	 *
 	 * XXX It'd still be correct to start the check a bit later, i.e. just
 	 * before CreateInitDecodingContext(), but the gain is not worth making
 	 * the code less readable.
@@ -1094,12 +1097,19 @@ get_attribute_xmins(Oid relid, int relnatts)
  *
  * If invalid_check_only is true, return after having verified that all
  * indexes are valid.
+ *
+ * Note that some index DDLs can commit while this function is called from
+ * get_catalog_state(). If we manage to see these changes, our result includes
+ * them and they'll affect the transient table. If any such change gets
+ * committed later and we miss it, it'll be identified as disruptive by
+ * check_catalog_changes(). After all, there should be no dangerous race
+ * conditions.
  */
 static IndexCatInfo *
 get_index_info(Oid relid, int *relninds, bool *found_invalid,
 			   bool invalid_check_only)
 {
-	Relation	rel;
+	Relation	rel, rel_idx;
 	ScanKeyData key[1];
 	SysScanDesc scan;
 	HeapTuple	tuple;
@@ -1115,11 +1125,21 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 
 	*found_invalid = false;
 
-	rel = heap_open(IndexRelationId, AccessShareLock);
+	/*
+	 * Open both pg_class and pg_index catalogs at once, so that we have a
+	 * consistent view in terms of invalidation. Otherwise we might get
+	 * different snapshot for each. Thus, in-progress index changes that do
+	 * not conflict with AccessShareLock on the parent table could trigger
+	 * false alarms later in check_catalog_changes().
+	 */
+	rel = heap_open(RelationRelationId, AccessShareLock);
+	rel_idx = heap_open(IndexRelationId, AccessShareLock);
+
 	ScanKeyInit(&key[0], Anum_pg_index_indrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel, IndexIndrelidIndexId, true, NULL, 1, key);
+	scan = systable_beginscan(rel_idx, IndexIndrelidIndexId, true, NULL, 1,
+							  key);
 
 	result = (IndexCatInfo *) palloc(relninds_max * sizeof(IndexCatInfo));
 	while ((tuple = systable_getnext(scan)) != NULL)
@@ -1155,14 +1175,20 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		}
 	}
 	systable_endscan(scan);
-	heap_close(rel, AccessShareLock);
+	heap_close(rel_idx, AccessShareLock);
 
 	/* Return if invalid index was found or ... */
 	if (*found_invalid)
+	{
+		heap_close(rel, AccessShareLock);
 		return result;
+	}
 	/* ... caller is not interested in anything else.  */
 	if (invalid_check_only)
+	{
+		heap_close(rel, AccessShareLock);
 		return result;
+	}
 
 	/*
 	 * Enforce sorting by OID, so that the entries match the result of the
@@ -1173,7 +1199,10 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	if (relninds)
 		*relninds = n;
 	if (n == 0)
+	{
+		heap_close(rel, AccessShareLock);
 		return result;
+	}
 
 	/*
 	 * Now retrieve the corresponding pg_class(xmax) values.
@@ -1187,8 +1216,6 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	get_typlenbyvalalign(OIDOID, &oidlen, &oidbyval, &oidalign);
 	oids_a = construct_array(oids_d, n, OIDOID, oidlen, oidbyval, oidalign);
 	pfree(oids_d);
-
-	rel = heap_open(RelationRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
 				F_OIDEQ, PointerGetDatum(oids_a));
