@@ -5,5 +5,7 @@ PGFILEDESC = "pg_squeeze - a tool to remove unused space from a relation."
 EXTENSION = pg_squeeze
 DATA = pg_squeeze--1.0.sql
 
+REGRESS = squeeze
+
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
