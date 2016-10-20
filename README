@@ -111,11 +111,11 @@ Additional columns can be specified optionally, for example:
 * "max_retry" is the maximum number of extra attempts to squeeze a table if
   the first processing of the corresponding task failed. Typical reason to
   retry the processing is that table definition got changed while the table
-  was being squeezed. (As we use "optimistic locking", such a definition
-  change causes the "squeezing transaction" to abort.) If the number of
-  retries is achieved, processing of the table is considered complete,
-  i.e. new task won't be created until the table gets ANALYZEd again. The
-  default value of "max_retry" is 0 (i.e. do not retry).
+  was being squeezed. If the number of retries is achieved, processing of the
+  table is considered complete. The next task is created as soon as time
+  specified by "task_interval" column of "squeeze.tables" table has elapsed.
+
+  The default value of "max_retry" is 0 (i.e. do not retry).
 
 * "clustering_index" is an existing index of the processed table. Once the
   processing is finished, tuples of the table will be physically sorted by
@@ -226,15 +226,19 @@ although the background worker does unregister non-existing tables
 periodically.
 
 
-Note on Concurrency
--------------------
+Notes on Concurrency
+--------------------
 
-Like [1], pg_squeeze holds exclusive table lock only for the (supposedly
-short) final stage of processing. The price user pays for it is that s/he
-can encounter MVCC-unsafe behavior described in [5].
+1. The extension does not prevent other transactions from altering table at
+certain stages of the processing. If a "disruptive command" (i.e. ALTER TABLE,
+VACUUM FULL, CLUSTER or TRUNCATE) manages to commit before the squeeze could
+finish, the squeeze_table() function aborts and all changes done to the table
+are rolled back. The "max_retry" column of "squeeze.tables" table determines
+how many times the squeeze worker will retry. Besides that, change of schedule
+might help you to avoid disruptions.
 
-Note that [1] has the same issue - see comments regarding AccessExclusiveLock
-in pg_squeeze.c.
+2. Like [1], pg_squeeze also changes visibility of rows and thus allows for
+MVCC-unsafe behavior described in the first paragraph of [5].
 
 
 References
