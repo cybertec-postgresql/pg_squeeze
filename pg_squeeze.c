@@ -125,10 +125,10 @@ int squeeze_max_xlock_time = 0;
 char *squeeze_worker_autostart = NULL;
 
 /*
- * OID of the role on behalf of which automatically-started worker connects to
+ * Role on behalf of which automatically-started worker connects to
  * database(s).
  */
-int squeeze_worker_role = 0;
+char *squeeze_worker_role = NULL;
 
 void
 _PG_init(void)
@@ -145,23 +145,18 @@ _PG_init(void)
 		"Comma-separated list for which squeeze worker starts as soon as "
 		"the cluster startup has completed.",
 		&squeeze_worker_autostart,
-		false,
+		NULL,
 		PGC_POSTMASTER,
 		0,
 		NULL, NULL, NULL);
 
-	DefineCustomIntVariable(
+	DefineCustomStringVariable(
 		"squeeze.worker_role",
-		"OID of role that background worker uses to connect to database.",
+		"Role that background worker uses to connect to database.",
 		"If background worker was launched automatically on cluster startup, "
 		"it uses this role to initiate database connection(s).",
 		&squeeze_worker_role,
-		/*
-		 * 1 would be more convenient as the minimum, but we need to preserve
-		 * the value 0 as boot value - that indicates that the parameter is
-		 * not set at all. (User has no reason to set 0 explicitly.)
-		 */
-		0, 0, INT_MAX,
+		NULL,
 		PGC_POSTMASTER,
 		0,
 		NULL, NULL, NULL);
@@ -179,34 +174,73 @@ _PG_init(void)
 
 	if (squeeze_worker_autostart)
 	{
-		BackgroundWorker worker;
-		Oid	role;
-		Datum	d;
-		oidvector	*oidvec;
-		int	i;
+		List	*dbnames = NIL;
+		char	*dbname, *c;
+		int	len;
+		ListCell	*lc;
 
-		if (squeeze_worker_role == 0)
+		if (squeeze_worker_role == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_ZERO_LENGTH_CHARACTER_STRING),
-					 (errmsg("\"squeeze.worker_role\" is invalid or not set"))));
+					 (errmsg("\"squeeze.worker_role\" parameter is invalid or not set"))));
 
-		role = (Oid) squeeze_worker_role;
-		d = DirectFunctionCall1(oidvectorin,
-								CStringGetDatum(squeeze_worker_autostart));
-
-		/*
-		 * oidvector is stored as varlena, use DatumGetByteaP() for
-		 * convenience.
-		 */
-		oidvec = (oidvector *) DatumGetByteaP(d);
-
-		/* Register the workers one after another. */
-		for (i = 0; i < oidvec->dim1; i++)
+		c = squeeze_worker_autostart;
+		len = 0;
+		dbname = NULL;
+		while (true)
 		{
+			bool done;
+
+			done = *c == '\0';
+			if (done || isspace(*c))
+			{
+				if (dbname != NULL)
+				{
+					/* The current item ends here. */
+					Assert(len > 0);
+					dbnames = lappend(dbnames, pnstrdup(dbname, len));
+					dbname = NULL;
+					len = 0;
+				}
+
+				if (done)
+					break;
+			}
+			else
+			{
+				/*
+				 * Start a new item or add the character to the current one.
+				 */
+				if (dbname == NULL)
+				{
+					dbname = c;
+					len = 1;
+				}
+				else
+					len++;
+			}
+
+			c++;
+		}
+
+		if (list_length(dbnames) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 (errmsg("\"squeeze.worker_autostart\" parameter is empty"))));
+
+		foreach(lc, dbnames)
+		{
+			WorkerConInit	*con;
+			BackgroundWorker worker;
+
+			dbname = lfirst(lc);
+			con = allocate_worker_con_info(dbname, squeeze_worker_role);
+
 			squeeze_initialize_bgworker(&worker, squeeze_worker_main,
-										oidvec->values[i], role, 0);
+										con, NULL, 0);
 			RegisterBackgroundWorker(&worker);
 		}
+		list_free_deep(dbnames);
 	}
 
 	DefineCustomIntVariable(

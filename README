@@ -170,27 +170,19 @@ seconds and the default value is 1 minute.
 If you want the background worker to start automatically during startup of the
 whole PostgreSQL cluster, add entries like this to postgresql.conf file
 
-	squeeze.worker_autostart = '16965 23238'
-	squeeze.worker_role = 50678
+	squeeze.worker_autostart = 'my_database your_database'
+	squeeze.worker_role = postgres
 
-Here, 16965 and 23238 stand for database OIDs that you can retrieve from
-pg_catalog.pg_database catalog. For example:
+Next time you start the cluster, one worker will be launched for "my_database"
+and one for "your_database". If you take this approach, note that any worker
+will either reject to start or will stop without doing any work if
 
-	SELECT oid FROM pg_catalog.pg_database WHERE datname='mydb';
+     1. The "pg_squeeze" extension does not exist in the database..
 
-Similarly, 50678 is role id that you get from pg_catalog.pg_authid catalog:
+     or
 
-	SELECT oid FROM pg_catalog.pg_authid WHERE rolname='postgres';
-
-Next time the cluster is started, one worker will be launched for
-"my_database" and one for "your_database". If you take this approach, note
-that any worker started this way will either reject to start or will stop
-without doing any work if
-
-     1. The "pg_squeeze" extension does not exist in the database it runs on.
-
-     2. squeeze.worker_role parameter is not set or it specifies role which
-     does not have the superuser privileges.
+     2. squeeze.worker_role parameter specifies role which does not have the
+     superuser privileges.
 
 
 Control the impact on other backends

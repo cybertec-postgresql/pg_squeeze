@@ -175,7 +175,40 @@ extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 									   struct timeval *must_complete);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
+/*
+ * Connection information the squeeze worker needs to connect to database if
+ * starting automatically. Strings are more convenient for admin than OIDs and
+ * we have no chance to lookup OIDs in the catalog when registering worker
+ * during postmaster startup. That's why we pass strings.
+ *
+ * The structure is allocated in TopMemoryContext during postmaster startup,
+ * so the worker should access it correctly if it receives pointer from the
+ * bgw_main_arg field of BackgroundWorker.
+ */
+typedef struct WorkerConInit
+{
+	char	*dbname;
+	char	*rolename;
+} WorkerConInit;
+
+/*
+ * The same for interactive start of the worker. In this case we can no longer
+ * add anything to the TopMemoryContext of postmaster, so
+ * BackgroundWorker.bgw_extra is the only way to pass the information. As we
+ * have OIDs at this stage, the structure is small enough to fit bgw_extra
+ * field of BackgroundWorker.
+ */
+typedef struct WorkerConInteractive
+{
+	Oid	dbid;
+	Oid	roleid;
+} WorkerConInteractive;
+
+extern WorkerConInit *allocate_worker_con_info(char *dbname,
+											   char *rolename);
 extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
-										bgworker_main_type bgw_main, Oid db,
-										Oid user, Oid notify_pid);
+										bgworker_main_type bgw_main,
+										WorkerConInit *con_init,
+										WorkerConInteractive *con_interactive,
+										Oid notify_pid);
 extern void squeeze_worker_main(Datum main_arg);

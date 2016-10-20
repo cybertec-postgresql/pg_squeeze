@@ -7,11 +7,13 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
+#include "utils/memutils.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 
@@ -29,6 +31,7 @@ PG_FUNCTION_INFO_V1(squeeze_start_worker);
 Datum
 squeeze_start_worker(PG_FUNCTION_ARGS)
 {
+	WorkerConInteractive	con;
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
@@ -43,11 +46,15 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to start squeeze worker"))));
 
-	squeeze_initialize_bgworker(&worker, NULL, MyDatabaseId, GetUserId(),
-								MyProcPid);
+	con.dbid = MyDatabaseId;
+	con.roleid = GetUserId();
+	squeeze_initialize_bgworker(&worker, NULL, NULL, &con, MyProcPid);
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
-		PG_RETURN_NULL();
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("could not register background process"),
+			   errhint("More details may be available in the server log.")));
 
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
 
@@ -66,12 +73,34 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pid);
 }
 
+/*
+ * Convenience routine to allocate the structure in TopMemoryContext. We need
+ * it to survive fork and initialization of the worker.
+ *
+ * (The allocation cannot be avoided as BackgroundWorker.bgw_extra does not
+ * provide enough space for us.)
+ */
+WorkerConInit *
+allocate_worker_con_info(char *dbname, char *rolename)
+{
+	WorkerConInit	*result;
+
+	result = (WorkerConInit *) MemoryContextAllocZero(TopMemoryContext,
+													  sizeof(WorkerConInit));
+	result->dbname = MemoryContextStrdup(TopMemoryContext, dbname);
+	result->rolename = MemoryContextStrdup(TopMemoryContext, rolename);
+	return result;
+}
+
+/* Initialize the worker and pass connection info in the appropriate form. */
 void
 squeeze_initialize_bgworker(BackgroundWorker *worker,
-							bgworker_main_type bgw_main, Oid db, Oid user,
+							bgworker_main_type bgw_main,
+							WorkerConInit *con_init,
+							WorkerConInteractive *con_interactive,
 							Oid notify_pid)
 {
-	char	*c;
+	char	*dbname;
 
 	worker->bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -80,14 +109,33 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 	worker->bgw_main = bgw_main;
 	sprintf(worker->bgw_library_name, "pg_squeeze");
 	sprintf(worker->bgw_function_name, "squeeze_worker_main");
-	snprintf(worker->bgw_name, BGW_MAXLEN, "squeeze worker %u", db);
-	worker->bgw_main_arg = (Datum) 0;
 
-	/* Store connection info. */
-	c = (char *) &worker->bgw_extra;
-	memcpy(c, &db, sizeof(Oid));
-	c += sizeof(Oid);
-	memcpy(c, &user, sizeof(Oid));
+	if (con_init != NULL)
+	{
+		worker->bgw_main_arg = (Datum) PointerGetDatum(con_init);
+		dbname = con_init->dbname;
+	}
+	else if (con_interactive != NULL)
+	{
+		worker->bgw_main_arg = (Datum) 0;
+
+		StaticAssertStmt(sizeof(WorkerConInteractive) <= BGW_EXTRALEN,
+						 "WorkerConInteractive is too big" );
+		memcpy(worker->bgw_extra, con_interactive,
+			   sizeof(WorkerConInteractive));
+
+		/*
+		 * Catalog lookup is possible during interactive start, so do it for
+		 * the sake of bgw_name. Comment of WorkerConInteractive structure
+		 * explains why we still must use the OID for worker registration.
+		 */
+		dbname = get_database_name(con_interactive->dbid);
+	}
+	else
+		elog(ERROR, "Connection info not available for squeeze worker.");
+
+	snprintf(worker->bgw_name, BGW_MAXLEN, "squeeze worker for database %s",
+			 dbname);
 
 	worker->bgw_notify_pid = notify_pid;
 }
@@ -98,8 +146,8 @@ static volatile sig_atomic_t got_sigterm = false;
 void
 squeeze_worker_main(Datum main_arg)
 {
-	Oid	database_id, user_id, extension_id;
-	char	*c;
+	Datum	arg;
+	Oid	extension_id;
 	LOCKTAG		tag;
 	LockAcquireResult	lock_res;
 	long	delay;
@@ -109,17 +157,27 @@ squeeze_worker_main(Datum main_arg)
 	pqsignal(SIGTERM, squeeze_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
 
-	/*
-	 * Retrieve connection info provided by the caller of
-	 * squeeze_start_worker().
-	 */
+	/* Retrieve connection info. */
 	Assert(MyBgworkerEntry != NULL);
-	c = MyBgworkerEntry->bgw_extra;
-	memcpy(&database_id, c, sizeof(Oid));
-	c += sizeof(Oid);
-	memcpy(&user_id, c, sizeof(Oid));
+	arg = MyBgworkerEntry->bgw_main_arg;
 
-	BackgroundWorkerInitializeConnectionByOid(database_id, user_id);
+	if (MyBgworkerEntry->bgw_main_arg != (Datum) 0)
+	{
+		WorkerConInit	*con;
+
+		con = (WorkerConInit *) DatumGetPointer(arg);
+		BackgroundWorkerInitializeConnection(con->dbname, con->rolename);
+	}
+	else
+	{
+		WorkerConInteractive	con;
+
+		/* Ensure aligned access. */
+		memcpy(&con, MyBgworkerEntry->bgw_extra,
+			   sizeof(WorkerConInteractive));
+
+		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid);
+	}
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -185,7 +243,8 @@ squeeze_worker_main(Datum main_arg)
 
 			run_command("SELECT squeeze.add_new_tasks()");
 			ntasks = get_task_count();
-			elog(DEBUG1, "pg_squeeze: %zd tasks added to queue", ntasks);
+			elog(DEBUG1, "pg_squeeze (dboid=%u): %zd tasks added to queue",
+				 MyDatabaseId, ntasks);
 		}
 
 		if (ntasks == 0)
