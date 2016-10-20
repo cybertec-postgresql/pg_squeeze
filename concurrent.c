@@ -170,15 +170,8 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
  * Apply changes that happened during the initial load.
  *
  * Scan key is passed by caller, so it does not have to be constructed
- * multiple times.
- *
- * Index list is passed explicitly as the relation cache entry is not supposed
- * to reflect changes of our transaction (unless we want to reload it, which
- * seems an overkill).
- *
- * For the same reason, ident_index is passed separate. (XXX The PoC does not
- * create constraints, so relation->rd_replidindex field would be empty
- * anyway. But this approach might change in the future.)
+ * multiple times. Key entries have all fields initialized, except for
+ * sk_argument.
  */
 static void
 apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
