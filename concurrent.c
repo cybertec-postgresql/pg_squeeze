@@ -621,8 +621,10 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 		flattened = true;
 	}
 
-	/* TODO elog(ERROR) if the tuple does not fit varlena. */
 	size = MAXALIGN(VARHDRSZ) + sizeof(ConcurrentChange) + tuple->t_len;
+	/* XXX Isn't there any function / macro to do this? */
+	if (size >= 0x3FFFFFFF)
+		elog(ERROR, "Change is too big.");
 
 	oldcontext = MemoryContextSwitchTo(ctx->context);
 	change_raw = (char *) palloc(size);
