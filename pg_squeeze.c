@@ -1248,7 +1248,6 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		IndexCatInfo	*res_item;
 		Form_pg_class	form_class;
 		char	*namestr;
-		Size	namelen;
 
 		if (i == n)
 		{
@@ -1260,8 +1259,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		res_item->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 		form_class = (Form_pg_class) GETSTRUCT(tuple);
 		namestr = NameStr(form_class->relname);
-		namelen = strlen(namestr);
-		Assert(namelen < NAMEDATALEN);
+		Assert(strlen(namestr) < NAMEDATALEN);
 		strcpy(NameStr(res_item->relname), namestr);
 
 		res_item->reltablespace = form_class->reltablespace;
