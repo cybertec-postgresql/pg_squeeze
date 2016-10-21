@@ -1,3 +1,12 @@
+/*-----------------------------------------------------
+ *
+ * pg_squeeze.c
+ *     A tool to eliminate table bloat.
+ *
+ * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ *
+ *-----------------------------------------------------
+ */
 #include "pg_squeeze.h"
 
 #include "access/multixact.h"

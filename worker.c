@@ -1,3 +1,12 @@
+/*---------------------------------------------------------
+ *
+ * worker.c
+ *     Background worker to call functions of pg_squeeze.c
+ *
+ * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ *
+ *---------------------------------------------------------
+ */
 #include "c.h"
 #include "postgres.h"
 #include "fmgr.h"

@@ -1,7 +1,13 @@
-/*
+/*-----------------------------------------------------------------------------------
+ *
  * concurrent.c
- *	  code to handle changes that took place while new table was being created
+ *	  Module to handle changes that took place while new table was being created
+ *
+ * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ *
+ *-----------------------------------------------------------------------------------
  */
+
 
 #include "pg_squeeze.h"
 

@@ -1,3 +1,12 @@
+/*-----------------------------------------------------
+ *
+ * pg_squeeze.h
+ *     A tool to eliminate table bloat.
+ *
+ * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ *
+ *-----------------------------------------------------
+ */
 #include "c.h"
 #include "postgres.h"
 #include "fmgr.h"
