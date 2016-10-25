@@ -647,11 +647,12 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * deadlock scenario: another transaction, performing index DDL
 	 * concurrenly (e.g. DROP INDEX CONCURRENTLY) committed change of
 	 * indisvalid, indisready, ... and called WaitForLockers() before we
-	 * unlocked both source table and its indexes above. Since our transaction
-	 * is still running, the other transaction keeps waiting, but holds
-	 * (non-exclusive) lock on both relation and index. In this situation we'd
-	 * cause deadlock by requesting exclusive lock. Fortunately we should
-	 * recognize this scenario by checking pg_index.
+	 * unlocked both source table and its indexes above. WaitForLockers()
+	 * waits till the end of the holding (our) transaction as opposed to the
+	 * end of our locks, and the other transaction holds (non-exclusive) lock
+	 * on both relation and index. In this situation we'd cause deadlock by
+	 * requesting exclusive lock. We should recognize this scenario by
+	 * checking pg_index alone.
 	 */
 	ind_info = get_index_info(relid_src, NULL, &invalid_index, true);
 	if (invalid_index)
