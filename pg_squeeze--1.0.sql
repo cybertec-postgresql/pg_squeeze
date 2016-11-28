@@ -335,15 +335,21 @@ AS $$
 
 	-- Create a new task for each table having more free space than
 	-- needed.
-	INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
-	SELECT	id, squeeze.is_autovacuum_enabled(i.class_id),
-		squeeze.is_autovacuum_enabled(i.class_id_toast)
-	FROM	squeeze.tables_internal i,
-		squeeze.tables t
+	UPDATE	squeeze.tables_internal i
+	SET	last_task_created = now()
+	FROM	squeeze.tables t
 	WHERE	i.class_id NOTNULL AND t.id = i.table_id AND i.free_space >
 		((100 - squeeze.get_heap_fillfactor(i.class_id)) + t.free_space_extra)
 		AND
 		pg_catalog.pg_relation_size(i.class_id, 'main') > t.min_size * 1048576;
+
+	-- now() is supposed to return the same value as it did in the previous
+	-- query.
+	INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
+	SELECT	table_id, squeeze.is_autovacuum_enabled(i.class_id),
+		squeeze.is_autovacuum_enabled(i.class_id_toast)
+	FROM	squeeze.tables_internal i
+	WHERE	i.last_task_created = now();
 $$;
 
 -- Mark the next task as active.
