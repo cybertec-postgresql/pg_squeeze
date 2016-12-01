@@ -64,28 +64,21 @@ they were created.
 
 The simplest "registration" looks like
 
-	INSERT INTO squeeze.tables
-	(tabschema, tabname, first_check)
-	VALUES
-	('public', 'foo', now());
-
-* "tabschema" and "tabname" are schema and table name respectively.
-
-* "first_check" column determines time of the earliest check of statistics,
-  which can possibly result in a new task creation.
+	INSERT INTO squeeze.tables (tabschema, tabname, schedule)
+	VALUES ('public', 'foo', '{22:30, 03:00}');
 
 Additional columns can be specified optionally, for example:
 
 	INSERT INTO squeeze.tables
-	(tabschema, tabname, first_check, task_interval, squeeze_scale_factor,
-	vacuum_max_age, max_retry)
-	VALUES
-	('public', 'bar', now(), '1 day', 0.9, '2 hours', 2);
+	(tabschema, tabname, schedule, vacuum_max_age, max_retry)
+	VALUES ('public', 'bar', '{22:30, 03:00}', '2 hours', 2);
 
-* "task_interval" is the minimum time between creation of two subsequent tasks
-  for given table. Note that ANALYZE (whether manually or by "autovacuum
-  worker" process) must have been executed since the previous task had
-  completed. The default value is 1 hour.
+Following is the complete description of table metadata.
+
+* "tabschema" and "tabname" are schema and table name respectively.
+
+* "schedule" column tells at which times of the day the table should be
+  checked. Such a check can possibly result in a new processing task.
 
 * "free_space_extra" is the minimum percentage of "extra free space" needed to
   trigger processing of the table. The "extra" adjective refers to the fact

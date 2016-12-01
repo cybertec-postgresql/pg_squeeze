@@ -1,4 +1,4 @@
-/* pg_squeeze--1.0.sql */
+/* pg_squeeze--1.1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_squeeze" to load this file. \quit
@@ -19,16 +19,8 @@ CREATE TABLE tables (
 	-- consist of 2 columns: index name and target tablespace.
 	ind_tablespaces	name[][],
 
-	-- The minimum time that needs to elapse after task creation before we
-	-- check again if the table is eligible for squeeze. (User might
-	-- prefer squeezing the table at defined time rather than taking an
-	-- immediate action to address excessive bloat.)
-	task_interval	interval	NOT NULL	DEFAULT '1 hour',
-	CHECK (task_interval >= '1 minute'),
-
-	-- The first check ever. Can be used when rescheduling processing of
-	-- particular table.
-	first_check	timestamptz	NOT NULL,
+	-- Times to check whether a new task should be created for the table.
+	schedule	timetz[]	NOT NULL,
 
 	-- The minimum percentage of free space that triggers processing, in
 	-- addition to the percentage determined by fillfactor.
@@ -71,10 +63,8 @@ COMMENT ON COLUMN tables.rel_tablespace IS
 	'Tablespace into which the registered table should be moved.';
 COMMENT ON COLUMN tables.ind_tablespaces IS
 	'Index-to-tablespace mappings to be applied.';
-COMMENT ON COLUMN tables.task_interval IS
-	'The minimum time between 2 subsequent processings.';
-COMMENT ON COLUMN tables.first_check IS
-	'The earliest possible schedule to process this table.';
+COMMENT ON COLUMN tables.schedule IS
+	'Array of scheduled times to check and possibly process the table.';
 COMMENT ON COLUMN tables.free_space_extra IS
 	'In addition to free space derived from fillfactor, this extra '
 	 'percentage of free space is needed to schedule processing of the '
@@ -108,17 +98,10 @@ CREATE TABLE tables_internal (
 	-- since these are eliminated by squeeze_table() function.
 	free_space	double precision,
 
-	-- If at least task_interval elapsed since the last task creation and
-        -- there's no task for the table in the queue, consider adding a new
-	-- one.
-	--
-	-- We could apply task_interval to last_task_finished instead, but
-	-- that would add the task duration as an extra delay to the next
-	-- schedule, making the schedule less predictable. (Of course the
-	-- schedule is shifted anyway if the task processing takes more than
-	-- task_interval.)
+	-- When was the most recent task created?
 	last_task_created	timestamptz,
 
+	-- When was the most recent task finished?
 	last_task_finished	timestamptz
 );
 
@@ -286,12 +269,18 @@ AS $$
 		i.table_id = t.id AND
 		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
 		c.relname = t.tabname AND
-		t.first_check <= now() AND
-		-- Checked too far in the past or never at all?
-		(
-			i.last_task_created + t.task_interval < now()
-			OR
-			i.last_task_created IS NULL
+		-- Is there a matching schedule?
+		EXISTS (
+		       SELECT	u.s
+		       FROM	squeeze.tables t_sub,
+		       		UNNEST(t_sub.schedule) u(s)
+		       WHERE	t_sub.id = t.id AND
+		       		-- The schedule must have passed ...
+		       		u.s <= now()::timetz AND
+				-- ... and it should be one for which no
+				-- task was created yet.
+				(u.s > i.last_task_created::timetz OR
+				i.last_task_created ISNULL)
 		)
 		-- Ignore tables for which a task currently exists.
 		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks);
@@ -335,15 +324,21 @@ AS $$
 
 	-- Create a new task for each table having more free space than
 	-- needed.
-	INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
-	SELECT	id, squeeze.is_autovacuum_enabled(i.class_id),
-		squeeze.is_autovacuum_enabled(i.class_id_toast)
-	FROM	squeeze.tables_internal i,
-		squeeze.tables t
+	UPDATE	squeeze.tables_internal i
+	SET	last_task_created = now()
+	FROM	squeeze.tables t
 	WHERE	i.class_id NOTNULL AND t.id = i.table_id AND i.free_space >
 		((100 - squeeze.get_heap_fillfactor(i.class_id)) + t.free_space_extra)
 		AND
 		pg_catalog.pg_relation_size(i.class_id, 'main') > t.min_size * 1048576;
+
+	-- now() is supposed to return the same value as it did in the previous
+	-- query.
+	INSERT INTO squeeze.tasks(table_id, autovac, autovac_toast)
+	SELECT	table_id, squeeze.is_autovacuum_enabled(i.class_id),
+		squeeze.is_autovacuum_enabled(i.class_id_toast)
+	FROM	squeeze.tables_internal i
+	WHERE	i.last_task_created = now();
 $$;
 
 -- Mark the next task as active.
