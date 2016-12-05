@@ -77,10 +77,10 @@ The simplest "registration" looks like
 Additional columns can be specified optionally, for example:
 
 	INSERT INTO squeeze.tables
-	(tabschema, tabname, first_check, task_interval, squeeze_scale_factor,
+	(tabschema, tabname, first_check, task_interval, free_space_extra,
 	vacuum_max_age, max_retry)
 	VALUES
-	('public', 'bar', now(), '1 day', 0.9, '2 hours', 2);
+	('public', 'bar', now(), '1 day', 30, '2 hours', 2);
 
 * "task_interval" is the minimum time between creation of two subsequent tasks
   for given table. Note that ANALYZE (whether manually or by "autovacuum
@@ -94,8 +94,9 @@ Additional columns can be specified optionally, for example:
 
   For example, if "fillfactor" is equal to 60, then at least 40 percent of
   each page should stay free during normal operation. If you want to ensure
-  that 70 percent of free space makes pg_squeeze interested in the tabe, set
-  "free_space_extra" to 30.
+  that 70 percent of free space makes pg_squeeze interested in the table, set
+  "free_space_extra" to 30 (that is 70 percent required to be free minus the
+  40 percent free due to the "fillfactor").
 
   Default value of "free_space_extra" is 50.
 
