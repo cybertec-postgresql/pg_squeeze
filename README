@@ -70,8 +70,9 @@ The simplest "registration" looks like
 Additional columns can be specified optionally, for example:
 
 	INSERT INTO squeeze.tables
-	(tabschema, tabname, schedule, vacuum_max_age, max_retry)
-	VALUES ('public', 'bar', '{22:30, 03:00}', '2 hours', 2);
+	(tabschema, tabname, schedule, free_space_extra, vacuum_max_age,
+	max_retry)
+	VALUES ('public', 'bar', '{22:30, 03:00}', 30, '2 hours', 2);
 
 Following is the complete description of table metadata.
 
@@ -87,8 +88,9 @@ Following is the complete description of table metadata.
 
   For example, if "fillfactor" is equal to 60, then at least 40 percent of
   each page should stay free during normal operation. If you want to ensure
-  that 70 percent of free space makes pg_squeeze interested in the tabe, set
-  "free_space_extra" to 30.
+  that 70 percent of free space makes pg_squeeze interested in the table, set
+  "free_space_extra" to 30 (that is 70 percent required to be free minus the
+  40 percent free due to the "fillfactor").
 
   Default value of "free_space_extra" is 50.
 
