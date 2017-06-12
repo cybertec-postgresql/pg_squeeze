@@ -890,8 +890,21 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	 * Neither prepare_write nor do_write callback is useful for us: we don't
 	 * release the slot until done, to prevent anyone from "stealing" changes
 	 * from us. Thus no one can use the SQL interface on our slot.
+	 *
+	 * On the preprocessor conditional: although this is not common practice,
+	 * signature of a public function changed between PG 9.6.2 and 9.6.3, see
+	 *
+https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=28afff347a5db51a02b269fa13677d6924a88e78
+	 *
+	 * Regarding the value of need_full_snapshot, we pass FALSE because the
+	 * table being squeezed is temporarily marked as catalog table (unlike the
+	 * logical replication which needs a snapshot usable for non-catalog
+	 * tables too).
 	 */
 	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME, NIL,
+#if PG_VERSION_NUM >= 90603
+									false,
+#endif
 									logical_read_local_xlog_page,
 									NULL, NULL);
 	DecodingContextFindStartpoint(ctx);
