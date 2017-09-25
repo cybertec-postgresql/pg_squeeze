@@ -245,8 +245,7 @@ _PG_init(void)
 			dbname = lfirst(lc);
 			con = allocate_worker_con_info(dbname, squeeze_worker_role);
 
-			squeeze_initialize_bgworker(&worker, squeeze_worker_main,
-										con, NULL, 0);
+			squeeze_initialize_bgworker(&worker, con, NULL, 0);
 			RegisterBackgroundWorker(&worker);
 		}
 		list_free_deep(dbnames);
@@ -887,14 +886,8 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL);
 
 	/*
-	 * Neither prepare_write nor do_write callback is useful for us: we don't
-	 * release the slot until done, to prevent anyone from "stealing" changes
-	 * from us. Thus no one can use the SQL interface on our slot.
-	 *
-	 * On the preprocessor conditional: although this is not common practice,
-	 * signature of a public function changed between PG 9.6.2 and 9.6.3, see
-	 *
-https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=28afff347a5db51a02b269fa13677d6924a88e78
+	 * Neither prepare_write nor do_write callback nor update_progress is
+	 * useful for us.
 	 *
 	 * Regarding the value of need_full_snapshot, we pass FALSE because the
 	 * table being squeezed is temporarily marked as catalog table (unlike the
@@ -902,11 +895,9 @@ https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=28afff347a5db51a0
 	 * tables too).
 	 */
 	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME, NIL,
-#if PG_VERSION_NUM >= 90603
 									false,
-#endif
 									logical_read_local_xlog_page,
-									NULL, NULL);
+									NULL, NULL, NULL);
 	DecodingContextFindStartpoint(ctx);
 
 	/*
@@ -1782,7 +1773,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 	while (true)
 	{
-		HeapTuple	tup_in;
+		HeapTuple	tup_in = NULL;
 		int	i;
 		Size	data_size;
 
@@ -1874,13 +1865,11 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		while (true)
 		{
 			HeapTuple	tup_out;
-			bool	should_free = false;;
 
 			CHECK_FOR_INTERRUPTS();
 
 			if (use_sort)
-				tup_out = tuplesort_getheaptuple(tuplesort, true,
-												 &should_free);
+				tup_out = tuplesort_getheaptuple(tuplesort, true);
 			else
 			{
 				if (i == batch_size)
@@ -1894,10 +1883,13 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0,
 						bistate);
-			if (!use_sort || should_free)
+			if (!use_sort)
 				pfree(tup_out);
 		}
 
+		/*
+		 * Reached the end of scan when retrieving data from heap or index?
+		 */
 		if (tup_in == NULL)
 			break;
 
@@ -2542,12 +2534,11 @@ swap_relation_files(Oid r1, Oid r2)
 	 */
 	relform1->relallvisible = 0;
 
-	simple_heap_update(relRelation, &reltup1->t_self, reltup1);
-	simple_heap_update(relRelation, &reltup2->t_self, reltup2);
-
 	indstate = CatalogOpenIndexes(relRelation);
-	CatalogIndexInsert(indstate, reltup1);
-	CatalogIndexInsert(indstate, reltup2);
+	CatalogTupleUpdateWithInfo(relRelation, &reltup1->t_self, reltup1,
+							   indstate);
+	CatalogTupleUpdateWithInfo(relRelation, &reltup2->t_self, reltup2,
+							   indstate);
 	CatalogCloseIndexes(indstate);
 
 	InvokeObjectPostAlterHookArg(RelationRelationId, r1, 0,
@@ -2797,12 +2788,13 @@ update_reloptions(Oid relid, bool user_cat, bool autovac)
 	changes_set = NIL;
 	if (user_cat)
 	{
-		def = makeDefElem("user_catalog_table", (Node *) makeString("true"));
+		def = makeDefElem("user_catalog_table", (Node *) makeString("true"),
+						  -1);
 		changes_set = lappend(changes_set, def);
 	}
 	else
 	{
-		def = makeDefElem("user_catalog_table", NULL);
+		def = makeDefElem("user_catalog_table", NULL, -1);
 		changes_reset = lappend(changes_reset, def);
 	}
 
@@ -2812,12 +2804,13 @@ update_reloptions(Oid relid, bool user_cat, bool autovac)
 	 */
 	if (!autovac)
 	{
-		def = makeDefElem("autovacuum_enabled", (Node *) makeString("false"));
+		def = makeDefElem("autovacuum_enabled", (Node *) makeString("false"),
+			-1);
 		changes_set = lappend(changes_set, def);
 	}
 	else
 	{
-		def = makeDefElem("autovacuum_enabled", NULL);
+		def = makeDefElem("autovacuum_enabled", NULL, -1);
 		changes_reset = lappend(changes_reset, def);
 	}
 
@@ -2844,8 +2837,7 @@ update_reloptions(Oid relid, bool user_cat, bool autovac)
 	/* Store the change. */
 	tuple_new = heap_modify_tuple(tuple, desc, repl_vals, repl_nulls,
 								  do_repl);
-	simple_heap_update(rel, &tuple_new->t_self, tuple_new);
-	CatalogUpdateIndexes(rel, tuple_new);
+	CatalogTupleUpdate(rel, &tuple_new->t_self, tuple_new);
 
 	/* Cleanup. */
 	ReleaseSysCache(tuple);
