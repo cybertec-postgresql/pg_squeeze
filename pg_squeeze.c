@@ -536,13 +536,13 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * Note: By still holding the share lock we only ensure that the source
 	 * relation is not altered underneath index build, but we'll have to
 	 * release the lock for a short time at some point. So while we can't
-	 * prevent anyone from forcing us to cancel our work,such cancellation
+	 * prevent anyone from forcing us to cancel our work, such cancellation
 	 * must happen at well-defined moment.
 	 */
 	check_catalog_changes(cat_state, AccessShareLock);
 
 	/*
-	 * Make sure the contents of the transient table contents if visible for
+	 * Make sure the contents of the transient table contents is visible for
 	 * the scan(s) during index build.
 	 */
 	CommandCounterIncrement();
