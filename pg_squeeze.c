@@ -1695,6 +1695,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 {
 	bool	use_sort;
 	int	batch_size, batch_max_size;
+	Size	tuple_array_size;
+	bool	tuple_array_can_expand = true;
 	Tuplesortstate *tuplesort = NULL;
 	Relation	cluster_idx = NULL;
 	HeapScanDesc	heap_scan = NULL;
@@ -1765,9 +1767,18 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 											cluster_idx, maintenance_work_mem,
 											false);
 
-	batch_max_size = 1024;
+	/*
+	 * If tuplesort is not applicable, we store as much data as we can into
+	 * memory. The more memory is available, the fewer iterations.
+	 */
 	if (!use_sort)
-		tuples = (HeapTuple *) palloc(batch_max_size * sizeof(HeapTuple));
+	{
+		batch_max_size = 1024;
+		tuple_array_size = batch_max_size * sizeof(HeapTuple);
+		/* The minimum value of maintenance_work_mem is 1024 kB. */
+		Assert(tuple_array_size / 1024 < maintenance_work_mem);
+		tuples = (HeapTuple *) palloc(tuple_array_size);
+	}
 
 	/* Expect many insertions. */
 	bistate = GetBulkInsertState();
@@ -1786,64 +1797,138 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	{
 		HeapTuple	tup_in = NULL;
 		int	i;
-		Size	data_size;
-
-		if (!use_sort)
-			data_size = 0;
+		Size	data_size = 0;
 
 		/* Sorting cannot be split into batches. */
-		for (i = 0; use_sort || (data_size / 1024) < maintenance_work_mem;
-			 i++)
+		for (i = 0;; i++)
 		{
+			bool	flattened = false;
+
+			/*
+			 * While tuplesort is responsible for not exceeding
+			 * maintenance_work_mem itself, we must check if the tuple array
+			 * does.
+			 *
+			 * Since the tuple cannot be put back to the scan, it'd be make
+			 * things tricky if we involved the current tuple in the
+			 * computation. Since the unit of maintenance_work_mem is kB, one
+			 * extra tuple shouldn't hurt too much.
+			 */
+			if (!use_sort && ((data_size + tuple_array_size) / 1024)
+				>= maintenance_work_mem)
+			{
+				/*
+				 * data_size should still be zero if tup_in is the first item
+				 * of the current batch and the array itself should never
+				 * exceed maintenance_work_mem. XXX If the condition above is
+				 * changed to include the current tuple (i.e. we put the
+				 * current tuple aside for the next batch), make sure the
+				 * first tuple of a batch is inserted regardless its size. We
+				 * cannot shrink the array in favor of actual data in generic
+				 * case (i.e. tuple size can in general be bigger than
+				 * maintenance_work_mem).
+				 */
+				Assert(i > 0);
+
+				break;
+			}
+
 			tup_in = use_sort || cluster_idx == NULL ?
 				heap_getnext(heap_scan, ForwardScanDirection) :
 				index_getnext(index_scan, ForwardScanDirection);
 
-			if (tup_in != NULL)
+			/*
+			 * Ran out of input data?
+			 */
+			if (tup_in == NULL)
+				break;
+
+			/*
+			 * Even though special snapshot is used to retrieve values from
+			 * TOAST relation (see toast_fetch_datum), we'd better flatten the
+			 * tuple and thus retrieve the TOAST while the historic snapshot
+			 * is active. One particular reason is that tuptoaster.c does
+			 * access catalog.
+			 */
+			if (HeapTupleHasExternal(tup_in))
 			{
-				bool	flattened = false;
+				tup_in = toast_flatten_tuple(tup_in,
+											 RelationGetDescr(rel_src));
+				flattened = true;
+			}
 
-				/*
-				 * Even though special snapshot is used to retrieve values
-				 * from TOAST relation (see toast_fetch_datum), we'd better
-				 * flatten the tuple and thus retrieve the TOAST while the
-				 * historic snapshot is active. One particular reason is that
-				 * tuptoaster.c does access catalog.
-				 */
-				if (HeapTupleHasExternal(tup_in))
-				{
-					tup_in = toast_flatten_tuple(tup_in,
-												 RelationGetDescr(rel_src));
-					flattened = true;
-				}
-
-				if (use_sort)
-				{
-					tuplesort_putheaptuple(tuplesort, tup_in);
-					/* tuplesort should have copied the tuple. */
-					if (flattened)
-						pfree(tup_in);
-				}
-				else
-				{
-					CHECK_FOR_INTERRUPTS();
-
-					if (i == batch_max_size)
-					{
-						batch_max_size *= 2;
-
-						tuples = (HeapTuple *)
-							repalloc(tuples,
-									 batch_max_size * sizeof(HeapTuple));
-					}
-					if (!flattened)
-						tup_in = heap_copytuple(tup_in);
-					tuples[i] = tup_in;
-					data_size += HEAPTUPLESIZE + tup_in->t_len;
-				}
+			if (use_sort)
+			{
+				tuplesort_putheaptuple(tuplesort, tup_in);
+				/* tuplesort should have copied the tuple. */
+				if (flattened)
+					pfree(tup_in);
 			}
 			else
-				break;
+			{
+				CHECK_FOR_INTERRUPTS();
+
+				/*
+				 * Check for a free slot early enough so that the current
+				 * tuple can be stored even if the array cannot be
+				 * reallocated. Do not try again and again if the tuple array
+				 * reached the maximum value.
+				 */
+				if (i == (batch_max_size - 1) && tuple_array_can_expand)
+				{
+					int batch_max_size_new;
+					Size	tuple_array_size_new;
+
+					batch_max_size_new = 2 * batch_max_size;
+					tuple_array_size_new = batch_max_size_new *
+						sizeof(HeapTuple);
+
+					/*
+					 * Besides being of valid size, the new array should allow
+					 * for storing some data w/o exceeding
+					 * maintenance_work_mem. XXX Consider tuning the portion
+					 * of maintenance_work_mem that the array can use.
+					 */
+					if (!AllocSizeIsValid(tuple_array_size_new) ||
+						tuple_array_size_new / 1024 >=
+						maintenance_work_mem / 16)
+						tuple_array_can_expand = false;
+
+					/*
+					 * Only expand the array if the current iteration does not
+					 * violate maintenance_work_mem.
+					 */
+					if (tuple_array_can_expand)
+					{
+						tuples = (HeapTuple *)
+							repalloc(tuples, tuple_array_size_new);
+
+						batch_max_size = batch_max_size_new;
+						tuple_array_size = tuple_array_size_new;
+					}
+				}
+
+				if (!flattened)
+					tup_in = heap_copytuple(tup_in);
+
+				/*
+				 * Store the tuple and account for its size.
+				 */
+				tuples[i] = tup_in;
+				data_size += HEAPTUPLESIZE + tup_in->t_len;
+
+				/*
+				 * If the tuple array could not be expanded, stop reading
+				 * for the current batch.
+				 */
+				if (i == (batch_max_size - 1))
+				{
+					/* The current tuple belongs to the current batch. */
+					i++;
+
+					break;
+				}
+			}
 		}
 
 		/*
