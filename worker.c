@@ -57,7 +57,7 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
 
 	con.dbid = MyDatabaseId;
 	con.roleid = GetUserId();
-	squeeze_initialize_bgworker(&worker, NULL, NULL, &con, MyProcPid);
+	squeeze_initialize_bgworker(&worker, NULL, &con, MyProcPid);
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		ereport(ERROR,
@@ -104,7 +104,6 @@ allocate_worker_con_info(char *dbname, char *rolename)
 /* Initialize the worker and pass connection info in the appropriate form. */
 void
 squeeze_initialize_bgworker(BackgroundWorker *worker,
-							bgworker_main_type bgw_main,
 							WorkerConInit *con_init,
 							WorkerConInteractive *con_interactive,
 							Oid notify_pid)
@@ -115,7 +114,6 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker->bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker->bgw_restart_time = BGW_NEVER_RESTART;
-	worker->bgw_main = bgw_main;
 	sprintf(worker->bgw_library_name, "pg_squeeze");
 	sprintf(worker->bgw_function_name, "squeeze_worker_main");
 
@@ -226,7 +224,8 @@ squeeze_worker_main(Datum main_arg)
 		int	rc;
 
 		rc = WaitLatch(MyLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay);
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
+					   PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 
 		if (rc & WL_POSTMASTER_DEATH)

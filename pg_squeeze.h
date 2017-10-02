@@ -7,6 +7,8 @@
  *
  *-----------------------------------------------------
  */
+#include <sys/time.h>
+
 #include "c.h"
 #include "postgres.h"
 #include "fmgr.h"
@@ -216,7 +218,6 @@ typedef struct WorkerConInteractive
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
 											   char *rolename);
 extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
-										bgworker_main_type bgw_main,
 										WorkerConInit *con_init,
 										WorkerConInteractive *con_interactive,
 										Oid notify_pid);

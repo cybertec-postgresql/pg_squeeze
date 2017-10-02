@@ -418,7 +418,7 @@ get_index_insert_state(Relation	relation, Oid ident_index_id)
 	result->econtext = GetPerTupleExprContext(estate);
 
 	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
-	InitResultRelInfo(result->rri, relation,  0, 0);
+	InitResultRelInfo(result->rri, relation,  0, 0, 0);
 	ExecOpenIndices(result->rri, false);
 
 	/*
