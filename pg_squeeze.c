@@ -1702,6 +1702,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	HeapTuple	*tuples = NULL;
 	ResourceOwner	res_owner_old, res_owner_plan;
 	BulkInsertState bistate;
+	MemoryContext	load_cxt, old_cxt;
 
 	/*
 	 * The initial load starts by fetching data from the source table and
@@ -1771,6 +1772,16 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	/* Expect many insertions. */
 	bistate = GetBulkInsertState();
 
+	/*
+	 * There processing can take many iterations. In case any data
+	 * manipulation below leaked, try defend against out-of-memory
+	 * conditions. by using a separate memory context.
+	 */
+	load_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									 "pg_squeeze initial load cxt",
+									 ALLOCSET_DEFAULT_SIZES);
+	old_cxt = MemoryContextSwitchTo(load_cxt);
+
 	while (true)
 	{
 		HeapTuple	tup_in = NULL;
@@ -1820,6 +1831,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 					if (i == batch_max_size)
 					{
 						batch_max_size *= 2;
+
 						tuples = (HeapTuple *)
 							repalloc(tuples,
 									 batch_max_size * sizeof(HeapTuple));
@@ -1894,6 +1906,11 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			break;
 
 		switch_snapshot(snap_hist);
+
+		/*
+		 * Free possibly-leaked memory.
+		 */
+		MemoryContextReset(load_cxt);
 	}
 	/*
 	 * At whichever stage the loop broke, the historic snapshot should no
@@ -1919,6 +1936,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	 */
 	if (cluster_idx != NULL)
 		relation_close(cluster_idx, AccessShareLock);
+
+	MemoryContextSwitchTo(old_cxt);
+	MemoryContextDelete(load_cxt);
 }
 
 
