@@ -1,3 +1,4 @@
+PG_CONFIG ?= pg_config
 MODULE_big = pg_squeeze
 OBJS = pg_squeeze.o concurrent.o worker.o pgstatapprox.o $(WIN32RES)
 PGFILEDESC = "pg_squeeze - a tool to remove unused space from a relation."
