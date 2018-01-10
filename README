@@ -254,3 +254,11 @@ References
 [4] https://www.postgresql.org/docs/9.6/static/logicaldecoding.html
 
 [5] https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html
+
+
+Authors
+-------
+
+The extension was developed by Cybertec Schönig & Schönig GmbH
+(https://www.cybertec-postgresql.com). Please use this page to report issues:
+https://github.com/cybertec-postgresql/pg_squeeze/issues
