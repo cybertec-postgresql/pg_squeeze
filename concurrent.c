@@ -16,7 +16,6 @@
 #include "utils/rel.h"
 
 static bool decode_concurrent_changes(LogicalDecodingContext *ctx,
-									  XLogRecPtr *startptr,
 									  XLogRecPtr end_of_wal,
 									  struct timeval *must_complete);
 static void apply_concurrent_changes(DecodingOutputState *dstate,
@@ -49,7 +48,7 @@ static HeapTuple get_changed_tuple(ConcurrentChange *change);
  */
 bool
 process_concurrent_changes(LogicalDecodingContext *ctx,
-						   XLogRecPtr *startptr, XLogRecPtr end_of_wal,
+						   XLogRecPtr end_of_wal,
 						   CatalogState	*cat_state,
 						   Relation rel_dst, ScanKey ident_key,
 						   int ident_key_nentries, IndexInsertState *iistate,
@@ -64,8 +63,7 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		done = decode_concurrent_changes(ctx, startptr, end_of_wal,
-										 must_complete);
+		done = decode_concurrent_changes(ctx, end_of_wal, must_complete);
 
 		if (processing_time_elapsed(must_complete))
 			/* Caller is responsible for applying the changes. */
@@ -90,14 +88,13 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 }
 
 /*
- * Decode logical changes from the XLOG sequence specified by *starptr and
- * end_of_wal.
+ * Decode logical changes from the XLOG sequence up to end_of_wal.
  *
- * Returns true iff done (for now), i.e. no changes within given limits can be
- * decoded.
+ * Returns true iff done (for now), i.e. no more changes below the end_of_wal
+ * can be decoded.
  */
 static bool
-decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
+decode_concurrent_changes(LogicalDecodingContext *ctx,
 						  XLogRecPtr end_of_wal,
 						  struct timeval *must_complete)
 {
@@ -126,19 +123,20 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 	{
 		maintenance_wm_bytes = (Size) maintenance_work_mem * 1024L;
 
-		while (((*startptr != InvalidXLogRecPtr && *startptr < end_of_wal) ||
-				(ctx->reader->EndRecPtr != InvalidXLogRecPtr &&
-				 ctx->reader->EndRecPtr < end_of_wal)) &&
+		while (ctx->reader->EndRecPtr < end_of_wal &&
 			   dstate->data_size < maintenance_wm_bytes)
 		{
 			XLogRecord *record;
 			char	   *errm = NULL;
 
-			record = XLogReadRecord(ctx->reader, *startptr, &errm);
+			/*
+			 * setup_decoding() must have read some XLOG records by now.
+			 */
+			Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
+
+			record = XLogReadRecord(ctx->reader, InvalidXLogRecPtr, &errm);
 			if (errm)
 				elog(ERROR, "%s", errm);
-
-			*startptr = InvalidXLogRecPtr;
 
 			if (record != NULL)
 				LogicalDecodingProcessRecord(ctx, ctx->reader);
@@ -164,12 +162,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx, XLogRecPtr *startptr,
 
 	elog(DEBUG1, "Decoded %.0f changes.", dstate->nchanges);
 
-	/*
-	 * The check for InvalidXLogRecPtr covers the (probably impossible) case
-	 * that *startptr is initially equal to end_of_val.
-	 */
-	return ctx->reader->EndRecPtr == InvalidXLogRecPtr ||
-		ctx->reader->EndRecPtr >= end_of_wal;
+	return ctx->reader->EndRecPtr >= end_of_wal;
 }
 
 /*
@@ -531,6 +524,12 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	DecodingOutputState	*dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	/*
+	 * Are we interested in any changes at the moment?
+	 */
+	if (!dstate->capture)
+		return;
 
 	/* Only interested in one particular relation. */
 	if (relation->rd_id != dstate->relid)

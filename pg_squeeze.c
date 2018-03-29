@@ -106,8 +106,7 @@ static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 								int ident_key_nentries,
 								IndexInsertState *iistate,
 								CatalogState *cat_state,
-								LogicalDecodingContext *ctx,
-								XLogRecPtr	*startptr);
+								LogicalDecodingContext *ctx);
 static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
@@ -294,7 +293,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	Snapshot	snap_hist;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
-	XLogRecPtr	end_of_wal, startptr;
+	XLogRecPtr	end_of_wal;
 	XLogRecPtr	xlog_insert_ptr;
 	int	nindexes;
 	Oid	*indexes_src = NULL, *indexes_dst = NULL;
@@ -304,6 +303,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	ObjectAddress	object;
 	bool	autovac;
 	bool	source_finalized;
+	DecodingOutputState	*dstate;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -626,18 +626,30 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * need to be decoded for sure.
 	 */
 	end_of_wal = GetFlushRecPtr();
-	startptr = MyReplicationSlot->data.restart_lsn;
+
+	/*
+	 * reorderbuffer.c could have called our change callback if some
+	 * transaction(s) started late enough to be decoded, and committed before
+	 * the snapshot builder reached the SNAPBUILD_CONSISTENT state. The effect
+	 * of such transactions must have been noticed by perform_initial_load(),
+	 * so our output plugin had to ignore them. However the following changes
+	 * must be captured.
+	 */
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+	Assert(!dstate->capture);
+	dstate->capture = true;
 
 	/*
 	 * Decode and apply the data changes that occurred while the initial load
-	 * was in progress.
+	 * was in progress. The XLOG reader should continue where setup_decoding()
+	 * has left it.
 	 *
 	 * Even if the amount of concurrent changes of our source table might not
 	 * be significant, both initial load and index build could have produced
 	 * many XLOG records that we need to read. Do so before requesting
 	 * exclusive lock on the source relation.
 	 */
-	process_concurrent_changes(ctx, &startptr, end_of_wal, cat_state, rel_dst,
+	process_concurrent_changes(ctx, end_of_wal, cat_state, rel_dst,
 							   ident_key, ident_key_nentries, iistate,
 							   NoLock, NULL);
 
@@ -674,7 +686,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	{
 		if (perform_final_merge(relid_src, indexes_src, nindexes,
 								rel_dst, ident_key, ident_key_nentries,
-								iistate, cat_state, ctx, &startptr))
+								iistate, cat_state, ctx))
 		{
 			source_finalized = true;
 			break;
@@ -2421,7 +2433,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 					Relation rel_dst, ScanKey ident_key,
 					int ident_key_nentries, IndexInsertState *iistate,
 					CatalogState *cat_state,
-					LogicalDecodingContext *ctx, XLogRecPtr	*startptr)
+					LogicalDecodingContext *ctx)
 {
 	bool	success;
 	XLogRecPtr	xlog_insert_ptr, end_of_wal;
@@ -2504,7 +2516,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	 * AccessExclusiveLock effectively disables catalog checks - we've already
 	 * performed them above.
 	 */
-	success = process_concurrent_changes(ctx, startptr, end_of_wal,
+	success = process_concurrent_changes(ctx, end_of_wal,
 										 cat_state, rel_dst, ident_key,
 										 ident_key_nentries, iistate,
 										 AccessExclusiveLock, t_end_ptr);
@@ -2524,7 +2536,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 		 * first change we decode now will make it spill to disk is too low to
 		 * justify calling apply_concurrent_changes() separately.
 		 */
-		process_concurrent_changes(ctx, startptr, end_of_wal,
+		process_concurrent_changes(ctx, end_of_wal,
 								   cat_state, rel_dst, ident_key,
 								   ident_key_nentries, iistate,
 								   AccessExclusiveLock, NULL);
