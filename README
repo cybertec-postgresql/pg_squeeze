@@ -107,8 +107,8 @@ Following is the complete description of table metadata.
   the first processing of the corresponding task failed. Typical reason to
   retry the processing is that table definition got changed while the table
   was being squeezed. If the number of retries is achieved, processing of the
-  table is considered complete. The next task is created as soon as time
-  specified by "task_interval" column of "squeeze.tables" table has elapsed.
+  table is considered complete. The next task is created as soon as the next
+  scheduled time is reached.
 
   The default value of "max_retry" is 0 (i.e. do not retry).
 

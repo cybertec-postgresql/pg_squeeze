@@ -135,20 +135,11 @@ typedef struct CatalogState
 	/* The relation whose changes we'll check for. */
 	Oid	relid;
 
-	/*
-	 * Have both the source relation and its TOAST relation the
-	 * "user_catalog_table" option set?
-	 */
-	bool		is_catalog;
-
 	/* Copy of pg_class tuple. */
 	Form_pg_class	form_class;
 
 	/* Copy of pg_class tuple descriptor. */
 	TupleDesc	desc_class;
-
-	/* Copy of pg_class(reloptions). */
-	Datum	reloptions;
 
 	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
 	TransactionId	*attr_xmins;
