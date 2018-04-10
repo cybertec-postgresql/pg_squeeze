@@ -21,6 +21,19 @@ ALTER TABLE tables DROP COLUMN task_interval;
 ALTER TABLE tasks DROP COLUMN autovac;
 ALTER TABLE tasks DROP COLUMN autovac_toast;
 
+-- The squeeze_table() function is no longer interested in the autovacuum
+-- related arguments.
+DROP FUNCTION squeeze_table(name, name, name, name, name[][], bool, bool);
+CREATE FUNCTION squeeze_table(
+       tabchema		name,
+       tabname		name,
+       clustering_index name,
+       rel_tablespace 	name,
+       ind_tablespaces	name[][])
+RETURNS void
+AS 'MODULE_PATHNAME', 'squeeze_table'
+LANGUAGE C;
+
 -- No longer needed.
 DROP FUNCTION is_autovacuum_enabled(oid);
 
@@ -152,7 +165,7 @@ $$;
 
 -- process_current_task() used to call set_reloptions(), so modify it
 -- accordingly.
-DROP FUNCTION process_current_task()
+DROP FUNCTION process_current_task();
 
 CREATE OR REPLACE FUNCTION process_current_task()
 RETURNS void
