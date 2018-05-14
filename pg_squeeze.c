@@ -257,12 +257,6 @@ _PG_init(void)
 
 /*
  * SQL interface to squeeze one table interactively.
- *
- * "user_catalog_table" option must have been set by a separate transaction
- * (otherwise the replication slot causes ERROR instead of infinite waiting
- * for consistent state). We try to clear it as soon as possible. Caller
- * should check (and possibly clear) the option if the function failed in any
- * way.
  */
 extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
@@ -773,6 +767,11 @@ check_prerequisites(Relation rel)
 				 errmsg("\"%s\" is mapped relation",
 						RelationGetRelationName(rel))));
 
+	/*
+	 * There's no urgent need to process catalog tables. Should this
+	 * limitation be relaxed someday, we probably need to write
+	 * xl_heap_rewrite_mapping records.
+	 */
 	if (RelationGetRelid(rel) < FirstNormalObjectId)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -2547,13 +2546,7 @@ swap_relation_files(Oid r1, Oid r2)
 		elog(ERROR, "cannot swap mapped relations");
 
 	/*
-	 * Set rel1's frozen Xid and minimum MultiXid so that they become the
-	 * lower bounds on XID.
-	 *
-	 * It'd probably be correct to copy the values from the original table,
-	 * but that would leave the tuples too far in the past. Thus VACUUM could
-	 * get overly eager about wrap-around avoidance (possibly including
-	 * unnecessary full scans), but would find very little work to do.
+	 * Set rel1's frozen Xid and minimum MultiXid.
 	 */
 	if (relform1->relkind != RELKIND_INDEX)
 	{
@@ -2562,6 +2555,7 @@ swap_relation_files(Oid r1, Oid r2)
 
 		frozenXid = RecentXmin;
 		Assert(TransactionIdIsNormal(frozenXid));
+
 		/*
 		 * Unlike CLUSTER command (see copy_heap_data()), we don't derive the
 		 * new value from any freeze-related configuration parameters, so
