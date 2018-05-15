@@ -465,12 +465,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	toastrelid_dst = rel_dst->rd_rel->reltoastrelid;
 
 	/*
-	 * We need at least to know whether the catalog option was never changed,
-	 * and that no DDL took place that allows for data inconsistency. That
-	 * includes removal of the "user_catalog_table" option.
-	 *
-	 * The relation was unlocked for some time since last check, so pass
-	 * NoLock.
+	 * We need to know whether that no DDL took place that allows for data
+	 * inconsistency. The relation was unlocked for some time since last
+	 * check, so pass NoLock.
 	 */
 	check_catalog_changes(cat_state, NoLock);
 
@@ -768,9 +765,16 @@ check_prerequisites(Relation rel)
 						RelationGetRelationName(rel))));
 
 	/*
-	 * There's no urgent need to process catalog tables. Should this
-	 * limitation be relaxed someday, we probably need to write
-	 * xl_heap_rewrite_mapping records.
+	 * There's no urgent need to process catalog tables.
+	 *
+	 * Should this limitation be relaxed someday, consider if we need to write
+	 * xl_heap_rewrite_mapping records. (Probably not because the whole
+	 * "decoding session" takes place within a call of squeeze_table() and our
+	 * catalog checks should not allow for a concurrent rewrite that could
+	 * make snapmgr.c:tuplecid_data obsolete. Furthermore, such a rewrite
+	 * would have to take place before perform_initial_load(), but this is
+	 * called before any transactions could have been decoded, so tuplecid
+	 * should still be empty anyway.)
 	 */
 	if (RelationGetRelid(rel) < FirstNormalObjectId)
 		ereport(ERROR,
