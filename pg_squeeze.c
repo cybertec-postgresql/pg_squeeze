@@ -1235,7 +1235,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
  * to those constraints / triggers, the transient relation does not need them,
  * and therefore no incompatibility can arise. We only need to make sure that
  * the storage is "compatible", i.e. no column and no index was added /
- * altered/ dropped, and no heap rewriting took place.
+ * altered / dropped, and no heap rewriting took place.
  *
  * Unlike get_catalog_state(), fresh catalog snapshot is used for each catalog
  * scan. That might increase the chance a little bit that concurrent change
