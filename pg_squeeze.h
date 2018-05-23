@@ -176,7 +176,6 @@ extern IndexInsertState *get_index_insert_state(Relation relation,
 												Oid ident_index_id);
 extern void free_index_insert_state(IndexInsertState *iistate);
 extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
-									   XLogRecPtr *startptr,
 									   XLogRecPtr end_of_wal,
 									   CatalogState	*cat_state,
 									   Relation rel_dst, ScanKey ident_key,
