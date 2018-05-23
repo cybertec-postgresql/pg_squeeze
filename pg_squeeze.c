@@ -288,7 +288,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	TablespaceInfo	*tbsp_info;
 	ObjectAddress	object;
 	bool	source_finalized;
-	DecodingOutputState	*dstate;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -584,18 +583,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * need to be decoded for sure.
 	 */
 	end_of_wal = GetFlushRecPtr();
-
-	/*
-	 * reorderbuffer.c could have called our change callback if some
-	 * transaction(s) started late enough to be decoded, and committed before
-	 * the snapshot builder reached the SNAPBUILD_CONSISTENT state. The effect
-	 * of such transactions must have been noticed by perform_initial_load(),
-	 * so our output plugin had to ignore them. However the following changes
-	 * must be captured.
-	 */
-	dstate = (DecodingOutputState *) ctx->output_writer_private;
-	Assert(!dstate->capture);
-	dstate->capture = true;
 
 	/*
 	 * Decode and apply the data changes that occurred while the initial load

@@ -525,12 +525,6 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
-	/*
-	 * Are we interested in any changes at the moment?
-	 */
-	if (!dstate->capture)
-		return;
-
 	/* Only interested in one particular relation. */
 	if (relation->rd_id != dstate->relid)
 		return;

@@ -52,9 +52,6 @@ typedef struct ConcurrentChange
 
 typedef struct DecodingOutputState
 {
-	/* Should the changes received be captured? */
-	bool	capture;
-
 	/* The relation whose changes we're decoding. */
 	Oid	relid;
 
