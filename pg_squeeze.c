@@ -1800,8 +1800,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 	/*
 	 * There processing can take many iterations. In case any data
-	 * manipulation below leaked, try defend against out-of-memory
-	 * conditions. by using a separate memory context.
+	 * manipulation below leaked, try to defend against out-of-memory
+	 * conditions by using a separate memory context.
 	 */
 	load_cxt = AllocSetContextCreate(CurrentMemoryContext,
 									 "pg_squeeze initial load cxt",
@@ -1848,9 +1848,15 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				break;
 			}
 
+			/*
+			 * Perform the tuple retrieval in the original context so that any
+			 * scan data is not freed during the cleanup between batches.
+			 */
+			MemoryContextSwitchTo(old_cxt);
 			tup_in = use_sort || cluster_idx == NULL ?
 				heap_getnext(heap_scan, ForwardScanDirection) :
 				index_getnext(index_scan, ForwardScanDirection);
+			MemoryContextSwitchTo(load_cxt);
 
 			/*
 			 * Ran out of input data?
@@ -1995,6 +2001,17 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			if (tup_out == NULL)
 				break;
 
+			/*
+			 * Insert the tuple into the new table.
+			 *
+			 * XXX Should this happen outside load_cxt? Currently "bistate" is
+			 * a flat object (i.e. it does not point to any memory chunk that
+			 * the previous call of heap_insert() might have allocated) and
+			 * thus the cleanup between batches should not damage it, but
+			 * can't it get more complex in future PG versions?  If we switch
+			 * to old_ctx for the insert, an extra context seems to make more
+			 * sense than checking that heap_insert() does not leak memory.
+			 */
 			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0,
 						bistate);
 			if (!use_sort || should_free)
