@@ -265,12 +265,6 @@ _PG_init(void)
 
 /*
  * SQL interface to squeeze one table interactively.
- *
- * "user_catalog_table" option must have been set by a separate transaction
- * (otherwise the replication slot causes ERROR instead of infinite waiting
- * for consistent state). We try to clear it as soon as possible. Caller
- * should check (and possibly clear) the option if the function failed in any
- * way.
  */
 extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
@@ -503,12 +497,9 @@ squeeze_table(PG_FUNCTION_ARGS)
 	toastrelid_dst = rel_dst->rd_rel->reltoastrelid;
 
 	/*
-	 * We need at least to know whether the catalog option was never changed,
-	 * and that no DDL took place that allows for data inconsistency. That
-	 * includes removal of the "user_catalog_table" option.
-	 *
-	 * The relation was unlocked for some time since last check, so pass
-	 * NoLock.
+	 * We need to know whether that no DDL took place that allows for data
+	 * inconsistency. The relation was unlocked for some time since last
+	 * check, so pass NoLock.
 	 */
 	check_catalog_changes(cat_state, NoLock);
 
@@ -821,6 +812,18 @@ check_prerequisites(Relation rel)
 				 errmsg("\"%s\" is mapped relation",
 						RelationGetRelationName(rel))));
 
+	/*
+	 * There's no urgent need to process catalog tables.
+	 *
+	 * Should this limitation be relaxed someday, consider if we need to write
+	 * xl_heap_rewrite_mapping records. (Probably not because the whole
+	 * "decoding session" takes place within a call of squeeze_table() and our
+	 * catalog checks should not allow for a concurrent rewrite that could
+	 * make snapmgr.c:tuplecid_data obsolete. Furthermore, such a rewrite
+	 * would have to take place before perform_initial_load(), but this is
+	 * called before any transactions could have been decoded, so tuplecid
+	 * should still be empty anyway.)
+	 */
 	if (RelationGetRelid(rel) < FirstNormalObjectId)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -1314,7 +1317,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
  * to those constraints / triggers, the transient relation does not need them,
  * and therefore no incompatibility can arise. We only need to make sure that
  * the storage is "compatible", i.e. no column and no index was added /
- * altered/ dropped, and no heap rewriting took place.
+ * altered / dropped, and no heap rewriting took place.
  *
  * Unlike get_catalog_state(), fresh catalog snapshot is used for each catalog
  * scan. That might increase the chance a little bit that concurrent change
@@ -2621,13 +2624,7 @@ swap_relation_files(Oid r1, Oid r2)
 		elog(ERROR, "cannot swap mapped relations");
 
 	/*
-	 * Set rel1's frozen Xid and minimum MultiXid so that they become the
-	 * lower bounds on XID.
-	 *
-	 * It'd probably be correct to copy the values from the original table,
-	 * but that would leave the tuples too far in the past. Thus VACUUM could
-	 * get overly eager about wrap-around avoidance (possibly including
-	 * unnecessary full scans), but would find very little work to do.
+	 * Set rel1's frozen Xid and minimum MultiXid.
 	 */
 	if (relform1->relkind != RELKIND_INDEX)
 	{
@@ -2636,6 +2633,7 @@ swap_relation_files(Oid r1, Oid r2)
 
 		frozenXid = RecentXmin;
 		Assert(TransactionIdIsNormal(frozenXid));
+
 		/*
 		 * Unlike CLUSTER command (see copy_heap_data()), we don't derive the
 		 * new value from any freeze-related configuration parameters, so
