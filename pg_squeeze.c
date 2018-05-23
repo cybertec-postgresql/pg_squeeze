@@ -1001,7 +1001,7 @@ get_catalog_state(Oid relid)
 	if (reloptions == NULL || !reloptions->user_catalog_table)
 	{
 		Assert(!result->is_catalog);
-		return result;
+		goto cleanup;
 	}
 
 	/*
@@ -1013,6 +1013,7 @@ get_catalog_state(Oid relid)
 		ScanKeyData key_toast[1];
 		SysScanDesc	scan_toast;
 		StdRdOptions	*reloptions_toast;
+		bool	failed = false;
 
 		ScanKeyInit(&key_toast[0], ObjectIdAttributeNumber,
 					BTEqualStrategyNumber, F_OIDEQ,
@@ -1024,12 +1025,18 @@ get_catalog_state(Oid relid)
 		reloptions_toast = (StdRdOptions *) extractRelOptions(tuple_toast,
 															  desc, NULL);
 		if (reloptions_toast == NULL || !reloptions_toast->user_catalog_table)
+			failed = true;
+
+		if (!failed)
+			result->toast_xmin = HeapTupleHeaderGetXmin(tuple_toast->t_data);
+
+		systable_endscan(scan_toast);
+
+		if (failed)
 		{
 			Assert(!result->is_catalog);
-			return result;
+			goto cleanup;
 		}
-		result->toast_xmin = HeapTupleHeaderGetXmin(tuple_toast->t_data);
-		systable_endscan(scan_toast);
 	}
 
 	result->relid = relid;
@@ -1061,12 +1068,12 @@ get_catalog_state(Oid relid)
 
 	/* If any index is "invalid", no more catalog information is needed. */
 	if (result->invalid_index)
-		return result;
+		goto cleanup;
 
 	if (form_class->relnatts > 0)
 		result->attr_xmins = get_attribute_xmins(relid, form_class->relnatts);
 
-	/* Cleanup. */
+cleanup:
 	systable_endscan(scan);
 	heap_close(rel, AccessShareLock);
 
