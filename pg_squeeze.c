@@ -36,6 +36,7 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/standbydefs.h"
 #include "utils/builtins.h"
@@ -89,7 +90,7 @@ static void free_tablespace_info(TablespaceInfo *tbsp_info);
 static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
 									 CatalogState *cat_state,
 									 ArrayType *ind_tbsp_a);
-static void switch_snapshot(Snapshot snap_hist);
+static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst);
 static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
@@ -444,13 +445,10 @@ squeeze_table(PG_FUNCTION_ARGS)
 	ctx = setup_decoding(relid_src, tup_desc);
 
 	/*
-	 * The first consistent snapshot should be available now. There's no
-	 * reason to look for another snapshot for the "main query".
-	 *
-	 * XXX The 2nd argument is currently unused in PG core.
+	 * Build an "historic snapshot", i.e. one that reflect the table state at
+	 * the moment the snapshot builder reached SNAPBUILD_CONSISTENT state.
 	 */
-	snap_hist = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder,
-											InvalidTransactionId);
+	snap_hist = build_historic_snapshot(ctx->snapshot_builder);
 
 	relid_dst = create_transient_table(cat_state, tup_desc, tbsp_info->table,
 		rel_src_owner);
@@ -472,19 +470,21 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/*
 	 * The historic snapshot is used to retrieve data w/o concurrent
-	 * changes. It must not stay active afterwards.
+	 * changes.
 	 */
-	PG_TRY();
-	{
-		perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
-		switch_snapshot(NULL);
-	}
-	PG_CATCH();
-	{
-		switch_snapshot(NULL);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
+
+	/*
+	 * The historic snapshot won't be needed anymore.
+	 */
+	pfree(snap_hist);
+
+	/*
+	 * This is rather paranoia than anything else --- perform_initial_load()
+	 * uses each snapshot to access different table, and it does not catalog
+	 * changes.
+	 */
+	InvalidateSystemCaches();
 
 	/*
 	 * Check for concurrent changes that would make us stop working later.
@@ -1551,47 +1551,61 @@ free_tablespace_info(TablespaceInfo *tbsp_info)
 	pfree(tbsp_info);
 }
 
+
 /*
- * Install the passed historic snapshot or uninstall it if NULL is passed.
+ * Wrapper for SnapBuildInitialSnapshot().
  *
- * Caution: Caller is responsible for calling TeardownHistoricSnapshot()
- * anytime ERROR is raised while the historic snapshot is active.
+ * We do not have to meet the assertions that SnapBuildInitialSnapshot()
+ * contains, nor should we set MyPgXact->xmin.
  */
-static void
-switch_snapshot(Snapshot snap_hist)
+static Snapshot
+build_historic_snapshot(SnapBuild *builder)
 {
-	if (snap_hist)
-	{
-		Assert(!HistoricSnapshotActive());
-
-		/*
-		 * "tuplecids" should only be needed by catalog-modifying
-		 * transactions, during decoding. Nothing of it is applicable here, so
-		 * pass NULL.
-		 */
-		SetupHistoricSnapshot(snap_hist, NULL);
-
-		/*
-		 * We don't use the historic snapshot in the way SPI expects. Avoid
-		 * assertion failure in GetTransactionSnapshot() when it's called by
-		 * the SPI.
-		 */
-		Assert(FirstSnapshotSet);
-		FirstSnapshotSet = false;
-	}
-	else
-	{
-		TeardownHistoricSnapshot(false);
-		/* Revert the hack done above. */
-		FirstSnapshotSet = true;
-	}
+	Snapshot	result;
+	bool	FirstSnapshotSet_save;
+	int		XactIsoLevel_save;
+	TransactionId	xmin_save;
 
 	/*
-	 * This is rather paranoia than anything else - the perform_initial_load()
-	 * uses each snapshot to access different table, and it does not catalog
-	 * changes.
+	 * Fake both FirstSnapshotSet and XactIsoLevel so that the assertions in
+	 * SnapBuildInitialSnapshot() don't fire. Otherwise squeeze_table() has no
+	 * reason to apply these values.
 	 */
-	InvalidateSystemCaches();
+	FirstSnapshotSet_save = FirstSnapshotSet;
+	FirstSnapshotSet = false;
+	XactIsoLevel_save = XactIsoLevel;
+	XactIsoLevel = XACT_REPEATABLE_READ;
+
+	/*
+	 * Likewise, fake MyPgXact->xmin so that the corresponding check passes.
+	 */
+	xmin_save = MyPgXact->xmin;
+	MyPgXact->xmin = InvalidTransactionId;
+
+	/*
+	 * Call the core function to actually build the snapshot.
+	 */
+	result = SnapBuildInitialSnapshot(builder);
+
+	/*
+	 * Restore the original values.
+	 */
+	FirstSnapshotSet = FirstSnapshotSet_save;
+	XactIsoLevel = XactIsoLevel_save;
+	MyPgXact->xmin = xmin_save;
+
+	/*
+	 * Fix the "satisfies" function that PG core incorrectly sets to
+	 * HeapTupleSatisfiesHistoricMVCC.
+	 *
+	 * https://www.postgresql.org/message-id/23215.1527665193%40localhost
+	 *
+	 * XXX Remove this assignment as soon as all the supported PG versions
+	 * have the problem fixed.
+	 */
+	result->satisfies = HeapTupleSatisfiesMVCC;
+
+	return result;
 }
 
 /*
@@ -1616,12 +1630,6 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	ResourceOwner	res_owner_old, res_owner_plan;
 	BulkInsertState bistate;
 	MemoryContext	load_cxt, old_cxt;
-
-	/*
-	 * The initial load starts by fetching data from the source table and
-	 * should not include concurrent changes.
-	 */
-	switch_snapshot(snap_hist);
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -1858,7 +1866,6 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		 * out later that we need to terminate processing of the current
 		 * table, but it's probably not worth checking each batch.)
 		 */
-		switch_snapshot(NULL);
 
 		if (use_sort)
 			tuplesort_performsort(tuplesort);
@@ -1918,8 +1925,6 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		 */
 		if (tup_in == NULL)
 			break;
-
-		switch_snapshot(snap_hist);
 
 		/*
 		 * Free possibly-leaked memory.
