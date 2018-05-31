@@ -1,0 +1,60 @@
+Release 1.1.0
+=============
+
+New features
+------------
+
+1. Instead of configuring "first_check" and "task_interval", administrator now
+   passes a "schedule" array of timestamps at which table should be squeezed.
+
+2. Table no longer needs to have the user_catalog_table storage option set
+   before it can be passed to squeeze_table() function.
+
+   Now INSERT ... ON CONFLICT ... command no longer raises ERROR if trying to
+   access table that is just being squeezed. Another advantage is this change
+   is that calls of the squeeze_table() function are now easier.
+
+
+Bug fixes
+---------
+
+1. Close pg_class relation and its scan if exiting early (i.e. catalog change
+   was detected).
+
+2. Defend against race conditions that allow for applying of the concurrent
+   changes which have already been captured by the initial load. In such a
+   case the squeeze_table() function can raise ERROR due to attempt to insert
+   duplicate value of identity key, or due to failure to update or delete row
+   that no longer exists.
+
+3. Use the correct snapshot for the initial load.
+
+   So far the squeeze_table() function could have used an obsolete snapshot if
+   some transaction(s) started after the snapshot builder reached
+   SNAPBUILD_FULL_SNAPSHOT state and committed before
+   SNAPBUILD_CONSISTENT. Both the initial load and the logical decoding used
+   to miss such transactions.
+
+   This problem could only happen after the bug fix #2 had been
+   implemented. Before that at least the logical decoding captured the
+   problematic transactions because it (the decoding) started earlier than
+   necessary.
+
+   No data loss was reported so far, but we still recommend you to upgrade
+   pg_squeeze to the version that includes this fix.
+
+4. Do not use "initial load memory context" to fetch tuples from table or
+   index.
+
+   If the load takes place in multiple "batches" (i.e. tuplesort is not used),
+   that memory context gets freed before the next batch starts and the call fo
+   squeeze_table() function results in SEGFAULT.
+
+
+Release 1.0.1
+=============
+
+Bug fixes
+---------
+
+1. Try harder to avoid out-of-memory conditions during the initial table load.
