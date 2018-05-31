@@ -21,6 +21,7 @@
 #include "nodes/execnodes.h"
 #include "postmaster/bgworker.h"
 #include "replication/logical.h"
+#include "replication/snapbuild.h"
 #include "utils/inval.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -220,3 +221,111 @@ extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
 										WorkerConInteractive *con_interactive,
 										Oid notify_pid);
 extern void squeeze_worker_main(Datum main_arg);
+
+/*
+ * This struct contains the current state of the snapshot building
+ * machinery. Besides a forward declaration in the header, it is not exposed
+ * to the public, so we can easily change its contents.
+ */
+struct SnapBuild
+{
+	/* how far are we along building our first full snapshot */
+	SnapBuildState state;
+
+	/* private memory context used to allocate memory for this module. */
+	MemoryContext context;
+
+	/* all transactions < than this have committed/aborted */
+	TransactionId xmin;
+
+	/* all transactions >= than this are uncommitted */
+	TransactionId xmax;
+
+	/*
+	 * Don't replay commits from an LSN < this LSN. This can be set externally
+	 * but it will also be advanced (never retreat) from within snapbuild.c.
+	 */
+	XLogRecPtr	start_decoding_at;
+
+	/*
+	 * Don't start decoding WAL until the "xl_running_xacts" information
+	 * indicates there are no running xids with an xid smaller than this.
+	 */
+	TransactionId initial_xmin_horizon;
+
+	/* Indicates if we are building full snapshot or just catalog one. */
+	bool		building_full_snapshot;
+
+	/*
+	 * Snapshot that's valid to see the catalog state seen at this moment.
+	 */
+	Snapshot	snapshot;
+
+	/*
+	 * LSN of the last location we are sure a snapshot has been serialized to.
+	 */
+	XLogRecPtr	last_serialized_snapshot;
+
+	/*
+	 * The reorderbuffer we need to update with usable snapshots et al.
+	 */
+	ReorderBuffer *reorder;
+
+	/*
+	 * Outdated: This struct isn't used for its original purpose anymore, but
+	 * can't be removed / changed in a minor version, because it's stored
+	 * on-disk.
+	 */
+	struct
+	{
+		/*
+		 * NB: This field is misused, until a major version can break on-disk
+		 * compatibility. See SnapBuildNextPhaseAt() /
+		 * SnapBuildStartNextPhaseAt().
+		 */
+		TransactionId was_xmin;
+		TransactionId was_xmax;
+
+		size_t		was_xcnt;	/* number of used xip entries */
+		size_t		was_xcnt_space; /* allocated size of xip */
+		TransactionId *was_xip; /* running xacts array, xidComparator-sorted */
+	}			was_running;
+
+	/*
+	 * Array of transactions which could have catalog changes that committed
+	 * between xmin and xmax.
+	 */
+	struct
+	{
+		/* number of committed transactions */
+		size_t		xcnt;
+
+		/* available space for committed transactions */
+		size_t		xcnt_space;
+
+		/*
+		 * Until we reach a CONSISTENT state, we record commits of all
+		 * transactions, not just the catalog changing ones. Record when that
+		 * changes so we know we cannot export a snapshot safely anymore.
+		 */
+		bool		includes_all_transactions;
+
+		/*
+		 * Array of committed transactions that have modified the catalog.
+		 *
+		 * As this array is frequently modified we do *not* keep it in
+		 * xidComparator order. Instead we sort the array when building &
+		 * distributing a snapshot.
+		 *
+		 * TODO: It's unclear whether that reasoning has much merit. Every
+		 * time we add something here after becoming consistent will also
+		 * require distributing a snapshot. Storing them sorted would
+		 * potentially also make it easier to purge (but more complicated wrt
+		 * wraparound?). Should be improved if sorting while building the
+		 * snapshot shows up in profiles.
+		 */
+		TransactionId *xip;
+	}			committed;
+};
+
+extern Snapshot SnapBuildInitialSnapshot(SnapBuild *builder);
