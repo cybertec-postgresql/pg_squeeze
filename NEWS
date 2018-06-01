@@ -14,6 +14,12 @@ New features
    access table that is just being squeezed. Another advantage is this change
    is that calls of the squeeze_table() function are now easier.
 
+3. No longer disable autovacuum for the table being squeezed.
+
+   The additional code complexity is probably not worth and it does not stop
+   already running VACUUM. It's responsibility of the DBA not to allow VACUUM
+   to waste resources on a table which should be treated by pg_squeeze.
+
 
 Bug fixes
 ---------
