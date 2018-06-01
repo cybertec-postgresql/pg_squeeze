@@ -221,6 +221,25 @@ although the background worker does unregister non-existing tables
 periodically.
 
 
+Upgrade from pg_squeeze 1.0.x
+-----------------------------
+
+1. Set PG_CONFIG envoirnment variable to point to pg_config command of your
+   PostgreSQL installation.
+
+2. make
+
+3. Stop the PG instance
+
+4. sudo make install
+
+5. Restart the PG instance
+
+6. Connect to each database containing pg_squeeze 1.0.x and run this command:
+
+   ALTER EXTENSION pg_squeeze UPDATE;
+
+
 Notes on Concurrency
 --------------------
 
