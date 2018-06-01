@@ -266,6 +266,12 @@ _PG_init(void)
 
 /*
  * SQL interface to squeeze one table interactively.
+ *
+ * "user_catalog_table" option must have been set by a separate transaction
+ * (otherwise the replication slot causes ERROR instead of infinite waiting
+ * for consistent state). We try to clear it as soon as possible. Caller
+ * should check (and possibly clear) the option if the function failed in any
+ * way.
  */
 extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
@@ -495,9 +501,12 @@ squeeze_table(PG_FUNCTION_ARGS)
 	toastrelid_dst = rel_dst->rd_rel->reltoastrelid;
 
 	/*
-	 * We need to know whether that no DDL took place that allows for data
-	 * inconsistency. The relation was unlocked for some time since last
-	 * check, so pass NoLock.
+	 * We need at least to know whether the catalog option was never changed,
+	 * and that no DDL took place that allows for data inconsistency. That
+	 * includes removal of the "user_catalog_table" option.
+	 *
+	 * The relation was unlocked for some time since last check, so pass
+	 * NoLock.
 	 */
 	check_catalog_changes(cat_state, NoLock);
 
