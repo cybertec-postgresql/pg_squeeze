@@ -3,7 +3,7 @@
  * concurrent.c
  *	  Module to handle changes that took place while new table was being created
  *
- * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2018, Cybertec Schönig & Schönig GmbH
  *
  *-----------------------------------------------------------------------------------
  */
