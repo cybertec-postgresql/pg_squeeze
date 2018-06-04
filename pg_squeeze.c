@@ -3,7 +3,7 @@
  * pg_squeeze.c
  *     A tool to eliminate table bloat.
  *
- * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2018, Cybertec Schönig & Schönig GmbH
  *
  *-----------------------------------------------------
  */
