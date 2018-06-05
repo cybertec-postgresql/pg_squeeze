@@ -173,7 +173,7 @@ squeeze_worker_main(Datum main_arg)
 		WorkerConInit	*con;
 
 		con = (WorkerConInit *) DatumGetPointer(arg);
-		BackgroundWorkerInitializeConnection(con->dbname, con->rolename);
+		BackgroundWorkerInitializeConnection(con->dbname, con->rolename, 0);
 	}
 	else
 	{
@@ -183,7 +183,7 @@ squeeze_worker_main(Datum main_arg)
 		memcpy(&con, MyBgworkerEntry->bgw_extra,
 			   sizeof(WorkerConInteractive));
 
-		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid);
+		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid, 0);
 	}
 
 	SetCurrentStatementStartTimestamp();

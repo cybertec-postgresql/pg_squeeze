@@ -689,8 +689,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	free_catalog_state(cat_state);
 
 	/*
-	 * Drop the transient table including indexes (constraints would be
-	 * dropped this way too, but we haven't created any).
+	 * Drop the transient table including indexes (and possibly constraints on
+	 * those indexes).
 	 */
 	object.classId = RelationRelationId;
 	object.objectSubId = 0;
@@ -854,8 +854,7 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tupdesc_change = CreateTemplateTupleDesc(1, false);
 	TupleDescInitEntry(dstate->tupdesc_change, 1, NULL, BYTEAOID, -1, 0);
 	/* ... as well as the corresponding slot. */
-	dstate->tsslot = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(dstate->tsslot, dstate->tupdesc_change);
+	dstate->tsslot = MakeTupleTableSlot(dstate->tupdesc_change);
 
 	dstate->data_size = 0;
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
@@ -1684,7 +1683,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	if (use_sort)
 		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
 											cluster_idx, maintenance_work_mem,
-											false);
+											false, false);
 
 	/*
 	 * If tuplesort is not applicable, we store as much data as we can into
@@ -1994,7 +1993,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 */
 		aclresult = pg_tablespace_aclcheck(tablespace, relowner, ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
+			aclcheck_error(aclresult, OBJECT_TABLESPACE,
 						   get_tablespace_name(tablespace));
 	}
 	if (tablespace == GLOBALTABLESPACE_OID)
@@ -2035,7 +2034,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		form_class->relkind, form_class->relpersistence,
 		false, false, true, 0,
 		ONCOMMIT_NOOP, reloptions,
-		false, false, false, NULL);
+		false, false, false, InvalidOid, NULL);
 
 	Assert(OidIsValid(result));
 
@@ -2119,7 +2118,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		size_t	oid_arr_size;
 		size_t	int2_arr_size;
 		int16	*indoptions;
-		bool	isconstraint;
+		bits16	flags;
 
 		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
@@ -2180,6 +2179,11 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		 */
 		resetStringInfo(ind_name);
 		appendStringInfo(ind_name, "ind_%d", i);
+
+		flags = 0;
+		if (ind->rd_index->indisprimary)
+			flags |= INDEX_CREATE_IS_PRIMARY;
+
 		index_close(ind, AccessShareLock);
 
 		colnames = NIL;
@@ -2270,18 +2274,31 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 		ReleaseSysCache(ind_tup);
 
-		isconstraint = ind->rd_index->indisprimary || ind_info->ii_Unique
-			|| ind->rd_index->indisexclusion;
-
-		ind_oid_new = index_create(rel_dst, ind_name->data,
-								   InvalidOid, InvalidOid, ind_info,
-								   colnames, ind->rd_rel->relam,
+		/*
+		 * Neither parentIndexRelid nor parentConstraintId needs to be passed
+		 * since the new catalog entries (pg_constraint, pg_inherits) will
+		 * eventually be dropped. Therefore there's no need to record valid
+		 * dependency on parents.
+		 */
+		ind_oid_new = index_create(rel_dst,
+								   ind_name->data,
+								   InvalidOid,
+								   InvalidOid,
+								   InvalidOid,
+								   InvalidOid,
+								   ind_info,
+								   colnames,
+								   ind->rd_rel->relam,
 								   tbsp_oid,
-								   collations, opclasses, indoptions,
+								   collations,
+								   opclasses,
+								   indoptions,
 								   PointerGetDatum(ind->rd_options),
-								   ind->rd_index->indisprimary, isconstraint,
-								   false, false, false, false, false, false,
-								   false);
+								   flags,
+								   0,
+								   false,
+								   false,
+								   NULL);
 		result[i] = ind_oid_new;
 
 		list_free_deep(colnames);
