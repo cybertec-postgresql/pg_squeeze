@@ -420,17 +420,7 @@ get_index_insert_state(Relation	relation, Oid ident_index_id)
 	 */
 	for (i = 0; i < result->rri->ri_NumIndices; i++)
 	{
-		IndexInfo	*ii;
 		Relation	ind_rel;
-
-		/*
-		 * We don't need ExecInsertIndexTuples() to check exclusion
-		 * constraints - the source relation is responsible for those.
-		 */
-		ii = result->rri->ri_IndexRelationInfo[i];
-		ii->ii_ExclusionOps = NULL;
-		ii->ii_ExclusionProcs = NULL;
-		ii->ii_ExclusionStrats = NULL;
 
 		ind_rel = result->rri->ri_IndexRelationDescs[i];
 		if (ind_rel->rd_id == ident_index_id)
