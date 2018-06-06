@@ -2185,7 +2185,6 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		 */
 		resetStringInfo(ind_name);
 		appendStringInfo(ind_name, "ind_%d", i);
-		index_close(ind, AccessShareLock);
 
 		colnames = NIL;
 		indnatts = ind->rd_index->indnatts;
@@ -2289,6 +2288,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   false);
 		result[i] = ind_oid_new;
 
+		index_close(ind, AccessShareLock);
 		list_free_deep(colnames);
 		pfree(collations);
 		pfree(opclasses);
