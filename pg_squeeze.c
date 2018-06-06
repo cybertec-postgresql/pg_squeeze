@@ -2189,8 +2189,6 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		if (ind->rd_index->indisprimary)
 			flags |= INDEX_CREATE_IS_PRIMARY;
 
-		index_close(ind, AccessShareLock);
-
 		colnames = NIL;
 		indnatts = ind->rd_index->indnatts;
 		oid_arr_size = sizeof(Oid) * indnatts;
@@ -2306,6 +2304,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   NULL);
 		result[i] = ind_oid_new;
 
+		index_close(ind, AccessShareLock);
 		list_free_deep(colnames);
 		pfree(collations);
 		pfree(opclasses);
