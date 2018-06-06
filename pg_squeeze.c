@@ -73,6 +73,7 @@ typedef struct TablespaceInfo
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
+static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
 static TransactionId *get_attribute_xmins(Oid relid, int relnatts);
@@ -844,6 +845,19 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 									true,
 									logical_read_local_xlog_page,
 									NULL, NULL, NULL);
+
+	/*
+	 * PG 11 does introduces the fast_forward field and the call above
+	 * provides us with no option to pass true to
+	 * StartupDecodingContext(). The easiest way to cope with this problem is
+	 * to do additionally what StartupDecodingContext() would do if we could
+	 * pass it fast_forward=true.
+	 */
+	Assert(ctx->fast_forward);
+	LoadOutputPlugin(&ctx->callbacks,
+					 NameStr(MyReplicationSlot->data.plugin));
+	ctx->fast_forward = false;
+
 	DecodingContextFindStartpoint(ctx);
 
 	/*
@@ -870,6 +884,32 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	ctx->output_writer_private = dstate;
 	return ctx;
 }
+
+/*
+ * Copy & pasted from logical.c in PG core.
+ */
+static void
+LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin)
+{
+	LogicalOutputPluginInit plugin_init;
+
+	plugin_init = (LogicalOutputPluginInit)
+		load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
+
+	if (plugin_init == NULL)
+		elog(ERROR, "output plugins have to declare the _PG_output_plugin_init symbol");
+
+	/* ask the output plugin to fill the callback struct */
+	plugin_init(callbacks);
+
+	if (callbacks->begin_cb == NULL)
+		elog(ERROR, "output plugins have to register a begin callback");
+	if (callbacks->change_cb == NULL)
+		elog(ERROR, "output plugins have to register a change callback");
+	if (callbacks->commit_cb == NULL)
+		elog(ERROR, "output plugins have to register a commit callback");
+}
+
 
 static void
 decoding_cleanup(LogicalDecodingContext *ctx)
