@@ -2137,12 +2137,12 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		tbsp_oid = InvalidOid;
 		for (j = 0; j < tbsp_info->nindexes; j++)
 		{
-			IndexTablespace	*ind;
+			IndexTablespace	*ind_tbsp;
 
-			ind = &tbsp_info->indexes[j];
-			if (ind->index == ind_oid)
+			ind_tbsp = &tbsp_info->indexes[j];
+			if (ind_tbsp->index == ind_oid)
 			{
-				tbsp_oid = ind->tablespace;
+				tbsp_oid = ind_tbsp->tablespace;
 				break;
 			}
 		}
