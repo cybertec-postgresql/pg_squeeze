@@ -797,6 +797,11 @@ check_prerequisites(Relation rel)
 	Form_pg_class	form = RelationGetForm(rel);
 
 	/* Check the relation first. */
+	if (form->relkind == RELKIND_PARTITIONED_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot squeeze partitioned table")));
+
 	if (form->relkind != RELKIND_RELATION)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
