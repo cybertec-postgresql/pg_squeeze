@@ -36,6 +36,9 @@ Bug fixes
    that memory context gets freed before the next batch starts and the call fo
    squeeze_table() function results in SEGFAULT.
 
+5. Do not close relation cache entry for index if some field is yet to be
+   accessed.
+
 
 Release 1.0.1
 =============
