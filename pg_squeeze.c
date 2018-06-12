@@ -76,17 +76,21 @@ static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
 static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
-static TransactionId *get_attribute_xmins(Oid relid, int relnatts);
+static void get_pg_class_info(Oid relid, TransactionId *xmin,
+							  Form_pg_class *form_p, TupleDesc *desc_p);
+static void get_attribute_info(Oid relid, int relnatts,
+							   TransactionId **xmins_p,
+							   CatalogState *cat_state);
+static void cache_composite_type_info(CatalogState *cat_state, Oid typid);
+static void get_composite_type_info(TypeCatInfo *tinfo);
 static IndexCatInfo *get_index_info(Oid relid, int *relninds,
 									bool *found_invalid,
 									bool invalid_check_only);
-static void check_attribute_changes(Oid relid, TransactionId *attrs,
-									int relnatts);
-static void check_index_changes(Oid relid, IndexCatInfo *indexes,
-								int relninds);
+static void check_attribute_changes(CatalogState *cat_state);
+static void check_index_changes(CatalogState *state);
+static void check_composite_type_changes(CatalogState *cat_state);
 static void free_catalog_state(CatalogState *state);
-static void check_pg_class_changes(Oid relid, TransactionId xmin,
-								   LOCKMODE lock_held);
+static void check_pg_class_changes(CatalogState *state);
 static void free_tablespace_info(TablespaceInfo *tbsp_info);
 static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
 									 CatalogState *cat_state,
@@ -934,71 +938,20 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 static CatalogState *
 get_catalog_state(Oid relid)
 {
-	HeapTuple	tuple;
-	Form_pg_class	form_class;
-	Relation	rel;
-	TupleDesc	desc;
-	SysScanDesc scan;
-	ScanKeyData key[1];
 	CatalogState	*result;
 
-	/*
-	 * ScanPgRelation() would do most of the work below, but relcache.c does
-	 * not export it.
-	 */
-	rel = heap_open(RelationRelationId, AccessShareLock);
-	desc = CreateTupleDescCopy(RelationGetDescr(rel));
-
-	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
-	tuple = systable_getnext(scan);
-
-	/*
-	 * The relation should be locked by caller, so it must not have
-	 * disappeared.
-	 */
-	Assert(HeapTupleIsValid(tuple));
-
-	/* Invalid relfilenode indicates mapped relation. */
-	form_class = (Form_pg_class) GETSTRUCT(tuple);
-	if (form_class->relfilenode == InvalidOid)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 (errmsg("Mapped relation cannot be squeezed"))));
-
 	result = (CatalogState *) palloc0(sizeof(CatalogState));
-
-	/*
-	 * If TOAST relation exists, we must also keep eye on the catalog option.
-	 */
-	if (form_class->reltoastrelid != InvalidOid)
-	{
-		HeapTuple	tuple_toast;
-		ScanKeyData key_toast[1];
-		SysScanDesc	scan_toast;
-
-		ScanKeyInit(&key_toast[0], ObjectIdAttributeNumber,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(form_class->reltoastrelid));
-		scan_toast = systable_beginscan(rel, ClassOidIndexId, true, NULL,
-										1, key_toast);
-		tuple_toast = systable_getnext(scan_toast);
-		result->toast_xmin = HeapTupleHeaderGetXmin(tuple_toast->t_data);
-		systable_endscan(scan_toast);
-	}
-
-	result->relid = relid;
-	result->desc_class = desc;
-	result->form_class = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
-	memcpy(result->form_class, form_class, CLASS_TUPLE_SIZE);
+	result->rel.relid = relid;
 
 	/*
 	 * pg_class(xmin) helps to ensure that the "user_catalog_option" wasn't
 	 * turned off and on. On the other hand it might restrict some concurrent
 	 * DDLs that would be safe as such.
 	 */
-	result->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+	get_pg_class_info(relid, &result->rel.xmin, &result->form_class,
+					  &result->desc_class);
+
+	result->rel.relnatts = result->form_class->relnatts;
 
 	/*
 	 * We might want to avoid the check if relhasindex is false, but
@@ -1010,25 +963,83 @@ get_catalog_state(Oid relid)
 
 	/* If any index is "invalid", no more catalog information is needed. */
 	if (result->invalid_index)
-		goto cleanup;
+		return result;
 
-	if (form_class->relnatts > 0)
-		result->attr_xmins = get_attribute_xmins(relid, form_class->relnatts);
-
-cleanup:
-	systable_endscan(scan);
-	heap_close(rel, AccessShareLock);
+	if (result->form_class->relnatts > 0)
+		get_attribute_info(relid, result->form_class->relnatts,
+						   &result->rel.attr_xmins, result);
 
 	return result;
+}
+
+/*
+ * For given relid retrieve pg_class(xmin). Also set *form and *desc if valid
+ * pointers are passed.
+ */
+static void
+get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
+				  TupleDesc *desc_p)
+{
+	HeapTuple	tuple;
+	Form_pg_class	form_class;
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+
+	/*
+	 * ScanPgRelation() would do most of the work below, but relcache.c does
+	 * not export it.
+	 */
+	rel = heap_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
+	tuple = systable_getnext(scan);
+
+	/*
+	 * As the relation might not be locked by some callers, it could have
+	 * disappeared.
+	 */
+	if (!HeapTupleIsValid(tuple))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 (errmsg("Table no longer exists"))));
+	}
+
+	/* Invalid relfilenode indicates mapped relation. */
+	form_class = (Form_pg_class) GETSTRUCT(tuple);
+	if (form_class->relfilenode == InvalidOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 (errmsg("Mapped relation cannot be squeezed"))));
+
+	*xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+	if (form_p)
+	{
+		*form_p = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
+		memcpy(*form_p, form_class, CLASS_TUPLE_SIZE);
+	}
+
+	if (desc_p)
+		*desc_p = CreateTupleDescCopy(RelationGetDescr(rel));
+
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
 }
 
 /*
  * Retrieve array of pg_attribute(xmin) values for given relation, ordered by
  * attnum. (The ordering is not essential but lets us do some extra sanity
  * checks.)
+ *
+ * If cat_state is passed and the attribute is of a composite type, make sure
+ * it's cached in ->comptypes.
  */
-static TransactionId *
-get_attribute_xmins(Oid relid, int relnatts)
+static void
+get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
+				   CatalogState *cat_state)
 {
 	Relation	rel;
 	ScanKeyData key[2];
@@ -1072,11 +1083,121 @@ get_attribute_xmins(Oid relid, int relnatts)
 			elog(ERROR, "Relation %u has too many attributes", relid);
 
 		result[i] = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		/*
+		 * Gather composite type info if needed.
+		 */
+		if (cat_state != NULL &&
+			get_typtype(form->atttypid) == TYPTYPE_COMPOSITE)
+			cache_composite_type_info(cat_state, form->atttypid);
 	}
 	Assert(relnatts == n);
 	systable_endscan(scan);
 	heap_close(rel, AccessShareLock);
-	return result;
+	*xmins_p = result;
+}
+
+
+/*
+ * Make sure that information on a type that caller has recognized as
+ * composite type is cached in cat_state.
+ */
+static void
+cache_composite_type_info(CatalogState *cat_state, Oid typid)
+{
+	int	i;
+	bool	found = false;
+	TypeCatInfo	*tinfo;
+
+	/* Check if we already have this type. */
+	for (i = 0; i < cat_state->ncomptypes; i++)
+	{
+		tinfo = &cat_state->comptypes[i];
+
+		if (tinfo->oid == typid)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	if (found)
+		return;
+
+	/* Extend the comptypes array if necessary. */
+	if (cat_state->ncomptypes == cat_state->ncomptypes_max)
+	{
+		if (cat_state->ncomptypes_max == 0)
+		{
+			Assert(cat_state->comptypes == NULL);
+			cat_state->ncomptypes_max = 2;
+			cat_state->comptypes = (TypeCatInfo *)
+				palloc(cat_state->ncomptypes_max * sizeof(TypeCatInfo));
+		}
+		else
+		{
+			cat_state->ncomptypes_max *= 2;
+			cat_state->comptypes = (TypeCatInfo *)
+				repalloc(cat_state->comptypes,
+						 cat_state->ncomptypes_max * sizeof(TypeCatInfo));
+		}
+	}
+
+	tinfo = &cat_state->comptypes[cat_state->ncomptypes];
+	tinfo->oid = typid;
+	get_composite_type_info(tinfo);
+
+	cat_state->ncomptypes++;
+}
+
+/*
+ * Retrieve information on a type that caller has recognized as composite
+ * type. tinfo->oid must be initialized.
+ */
+static void
+get_composite_type_info(TypeCatInfo *tinfo)
+{
+	Relation	rel;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Form_pg_type	form_type;
+	Form_pg_class	form_class;
+
+	Assert(tinfo->oid != InvalidOid);
+
+	/* Find the pg_type tuple. */
+	rel = heap_open(TypeRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(tinfo->oid));
+	scan = systable_beginscan(rel, TypeOidIndexId, true, NULL, 1, key);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "composite type %u not found", tinfo->oid);
+
+	form_type = (Form_pg_type) GETSTRUCT(tuple);
+	Assert(form_type->typtype == TYPTYPE_COMPOSITE);
+
+	/* Initialize the structure. */
+	tinfo->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+	/*
+	 * Retrieve the pg_class tuple that represents the composite type, as well
+	 * as the corresponding pg_attribute tuples.
+	 */
+	tinfo->rel.relid = form_type->typrelid;
+	get_pg_class_info(form_type->typrelid, &tinfo->rel.xmin, &form_class,
+					  NULL);
+	if (form_class->relnatts > 0)
+		get_attribute_info(form_type->typrelid, form_class->relnatts,
+						   &tinfo->rel.attr_xmins, NULL);
+	else
+		tinfo->rel.attr_xmins = NULL;
+	tinfo->rel.relnatts = form_class->relnatts;
+
+	pfree(form_class);
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
 }
 
 /*
@@ -1156,7 +1277,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		res_entry->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 
 		/*
-		 * Unlike get_attribute_xmins(), we can't receive the expected number
+		 * Unlike get_attribute_info(), we can't receive the expected number
 		 * of entries from caller.
 		 */
 		if (n == relninds_max)
@@ -1281,8 +1402,6 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 void
 check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 {
-	Oid	toast_relid;
-
 	/*
 	 * No DDL should be compatible with this lock mode. (Not sure if this
 	 * condition will ever fire.)
@@ -1300,97 +1419,58 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 	 * deduce the kind of DDL from lock level, so do this check
 	 * unconditionally.
 	 */
-	check_pg_class_changes(state->relid, state->pg_class_xmin, lock_held);
-
-	/*
-	 * If TOAST relation exists, check it too.
-	 *
-	 * It's questionable whether change of the pg_class of the TOAST relation
-	 * should ever be expected. Let's do it to guard user against accidental
-	 * misuse of the set_reloptions() function. In contrast, we don't check
-	 * changes of TOAST indexes or attributes - these should not happen unless
-	 * allow_system_table_mods GUC is set deliberately.
-	 */
-	toast_relid = state->form_class->reltoastrelid;
-	if (OidIsValid(toast_relid))
-	{
-		/*
-		 * Lock on the relation does not imply lock on its TOAST, so assume
-		 * NoLock.
-		 */
-		check_pg_class_changes(toast_relid, state->toast_xmin, NoLock);
-	}
+	check_pg_class_changes(state);
 
 	/*
 	 * Index change does not necessarily require lock of the parent relation,
 	 * so check indexes unconditionally.
 	 */
-	check_index_changes(state->relid, state->indexes, state->relninds);
+	check_index_changes(state);
 
 	/*
 	 * XXX If any lock level lower than AccessExclusiveLock conflicts with all
 	 * commands that change pg_attribute catalog, skip this check if lock_held
 	 * is at least that level.
 	 */
-	check_attribute_changes(state->relid, state->attr_xmins,
-							state->form_class->relnatts);
+	check_attribute_changes(state);
+
+	/*
+	 * Finally check if any composite type used by the source relation has
+	 * changed.
+	 */
+	if (state->ncomptypes > 0)
+		check_composite_type_changes(state);
 }
 
 static void
-check_pg_class_changes(Oid relid, TransactionId xmin, LOCKMODE lock_held)
+check_pg_class_changes(CatalogState *cat_state)
 {
-	ScanKeyData key[1];
-	HeapTuple	pg_class_tuple = NULL;
-	Relation	pg_class_rel;
-	TupleDesc	pg_class_desc;
-	SysScanDesc pg_class_scan;
-	TransactionId		pg_class_xmin;
+	TransactionId	xmin_current;
 
-	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(relid));
-	pg_class_rel = heap_open(RelationRelationId, AccessShareLock);
-	pg_class_desc = CreateTupleDescCopy(RelationGetDescr(pg_class_rel));
-	pg_class_scan = systable_beginscan(pg_class_rel, ClassOidIndexId,
-									   true, NULL, 1, key);
-	pg_class_tuple = systable_getnext(pg_class_scan);
-
-	/* As the relation might not be locked, it could have disappeared. */
-	if (!HeapTupleIsValid(pg_class_tuple))
-	{
-		Assert(lock_held == NoLock);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 (errmsg("Table no longer exists"))));
-	}
+	get_pg_class_info(cat_state->rel.relid, &xmin_current, NULL, NULL);
 
 	/*
-	 * Check if pg_class(xmin) has changed. Note that it makes no sense to
-	 * check CatalogState.is_catalog here. Even true value does not tell
-	 * whether "user_catalog_option" was never changed back and
-	 * forth. pg_class(xmin) will reveal any change of the storage option.
+	 * Check if pg_class(xmin) has changed.
 	 *
-	 * Besides the "user_catalog_option", we use pg_class(xmin) to detect
-	 * change of pg_class(relfilenode), which indicates heap rewriting or
-	 * TRUNCATE command (or concurrent call of squeeze_table(), but that
-	 * should fail to allocate new replication slot). (Invalid relfilenode
-	 * does not change, but mapped relations are excluded from processing
-	 * by get_catalog_state().)
+	 * The changes caught here include change of pg_class(relfilenode), which
+	 * indicates heap rewriting or TRUNCATE command (or concurrent call of
+	 * squeeze_table(), but that should fail to allocate new replication
+	 * slot). (Invalid relfilenode does not change, but mapped relations are
+	 * excluded from processing by get_catalog_state().)
 	 */
-	pg_class_xmin = HeapTupleHeaderGetXmin(pg_class_tuple->t_data);
-	if (!TransactionIdEquals(pg_class_xmin, xmin))
+	if (!TransactionIdEquals(xmin_current, cat_state->rel.xmin))
 		/* XXX Does more suitable error code exist? */
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("Incompatible DDL or heap rewrite performed concurrently")));
-
-	systable_endscan(pg_class_scan);
-	heap_close(pg_class_rel, AccessShareLock);
-	pfree(pg_class_desc);
 }
 
+/*
+ * Check if any tuple of pg_attribute of given relation has changed. In
+ * addition, if the attribute type is composite, check for its changes too.
+ */
 static void
-check_attribute_changes(Oid relid, TransactionId *attrs, int relnatts)
+check_attribute_changes(CatalogState *cat_state)
 {
 	TransactionId	*attrs_new;
 	int i;
@@ -1400,16 +1480,25 @@ check_attribute_changes(Oid relid, TransactionId *attrs, int relnatts)
 	 * zero if it was zero originally, so there's no info to be compared to
 	 * the current state.
 	 */
-	if (relnatts == 0)
+	if (cat_state->rel.relnatts == 0)
 	{
-		Assert(attrs == NULL);
+		Assert(cat_state->rel.attr_xmins == NULL);
 		return;
 	}
 
-	attrs_new = get_attribute_xmins(relid, relnatts);
-	for (i = 0; i < relnatts; i++)
+	/*
+	 * Check if any row of pg_attribute changed.
+	 *
+	 * If the underlying type is composite, pg_attribute(xmin) will not
+	 * reflect its change, so pass NULL for cat_state to indicate that we're
+	 * not interested in type info at the moment. We'll do that later if all
+	 * the cheaper tests pass.
+	 */
+	get_attribute_info(cat_state->rel.relid, cat_state->rel.relnatts,
+					   &attrs_new, NULL);
+	for (i = 0; i < cat_state->rel.relnatts; i++)
 	{
-		if (!TransactionIdEquals(attrs[i], attrs_new[i]))
+		if (!TransactionIdEquals(cat_state->rel.attr_xmins[i], attrs_new[i]))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_IN_USE),
 					 errmsg("Table definition changed concurrently")));
@@ -1418,20 +1507,21 @@ check_attribute_changes(Oid relid, TransactionId *attrs, int relnatts)
 }
 
 static void
-check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
+check_index_changes(CatalogState *cat_state)
 {
 	IndexCatInfo	*inds_new;
 	int	relninds_new;
 	bool	failed = false;
 	bool	invalid_index;
 
-	if (relninds == 0)
+	if (cat_state->relninds == 0)
 	{
-		Assert(indexes == NULL);
+		Assert(cat_state->indexes == NULL);
 		return;
 	}
 
-	inds_new = get_index_info(relid, &relninds_new, &invalid_index, false);
+	inds_new = get_index_info(cat_state->rel.relid, &relninds_new,
+							  &invalid_index, false);
 
 	/*
 	 * If this field was set to true, no attention was paid to the other
@@ -1440,18 +1530,18 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 	if (invalid_index)
 		failed = true;
 
-	if (!failed && relninds_new != relninds)
+	if (!failed && relninds_new != cat_state->relninds)
 		failed = true;
 
 	if (!failed)
 	{
 		int i;
 
-		for (i = 0; i < relninds; i++)
+		for (i = 0; i < cat_state->relninds; i++)
 		{
 			IndexCatInfo	*ind, *ind_new;
 
-			ind = &indexes[i];
+			ind = &cat_state->indexes[i];
 			ind_new = &inds_new[i];
 			if (ind->oid != ind_new->oid ||
 				!TransactionIdEquals(ind->xmin, ind_new->xmin) ||
@@ -1471,6 +1561,59 @@ check_index_changes(Oid relid, IndexCatInfo *indexes, int relninds)
 }
 
 static void
+check_composite_type_changes(CatalogState *cat_state)
+{
+	int	i;
+	TypeCatInfo	*changed = NULL;
+
+	for (i = 0; i < cat_state->ncomptypes; i++)
+	{
+		TypeCatInfo	*tinfo = &cat_state->comptypes[i];
+		TypeCatInfo tinfo_new;
+		int	j;
+
+		tinfo_new.oid = tinfo->oid;
+		get_composite_type_info(&tinfo_new);
+
+		if (!TransactionIdEquals(tinfo->xmin, tinfo_new.xmin) ||
+			!TransactionIdEquals(tinfo->rel.xmin, tinfo_new.rel.xmin) ||
+			(tinfo->rel.relnatts != tinfo_new.rel.relnatts))
+		{
+			changed = tinfo;
+			break;
+		}
+
+		/*
+		 * Check the individual attributes of the type relation.
+		 *
+		 * This should catch ALTER TYPE ... ALTER ATTRIBUTE ... change of
+		 * attribute data type, which is currently not allowed if the type is
+		 * referenced by any table. Do it yet in this generic way so that we
+		 * don't have to care whether any PG restrictions are relaxed in the
+		 * future.
+		 */
+		for (j = 0; j < tinfo->rel.relnatts; j++)
+		{
+			if (!TransactionIdEquals(tinfo->rel.attr_xmins[j],
+									 tinfo_new.rel.attr_xmins[j]))
+			{
+				changed = tinfo;
+				break;
+			}
+		}
+
+		if (changed != NULL)
+			break;
+	}
+
+	if (changed != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("Concurrent change of composite type %u detected",
+						changed->oid)));
+}
+
+static void
 free_catalog_state(CatalogState *state)
 {
 	if (state->form_class)
@@ -1479,11 +1622,25 @@ free_catalog_state(CatalogState *state)
 	if (state->desc_class)
 		pfree(state->desc_class);
 
-	if (state->attr_xmins)
-		pfree(state->attr_xmins);
+	if (state->rel.attr_xmins)
+		pfree(state->rel.attr_xmins);
 
 	if (state->indexes)
 		pfree(state->indexes);
+
+	if (state->comptypes)
+	{
+		int	i;
+
+		for (i = 0; i < state->ncomptypes; i++)
+		{
+			TypeCatInfo *tinfo = &state->comptypes[i];
+
+			if (tinfo->rel.attr_xmins)
+				pfree(tinfo->rel.attr_xmins);
+		}
+		pfree(state->comptypes);
+	}
 	pfree(state);
 }
 
@@ -2047,7 +2204,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 				 errmsg("only shared relations can be placed in pg_global tablespace")));
 
 	relname = makeStringInfo();
-	appendStringInfo(relname, "tmp_%u", cat_state->relid);
+	appendStringInfo(relname, "tmp_%u", cat_state->rel.relid);
 
 	/*
 	 * Constraints are not created because each data change must be committed
@@ -2064,9 +2221,10 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 	/*
 	 * reloptions must be preserved, so fetch them from the catalog.
 	 */
-	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(cat_state->relid));
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(cat_state->rel.relid));
 	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", cat_state->relid);
+		elog(ERROR, "cache lookup failed for relation %u",
+			 cat_state->rel.relid);
 	reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
 								 &isnull);
 	Assert(!isnull || reloptions == (Datum) 0);
