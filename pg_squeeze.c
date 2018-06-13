@@ -1602,6 +1602,12 @@ check_composite_type_changes(CatalogState *cat_state)
 			}
 		}
 
+		if (tinfo_new.rel.relnatts > 0)
+		{
+			Assert(tinfo_new.rel.attr_xmins != NULL);
+			pfree(tinfo_new.rel.attr_xmins);
+		}
+
 		if (changed != NULL)
 			break;
 	}
