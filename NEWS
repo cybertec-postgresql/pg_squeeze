@@ -43,6 +43,10 @@ Bug fixes
 5. Do not close relation cache entry for index if some field is yet to be
    accessed.
 
+6. Include composite types in the checks of concurrent catalog changes. If
+   table has a column of a composite data type and the type is altered during
+   the squeeze, the squeeze_table() function raises ERROR.
+
 
 Release 1.0.1
 =============
