@@ -107,6 +107,26 @@ typedef struct IndexInsertState
 } IndexInsertState;
 
 /*
+ * Subset of fields of pg_class, plus the necessary info on attributes. It
+ * represents either the source relation or a composite type of the source
+ * relation's attribute.
+ */
+typedef struct PgClassCatInfo
+{
+	/* pg_class(oid) */
+	Oid	relid;
+
+	/*
+	 * pg_class(xmin)
+	 */
+	TransactionId	xmin;
+
+	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
+	TransactionId	*attr_xmins;
+	int16		relnatts;
+} PgClassCatInfo;
+
+/*
  * Information on source relation index, used to build the index on the
  * transient relation. To avoid repeated retrieval of the pg_index fields we
  * also add pg_class(xmin) and pass the same structure to
@@ -123,6 +143,21 @@ typedef struct IndexCatInfo
 } IndexCatInfo;
 
 /*
+ * If the source relation has attribute(s) of composite type, we need to check
+ * for changes of those types.
+ */
+typedef struct TypeCatInfo
+{
+	Oid	oid;					/* pg_type(oid) */
+	TransactionId	xmin;		/* pg_type(xmin) */
+
+	/*
+	 * The pg_class entry whose oid == pg_type(typrelid) of this type.
+	 */
+	PgClassCatInfo	rel;
+} TypeCatInfo;
+
+/*
  * Information to check whether an "incompatible" catalog change took
  * place. Such a change prevents us from completing processing of the current
  * table.
@@ -130,32 +165,27 @@ typedef struct IndexCatInfo
 typedef struct CatalogState
 {
 	/* The relation whose changes we'll check for. */
-	Oid	relid;
+	PgClassCatInfo	rel;
 
-	/* Copy of pg_class tuple. */
+	/* Copy of pg_class tuple of the source relation. */
 	Form_pg_class	form_class;
 
-	/* Copy of pg_class tuple descriptor. */
+	/* Copy of pg_class tuple descriptor of the source relation. */
 	TupleDesc	desc_class;
 
-	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
-	TransactionId	*attr_xmins;
-
-	/* Likewise, per-index info. */
+	/* Per-index info. */
 	int		relninds;
 	IndexCatInfo	*indexes;
 
-	/*
-	 * xmin of the pg_class tuple of the source relation during the initial
-	 * check.
-	 */
-	TransactionId		pg_class_xmin;
-
-	/* The same for TOAST relation, if there's one. */
-	TransactionId		toast_xmin;
+	/* Composite types used by the source rel attributes. */
+	TypeCatInfo		*comptypes;
+	/* Size of the array. */
+	int		ncomptypes_max;
+	/* Used elements of the array. */
+	int		ncomptypes;
 
 	/*
-	 * Does at least one index wrong value of indisvalid, indisready or
+	 * Does at least one index have wrong value of indisvalid, indisready or
 	 * indislive?
 	 */
 	bool	invalid_index;
