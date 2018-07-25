@@ -22,8 +22,8 @@ changes.
 Installation
 ------------
 
-1. Set PG_CONFIG environment variable to point to pg_config command of your
-   PostgreSQL installation (Postgres >= 9.6.3 required!).
+1. Set PG_CONFIG envoirnment variable to point to pg_config command of your
+   PostgreSQL installation.
 
 2. make
 
