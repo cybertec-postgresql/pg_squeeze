@@ -39,6 +39,7 @@
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/standbydefs.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -2482,6 +2483,12 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		ReleaseSysCache(ind_tup);
 
 		/*
+		 * Publish information on what we're going to do. This is especially
+		 * important if parallel workers are used to build the index.
+		 */
+		debug_query_string = "pg_squeeze index build";
+
+		/*
 		 * Neither parentIndexRelid nor parentConstraintId needs to be passed
 		 * since the new catalog entries (pg_constraint, pg_inherits) will
 		 * eventually be dropped. Therefore there's no need to record valid
@@ -2507,6 +2514,8 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   false,
 								   NULL);
 		result[i] = ind_oid_new;
+
+		debug_query_string = NULL;
 
 		index_close(ind, AccessShareLock);
 		list_free_deep(colnames);
