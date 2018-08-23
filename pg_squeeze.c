@@ -2696,12 +2696,7 @@ swap_relation_files(Oid r1, Oid r2)
 		relform1->reltablespace = relform2->reltablespace;
 		relform2->reltablespace = swaptemp;
 
-		/*
-		 * Although this condition shouldn't really occur, elog seems wiser
-		 * here than Assert() in this case.
-		 */
-		if (relform1->relpersistence != relform1->relpersistence)
-			elog(ERROR, "relpersistence does not match");
+		Assert(relform1->relpersistence == relform2->relpersistence);
 
 		swaptemp = relform1->reltoastrelid;
 		relform1->reltoastrelid = relform2->reltoastrelid;
