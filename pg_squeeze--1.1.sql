@@ -268,7 +268,10 @@ AS $$
 				-- ... and it should be one for which no
 				-- task was created yet.
 				(u.s > i.last_task_created::timetz OR
-				i.last_task_created ISNULL)
+				i.last_task_created ISNULL OR
+				-- The next schedule can be in front of the
+				-- last task if a new day started.
+				i.last_task_created::date < current_date)
 		)
 		-- Ignore tables for which a task currently exists.
 		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks);
