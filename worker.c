@@ -173,7 +173,11 @@ squeeze_worker_main(Datum main_arg)
 		WorkerConInit	*con;
 
 		con = (WorkerConInit *) DatumGetPointer(arg);
-		BackgroundWorkerInitializeConnection(con->dbname, con->rolename, 0);
+		BackgroundWorkerInitializeConnection(con->dbname, con->rolename
+#if PG_VERSION_NUM >= 110000
+											 , 0 /* flags */
+#endif
+			);
 	}
 	else
 	{
@@ -183,7 +187,11 @@ squeeze_worker_main(Datum main_arg)
 		memcpy(&con, MyBgworkerEntry->bgw_extra,
 			   sizeof(WorkerConInteractive));
 
-		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid, 0);
+		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid
+#if PG_VERSION_NUM >= 110000
+												  , 0
+#endif
+			);
 	}
 
 	SetCurrentStatementStartTimestamp();

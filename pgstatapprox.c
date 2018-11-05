@@ -191,7 +191,11 @@ statapprox_heap(Relation rel, output_type *stat)
 
 	stat->table_len = (uint64) nblocks *BLCKSZ;
 
-	stat->tuple_count = vac_estimate_reltuples(rel, nblocks, scanned,
+	stat->tuple_count = vac_estimate_reltuples(rel,
+#if PG_VERSION_NUM < 110000
+											   false, /* is_analyze */
+#endif
+											   nblocks, scanned,
 											   stat->tuple_count + misc_count);
 
 	/*

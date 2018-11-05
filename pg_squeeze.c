@@ -49,6 +49,10 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#if PG_VERSION_NUM < 100000
+#error "PostgreSQL version 10 or higher is required"
+#endif
+
 PG_MODULE_MAGIC;
 
 #define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
@@ -74,7 +78,9 @@ typedef struct TablespaceInfo
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
+#if PG_VERSION_NUM >= 110000
 static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin);
+#endif
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
 static void get_pg_class_info(Oid relid, TransactionId *xmin,
@@ -851,17 +857,19 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 									logical_read_local_xlog_page,
 									NULL, NULL, NULL);
 
+#if PG_VERSION_NUM >= 110000
 	/*
-	 * PG 11 does introduces the fast_forward field and the call above
-	 * provides us with no option to pass true to
-	 * StartupDecodingContext(). The easiest way to cope with this problem is
-	 * to do additionally what StartupDecodingContext() would do if we could
-	 * pass it fast_forward=true.
+	 * PG 11 introduces the fast_forward field and the call above provides us
+	 * with no option to pass false to StartupDecodingContext(). The easiest
+	 * way to cope with this problem is to do additionally what
+	 * StartupDecodingContext() would do if we could pass it
+	 * fast_forward=true.
 	 */
 	Assert(ctx->fast_forward);
 	LoadOutputPlugin(&ctx->callbacks,
 					 NameStr(MyReplicationSlot->data.plugin));
 	ctx->fast_forward = false;
+#endif
 
 	DecodingContextFindStartpoint(ctx);
 
@@ -878,7 +886,12 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tupdesc_change = CreateTemplateTupleDesc(1, false);
 	TupleDescInitEntry(dstate->tupdesc_change, 1, NULL, BYTEAOID, -1, 0);
 	/* ... as well as the corresponding slot. */
+#if PG_VERSION_NUM >= 110000
 	dstate->tsslot = MakeTupleTableSlot(dstate->tupdesc_change);
+#else
+	dstate->tsslot = MakeTupleTableSlot();
+	ExecSetSlotDescriptor(dstate->tsslot, dstate->tupdesc_change);
+#endif
 
 	dstate->data_size = 0;
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
@@ -890,6 +903,7 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	return ctx;
 }
 
+#if PG_VERSION_NUM >= 110000
 /*
  * Copy & pasted from logical.c in PG core.
  */
@@ -914,6 +928,7 @@ LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin)
 	if (callbacks->commit_cb == NULL)
 		elog(ERROR, "output plugins have to register a commit callback");
 }
+#endif
 
 
 static void
@@ -1892,7 +1907,10 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	if (use_sort)
 		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
 											cluster_idx, maintenance_work_mem,
-											false, false);
+#if PG_VERSION_NUM >= 110000
+											NULL,
+#endif
+											false);
 
 	/*
 	 * If tuplesort is not applicable, we store as much data as we can into
@@ -2202,7 +2220,12 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 */
 		aclresult = pg_tablespace_aclcheck(tablespace, relowner, ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, OBJECT_TABLESPACE,
+			aclcheck_error(aclresult,
+#if PG_VERSION_NUM >= 110000
+						   OBJECT_TABLESPACE,
+#else
+						   ACL_KIND_TABLESPACE,
+#endif
 						   get_tablespace_name(tablespace));
 	}
 	if (tablespace == GLOBALTABLESPACE_OID)
@@ -2244,7 +2267,11 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		form_class->relkind, form_class->relpersistence,
 		false, false, true, 0,
 		ONCOMMIT_NOOP, reloptions,
-		false, false, false, InvalidOid, NULL);
+		false, false, false,
+#if PG_VERSION_NUM >= 110000
+		InvalidOid,
+#endif
+		NULL);
 
 	Assert(OidIsValid(result));
 
@@ -2328,7 +2355,11 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		size_t	oid_arr_size;
 		size_t	int2_arr_size;
 		int16	*indoptions;
+#if PG_VERSION_NUM >= 110000
 		bits16	flags;
+#else
+		bool	isconstraint;
+#endif
 
 		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
@@ -2390,9 +2421,14 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		resetStringInfo(ind_name);
 		appendStringInfo(ind_name, "ind_%d", i);
 
+#if PG_VERSION_NUM >= 110000
 		flags = 0;
 		if (ind->rd_index->indisprimary)
 			flags |= INDEX_CREATE_IS_PRIMARY;
+#else
+		isconstraint = ind->rd_index->indisprimary || ind_info->ii_Unique ||
+			ind->rd_index->indisexclusion;
+#endif
 
 		colnames = NIL;
 		indnatts = ind->rd_index->indnatts;
@@ -2482,11 +2518,13 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 		ReleaseSysCache(ind_tup);
 
+#if PG_VERSION_NUM >= 110000
 		/*
 		 * Publish information on what we're going to do. This is especially
 		 * important if parallel workers are used to build the index.
 		 */
 		debug_query_string = "pg_squeeze index build";
+#endif
 
 		/*
 		 * Neither parentIndexRelid nor parentConstraintId needs to be passed
@@ -2497,8 +2535,10 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		ind_oid_new = index_create(rel_dst,
 								   ind_name->data,
 								   InvalidOid,
-								   InvalidOid,
-								   InvalidOid,
+#if PG_VERSION_NUM >= 110000
+								   InvalidOid, /* parentIndexRelid */
+								   InvalidOid, /* parentConstraintId */
+#endif
 								   InvalidOid,
 								   ind_info,
 								   colnames,
@@ -2508,14 +2548,31 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   opclasses,
 								   indoptions,
 								   PointerGetDatum(ind->rd_options),
-								   flags,
-								   0,
-								   false,
-								   false,
-								   NULL);
+#if PG_VERSION_NUM >= 110000
+								   flags, /* flags */
+								   0,	  /* constr_flags */
+#else
+								   ind->rd_index->indisprimary, /* isprimary */
+								   isconstraint, /* isconstraint */
+								   false, /* deferrable */
+								   false, /* initdeferred */
+#endif
+								   false, /* allow_system_table_mods */
+#if PG_VERSION_NUM >= 110000
+								   false, /* is_internal */
+								   NULL	  /* constraintId */
+#else
+								   false, /* skip_build */
+								   false, /* concurrent */
+								   false, /* is_internal */
+								   false  /* if_not_exists */
+#endif
+);
 		result[i] = ind_oid_new;
 
+#if PG_VERSION_NUM >= 110000
 		debug_query_string = NULL;
+#endif
 
 		index_close(ind, AccessShareLock);
 		list_free_deep(colnames);
