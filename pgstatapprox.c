@@ -77,7 +77,7 @@ statapprox_heap(Relation rel, output_type *stat)
 	TransactionId OldestXmin;
 	uint64		misc_count = 0;
 
-	OldestXmin = GetOldestXmin(rel, true);
+	OldestXmin = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
 	bstrategy = GetAccessStrategy(BAS_BULKREAD);
 
 	nblocks = RelationGetNumberOfBlocks(rel);
@@ -189,13 +189,13 @@ statapprox_heap(Relation rel, output_type *stat)
 		UnlockReleaseBuffer(buf);
 	}
 
-	stat->table_len = (uint64) nblocks *BLCKSZ;
+	stat->table_len = (uint64) nblocks * BLCKSZ;
 
 	stat->tuple_count = vac_estimate_reltuples(rel,
 #if PG_VERSION_NUM < 110000
-											   false, /* is_analyze */
+						   false, /* is_analyze */
 #endif
-											   nblocks, scanned,
+						   nblocks, scanned,
 											   stat->tuple_count + misc_count);
 
 	/*
