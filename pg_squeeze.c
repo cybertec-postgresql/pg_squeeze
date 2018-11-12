@@ -2579,8 +2579,12 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 			desc = rel_src->rd_att;
 			att = TupleDescAttr(desc, relattno - 1);
 		} else if (relattno == ObjectIdAttributeNumber)
-			att = SystemAttributeDefinition(relattno,
-											rel_src->rd_rel->relhasoids);
+			att =
+#if PG_VERSION_NUM >= 120000
+				(Form_pg_attribute)
+#endif
+				SystemAttributeDefinition(relattno,
+										  rel_src->rd_rel->relhasoids);
 		else
 			elog(ERROR, "Unexpected attribute number %d in index", relattno);
 

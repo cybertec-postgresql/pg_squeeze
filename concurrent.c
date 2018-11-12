@@ -255,7 +255,11 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
 
 			/* Update indexes. */
+#if PG_VERSION_NUM >= 120000
+			ExecStoreHeapTuple(tup, slot, false);
+#else
 			ExecStoreTuple(tup, slot, InvalidBuffer, false);
+#endif
 			recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
 											iistate->estate, false, NULL,
 											NIL);
@@ -330,7 +334,12 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 				{
 					List	*recheck;
 
+#if PG_VERSION_NUM >= 120000
+					ExecStoreHeapTuple(tup, slot, false);
+#else
 					ExecStoreTuple(tup, slot, InvalidBuffer, false);
+#endif
+
 					recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
 													iistate->estate, false,
 													NULL, NIL);
