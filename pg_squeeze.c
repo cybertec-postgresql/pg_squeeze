@@ -78,9 +78,6 @@ typedef struct TablespaceInfo
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
-#if PG_VERSION_NUM >= 110000
-static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin);
-#endif
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
 static void get_pg_class_info(Oid relid, TransactionId *xmin,
@@ -859,16 +856,9 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 
 #if PG_VERSION_NUM >= 110000
 	/*
-	 * PG 11 introduces the fast_forward field and the call above provides us
-	 * with no option to pass false to StartupDecodingContext(). The easiest
-	 * way to cope with this problem is to do additionally what
-	 * StartupDecodingContext() would do if we could pass it
-	 * fast_forward=true.
+	 * We don't have control on setting fast_forward, so at least check it.
 	 */
-	Assert(ctx->fast_forward);
-	LoadOutputPlugin(&ctx->callbacks,
-					 NameStr(MyReplicationSlot->data.plugin));
-	ctx->fast_forward = false;
+	Assert(!ctx->fast_forward);
 #endif
 
 	DecodingContextFindStartpoint(ctx);
@@ -902,34 +892,6 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	ctx->output_writer_private = dstate;
 	return ctx;
 }
-
-#if PG_VERSION_NUM >= 110000
-/*
- * Copy & pasted from logical.c in PG core.
- */
-static void
-LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin)
-{
-	LogicalOutputPluginInit plugin_init;
-
-	plugin_init = (LogicalOutputPluginInit)
-		load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
-
-	if (plugin_init == NULL)
-		elog(ERROR, "output plugins have to declare the _PG_output_plugin_init symbol");
-
-	/* ask the output plugin to fill the callback struct */
-	plugin_init(callbacks);
-
-	if (callbacks->begin_cb == NULL)
-		elog(ERROR, "output plugins have to register a begin callback");
-	if (callbacks->change_cb == NULL)
-		elog(ERROR, "output plugins have to register a change callback");
-	if (callbacks->commit_cb == NULL)
-		elog(ERROR, "output plugins have to register a commit callback");
-}
-#endif
-
 
 static void
 decoding_cleanup(LogicalDecodingContext *ctx)
