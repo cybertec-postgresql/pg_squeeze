@@ -2588,6 +2588,20 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 		opno = get_opfamily_member(opfamily, att->atttypid, att->atttypid,
 								   BTEqualStrategyNumber);
 
+		/*
+		 * Array type is not likely to be a column of the identity index, so
+		 * search for the array equality operator only if the previous check
+		 * failed.
+		 */
+		if (!OidIsValid(opno))
+		{
+			Oid	elmtype = get_element_type(att->atttypid);
+
+			if (OidIsValid(elmtype))
+				opno = get_opfamily_member(opfamily, ANYARRAYOID, ANYARRAYOID,
+										   BTEqualStrategyNumber);
+		}
+
 		if (!OidIsValid(opno))
 			elog(ERROR, "Failed to find = operator for type %u",
 				 att->atttypid);
