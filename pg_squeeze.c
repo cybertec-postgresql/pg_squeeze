@@ -2309,7 +2309,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		List	*colnames;
 		int16	indnatts;
 		Oid	*collations, *opclasses;
-		HeapTuple	ind_tup;
+		HeapTuple	tup;
 		bool	isnull;
 		Datum	d;
 		oidvector *oidvec;
@@ -2317,6 +2317,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		size_t	oid_arr_size;
 		size_t	int2_arr_size;
 		int16	*indoptions;
+		text	*reloptions = NULL;
 #if PG_VERSION_NUM >= 110000
 		bits16	flags;
 #else
@@ -2461,24 +2462,29 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		 * Special effort needed for variable length attributes of
 		 * Form_pg_index.
 		 */
-		ind_tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(ind_oid));
-		if (!HeapTupleIsValid(ind_tup))
+		tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(ind_oid));
+		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "cache lookup failed for index %u", ind_oid);
-		d = SysCacheGetAttr(INDEXRELID, ind_tup, Anum_pg_index_indclass,
-							&isnull);
+		d = SysCacheGetAttr(INDEXRELID, tup, Anum_pg_index_indclass, &isnull);
 		Assert(!isnull);
 		oidvec = (oidvector *) DatumGetPointer(d);
 		opclasses = (Oid *) palloc(oid_arr_size);
 		memcpy(opclasses, oidvec->values, oid_arr_size);
 
-		d = SysCacheGetAttr(INDEXRELID, ind_tup, Anum_pg_index_indoption,
+		d = SysCacheGetAttr(INDEXRELID, tup, Anum_pg_index_indoption,
 							&isnull);
 		Assert(!isnull);
 		int2vec = (int2vector *) DatumGetPointer(d);
 		indoptions = (int16 *) palloc(int2_arr_size);
 		memcpy(indoptions, int2vec->values, int2_arr_size);
+		ReleaseSysCache(tup);
 
-		ReleaseSysCache(ind_tup);
+		tup = SearchSysCache1(RELOID, ObjectIdGetDatum(ind_oid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for index relation %u", ind_oid);
+		d = SysCacheGetAttr(RELOID, tup, Anum_pg_class_reloptions, &isnull);
+		reloptions = !isnull ? DatumGetTextPCopy(d) : NULL;
+		ReleaseSysCache(tup);
 
 #if PG_VERSION_NUM >= 110000
 		/*
@@ -2509,7 +2515,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   collations,
 								   opclasses,
 								   indoptions,
-								   PointerGetDatum(ind->rd_options),
+								   PointerGetDatum(reloptions),
 #if PG_VERSION_NUM >= 110000
 								   flags, /* flags */
 								   0,	  /* constr_flags */
@@ -2540,6 +2546,9 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		list_free_deep(colnames);
 		pfree(collations);
 		pfree(opclasses);
+		pfree(indoptions);
+		if (reloptions)
+			pfree(reloptions);
 	}
 
 	return result;
