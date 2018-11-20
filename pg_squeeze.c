@@ -2577,7 +2577,7 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 		ScanKey	entry;
 		int16	relattno;
 		Form_pg_attribute	att;
-		Oid	opfamily, opno, opcode;
+		Oid	opfamily, opcintype, opno, opcode;
 
 		entry = &result[i];
 		relattno = ident_idx->indkey.values[i];
@@ -2598,26 +2598,12 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 			elog(ERROR, "Unexpected attribute number %d in index", relattno);
 
 		opfamily = ident_idx_rel->rd_opfamily[i];
-		opno = get_opfamily_member(opfamily, att->atttypid, att->atttypid,
+		opcintype = ident_idx_rel->rd_opcintype[i];
+		opno = get_opfamily_member(opfamily, opcintype, opcintype,
 								   BTEqualStrategyNumber);
 
-		/*
-		 * Array type is not likely to be a column of the identity index, so
-		 * search for the array equality operator only if the previous check
-		 * failed.
-		 */
 		if (!OidIsValid(opno))
-		{
-			Oid	elmtype = get_element_type(att->atttypid);
-
-			if (OidIsValid(elmtype))
-				opno = get_opfamily_member(opfamily, ANYARRAYOID, ANYARRAYOID,
-										   BTEqualStrategyNumber);
-		}
-
-		if (!OidIsValid(opno))
-			elog(ERROR, "Failed to find = operator for type %u",
-				 att->atttypid);
+			elog(ERROR, "Failed to find = operator for type %u", opcintype);
 
 		opcode = get_opcode(opno);
 		if (!OidIsValid(opcode))
