@@ -1,3 +1,19 @@
+Release 1.1.1
+=============
+
+Bug fixes
+---------
+
+1. Fixed failure to find equality operator for index scan. The failure was
+   observed when the column type (e.g. varchar) differed from the operator
+   class input type (e.g. text).
+
+2. Use index reloptions in the correct format when creating indexes on the new
+   table. The bug could cause crash, however it should not lead to corruption
+   of the original reloptions since the new catalog entries are eventually
+   dropped (only storage of the new index is used).
+
+
 Release 1.1.0
 =============
 
