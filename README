@@ -224,9 +224,7 @@ periodically.
 Upgrade from pg_squeeze 1.0.x
 -----------------------------
 
-1. Set PG_CONFIG 
-
-variable to point to pg_config command of your
+1. Set PG_CONFIG environment variable to point to pg_config command of your
    PostgreSQL installation.
 
 2. make
