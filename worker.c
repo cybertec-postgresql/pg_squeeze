@@ -143,6 +143,7 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 
 	snprintf(worker->bgw_name, BGW_MAXLEN, "squeeze worker for database %s",
 			 dbname);
+	snprintf(worker->bgw_type, BGW_MAXLEN, "squeeze worker");
 
 	worker->bgw_notify_pid = notify_pid;
 }
