@@ -286,6 +286,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	int	i, ident_key_nentries;
 	IndexInsertState	*iistate;
 	LogicalDecodingContext	*ctx;
+	ReplicationSlot *slot;
 	Snapshot	snap_hist;
 	TupleDesc	tup_desc;
 	CatalogState		*cat_state;
@@ -482,6 +483,19 @@ squeeze_table(PG_FUNCTION_ARGS)
 	 * changes.
 	 */
 	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
+
+	/*
+	 * We no longer need to preserve the rows processed during the initial
+	 * load from VACUUM. (User should not run VACUUM on a table that we
+	 * currently process, but our stale effective_xmin would also restrict
+	 * VACUUM on other tables.)
+	 */
+	slot = ctx->slot;
+	SpinLockAcquire(&slot->mutex);
+	Assert(TransactionIdIsValid(slot->effective_xmin) &&
+		   !TransactionIdIsValid(slot->data.xmin));
+	slot->effective_xmin = InvalidTransactionId;
+	SpinLockRelease(&slot->mutex);
 
 	/*
 	 * The historic snapshot won't be needed anymore.
