@@ -127,12 +127,9 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			   dstate->data_size < maintenance_wm_bytes)
 		{
 			XLogRecord *record;
+			XLogSegNo	segno_new;
 			char	   *errm = NULL;
-
-			/*
-			 * setup_decoding() must have read some XLOG records by now.
-			 */
-			Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
+			XLogRecPtr	end_lsn;
 
 			record = XLogReadRecord(ctx->reader, InvalidXLogRecPtr, &errm);
 			if (errm)
@@ -144,13 +141,28 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			if (processing_time_elapsed(must_complete))
 				break;
 
+			/*
+			 * If WAL segment boundary has been crossed, inform PG core that
+			 * we no longer need the previous segment.
+			 */
+			end_lsn = ctx->reader->EndRecPtr;
+#if PG_VERSION_NUM >= 110000
+			XLByteToSeg(end_lsn, segno_new, wal_segment_size);
+#else
+			XLByteToSeg(end_lsn, segno_new);
+#endif
+			if (segno_new != squeeze_current_segment)
+			{
+				LogicalConfirmReceivedLocation(end_lsn);
+				elog(DEBUG1, "Confirmed receive location %X/%X",
+					 (uint32) (end_lsn >> 32), (uint32) end_lsn);
+				squeeze_current_segment = segno_new;
+			}
+
 			CHECK_FOR_INTERRUPTS();
 		}
 		InvalidateSystemCaches();
 		CurrentResourceOwner = resowner_old;
-
-		if (ctx->reader->EndRecPtr != InvalidXLogRecPtr)
-			LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 	}
 	PG_CATCH();
 	{

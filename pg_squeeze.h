@@ -18,6 +18,7 @@
 #include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/tuptoaster.h"
+#include "access/xlog_internal.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "nodes/execnodes.h"
@@ -91,6 +92,9 @@ typedef struct DecodingOutputState
 
 	ResourceOwner	resowner;
 } DecodingOutputState;
+
+/* The WAL segment being decoded. */
+extern	XLogSegNo	squeeze_current_segment;
 
 extern void	_PG_init(void);
 

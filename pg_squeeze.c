@@ -76,6 +76,9 @@ typedef struct TablespaceInfo
 	IndexTablespace *indexes;
 } TablespaceInfo;
 
+/* The WAL segment being decoded. */
+XLogSegNo	squeeze_current_segment = 0;
+
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
@@ -876,6 +879,16 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 #endif
 
 	DecodingContextFindStartpoint(ctx);
+
+	/* Some WAL records should have been read. */
+	Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
+
+#if PG_VERSION_NUM >= 110000
+	XLByteToSeg(ctx->reader->EndRecPtr, squeeze_current_segment,
+				wal_segment_size);
+#else
+	XLByteToSeg(ctx->reader->EndRecPtr, squeeze_current_segment);
+#endif
 
 	/*
 	 * Setup structures to store decoded changes.
