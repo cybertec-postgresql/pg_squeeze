@@ -504,8 +504,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	/*
 	 * This is rather paranoia than anything else --- perform_initial_load()
-	 * uses each snapshot to access different table, and it does not catalog
-	 * changes.
+	 * uses each snapshot to access different table, and it does not cause
+	 * catalog changes.
 	 */
 	InvalidateSystemCaches();
 
@@ -522,8 +522,8 @@ squeeze_table(PG_FUNCTION_ARGS)
 	check_catalog_changes(cat_state, AccessShareLock);
 
 	/*
-	 * Make sure the contents of the transient table contents is visible for
-	 * the scan(s) during index build.
+	 * Make sure the contents of the transient table is visible for the
+	 * scan(s) during index build.
 	 */
 	CommandCounterIncrement();
 
