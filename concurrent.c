@@ -189,6 +189,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						 ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot	*slot;
+#if PG_VERSION_NUM >= 120000
+	TupleTableSlot	*ind_slot;
+#endif
 	Form_pg_index ident_form;
 	int2vector	*ident_indkey;
 	HeapTuple tup_old = NULL;
@@ -203,8 +206,17 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	ident_indkey = &ident_form->indkey;
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
+#if PG_VERSION_NUM >= 120000
+	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsMinimalTuple);
+#else
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc);
+#endif
 	iistate->econtext->ecxt_scantuple = slot;
+
+#if PG_VERSION_NUM >= 120000
+	/* A slot to fetch tuples from identity index. */
+	ind_slot = table_slot_create(relation, NULL);
+#endif
 
 	/*
 	 * In case functions in the index need the active snapshot and caller
@@ -218,6 +230,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	while (tuplestore_gettupleslot(dstate->tstore, true, false,
 								   dstate->tsslot))
 	{
+#if PG_VERSION_NUM >= 120000
+		bool	shouldFree;
+#endif
 		HeapTuple tup_change, tup, tup_exist;
 		char	*change_raw;
 		ConcurrentChange	*change;
@@ -225,9 +240,19 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		Datum	values[1];
 
 		/* Get the change from the single-column tuple. */
+#if PG_VERSION_NUM >= 120000
+		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
+#else
 		tup_change = ExecFetchSlotTuple(dstate->tsslot);
+#endif
 		heap_deform_tuple(tup_change, dstate->tupdesc_change, values, isnull);
 		Assert(!isnull[0]);
+
+#if PG_VERSION_NUM >= 120000
+		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
+		Assert(shouldFree);
+		pfree(tup_change);
+#endif
 
 		/* This is bytea, but char* is easier to work with. */
 		change_raw = (char *) DatumGetByteaP(values[0]);
@@ -272,8 +297,13 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #else
 			ExecStoreTuple(tup, slot, InvalidBuffer, false);
 #endif
-			recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
-											iistate->estate, false, NULL,
+			recheck = ExecInsertIndexTuples(slot,
+#if PG_VERSION_NUM < 120000
+											&(tup->t_self),
+#endif
+											iistate->estate,
+											false,
+											NULL,
 											NIL);
 
 			/*
@@ -333,7 +363,21 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 												  &isnull);
 				Assert(!isnull);
 			}
+#if PG_VERSION_NUM >= 120000
+			if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
+			{
+				bool	shouldFree;
+
+				tup_exist = ExecFetchSlotHeapTuple(ind_slot, false,
+												   &shouldFree);
+				/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
+				Assert(!shouldFree);
+			}
+			else
+				tup_exist = NULL;
+#else
 			tup_exist = index_getnext(scan, ForwardScanDirection);
+#endif
 			if (tup_exist == NULL)
 				elog(ERROR, "Failed to find target tuple");
 			ItemPointerCopy(&tup_exist->t_self, &ctid);
@@ -352,9 +396,14 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 					ExecStoreTuple(tup, slot, InvalidBuffer, false);
 #endif
 
-					recheck = ExecInsertIndexTuples(slot, &(tup->t_self),
-													iistate->estate, false,
-													NULL, NIL);
+					recheck = ExecInsertIndexTuples(slot,
+#if PG_VERSION_NUM < 120000
+													&(tup->t_self),
+#endif
+													iistate->estate,
+													false,
+													NULL,
+													NIL);
 					list_free(recheck);
 				}
 
@@ -399,6 +448,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 	ExecDropSingleTupleTableSlot(slot);
+#if PG_VERSION_NUM >= 120000
+	ExecDropSingleTupleTableSlot(ind_slot);
+#endif
 }
 
 static bool

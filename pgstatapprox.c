@@ -22,6 +22,9 @@
  */
 #include "postgres.h"
 
+#if PG_VERSION_NUM >= 120000
+#include "access/heapam.h"
+#endif
 #include "access/visibilitymap.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -35,7 +38,9 @@
 #include "storage/procarray.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#if PG_VERSION_NUM < 120000
 #include "utils/tqual.h"
+#endif
 #include "commands/vacuum.h"
 
 PG_FUNCTION_INFO_V1(squeeze_pgstattuple_approx);

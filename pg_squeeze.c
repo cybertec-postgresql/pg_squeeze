@@ -30,7 +30,11 @@
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
 #include "nodes/makefuncs.h"
+#if PG_VERSION_NUM >= 120000
+#include "optimizer/optimizer.h"
+#else
 #include "optimizer/planner.h"
+#endif
 #include "replication/logicalfuncs.h"
 #include "replication/snapbuild.h"
 #include "storage/bufmgr.h"
@@ -47,7 +51,10 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+#if PG_VERSION_NUM < 120000
 #include "utils/tqual.h"
+#endif
 
 #if PG_VERSION_NUM < 100000
 #error "PostgreSQL version 10 or higher is required"
@@ -469,8 +476,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* The source relation will be needed for the initial load. */
 	rel_src = heap_open(relid_src, AccessShareLock);
 
-	/* NoLock, it's only visible by us. */
-	rel_dst = heap_open(relid_dst, NoLock);
+	/*
+	 * The new relation should not be visible for other transactions until we
+	 * commit, but exclusive lock just makes sense.
+	 */
+	rel_dst = heap_open(relid_dst, AccessExclusiveLock);
 
 	toastrelid_dst = rel_dst->rd_rel->reltoastrelid;
 
@@ -686,7 +696,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 	/* The destination table is no longer necessary, so close it. */
 	/* XXX (Should have been closed right after
 	 * process_concurrent_changes()?) */
-	heap_close(rel_dst, NoLock);
+	heap_close(rel_dst, AccessExclusiveLock);
 
 	/*
 	 * Exchange storage (including TOAST) and indexes between the source and
@@ -866,8 +876,12 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	 * initial load could miss some data. (Unlike logical decoding, we need
 	 * the historical snapshot for non-catalog tables.)
 	 */
-	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME, NIL,
+	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
+									NIL,
 									true,
+#if PG_VERSION_NUM >= 120000
+									InvalidXLogRecPtr,
+#endif
 									logical_read_local_xlog_page,
 									NULL, NULL, NULL);
 
@@ -900,14 +914,19 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tupdesc = tup_desc;
 
 	/* Initialize the descriptor to store the changes ... */
+#if PG_VERSION_NUM >= 120000
+	dstate->tupdesc_change = CreateTemplateTupleDesc(1);
+#else
 	dstate->tupdesc_change = CreateTemplateTupleDesc(1, false);
+#endif
+
 	TupleDescInitEntry(dstate->tupdesc_change, 1, NULL, BYTEAOID, -1, 0);
 	/* ... as well as the corresponding slot. */
-#if PG_VERSION_NUM >= 110000
-	dstate->tsslot = MakeTupleTableSlot(dstate->tupdesc_change);
+#if PG_VERSION_NUM >= 120000
+	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change,
+											  &TTSOpsMinimalTuple);
 #else
-	dstate->tsslot = MakeTupleTableSlot();
-	ExecSetSlotDescriptor(dstate->tsslot, dstate->tupdesc_change);
+	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change);
 #endif
 
 	dstate->data_size = 0;
@@ -996,8 +1015,15 @@ get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
 	 * not export it.
 	 */
 	rel = heap_open(RelationRelationId, AccessShareLock);
-	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(relid));
+	ScanKeyInit(&key[0],
+#if PG_VERSION_NUM >= 120000
+				Anum_pg_class_oid,
+#else
+				ObjectIdAttributeNumber,
+#endif
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(relid));
 	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
 	tuple = systable_getnext(scan);
 
@@ -1173,8 +1199,15 @@ get_composite_type_info(TypeCatInfo *tinfo)
 
 	/* Find the pg_type tuple. */
 	rel = heap_open(TypeRelationId, AccessShareLock);
-	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(tinfo->oid));
+	ScanKeyInit(&key[0],
+#if PG_VERSION_NUM >= 120000
+				Anum_pg_type_oid,
+#else
+				ObjectIdAttributeNumber,
+#endif
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(tinfo->oid));
 	scan = systable_beginscan(rel, TypeOidIndexId, true, NULL, 1, key);
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
@@ -1271,7 +1304,7 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		 * First, perform the simple checks that can make the next work
 		 * unnecessary.
 		 */
-		if (!IndexIsValid(form) || !IndexIsReady(form) || !IndexIsLive(form))
+		if (!form->indisvalid || !form->indisready || !form->indislive)
 		{
 			*found_invalid = true;
 			break;
@@ -1335,8 +1368,15 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	oids_a = construct_array(oids_d, n, OIDOID, oidlen, oidbyval, oidalign);
 	pfree(oids_d);
 
-	ScanKeyInit(&key[0], ObjectIdAttributeNumber, BTEqualStrategyNumber,
-				F_OIDEQ, PointerGetDatum(oids_a));
+	ScanKeyInit(&key[0],
+#if PG_VERSION_NUM >= 120000
+				Anum_pg_class_oid,
+#else
+				ObjectIdAttributeNumber,
+#endif
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				PointerGetDatum(oids_a));
 	key[0].sk_flags |= SK_SEARCHARRAY;
 	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
 	i = 0;
@@ -1815,7 +1855,9 @@ build_historic_snapshot(SnapBuild *builder)
 	 * XXX Remove this assignment as soon as all the supported PG versions
 	 * have the problem fixed.
 	 */
+#if PG_VERSION_NUM < 120000
 	result->satisfies = HeapTupleSatisfiesMVCC;
+#endif
 
 	return result;
 }
@@ -1836,7 +1878,12 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	bool	tuple_array_can_expand = true;
 	Tuplesortstate *tuplesort = NULL;
 	Relation	cluster_idx = NULL;
+#if PG_VERSION_NUM >= 120000
+	TableScanDesc	heap_scan = NULL;
+	TupleTableSlot	*slot;
+#else
 	HeapScanDesc	heap_scan = NULL;
+#endif
 	IndexScanDesc	index_scan = NULL;
 	HeapTuple	*tuples = NULL;
 	ResourceOwner	res_owner_old, res_owner_plan;
@@ -1886,16 +1933,25 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		use_sort = false;
 
 	if (use_sort || cluster_idx == NULL)
+#if PG_VERSION_NUM >= 120000
+		heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
+#else
 		heap_scan = heap_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
+#endif
 	else
 	{
 		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, 0, 0);
 		index_rescan(index_scan, NULL, 0, NULL, 0);
 	}
 
+#if PG_VERSION_NUM >= 120000
+	slot = table_slot_create(rel_src, NULL);
+#endif
+
 	if (use_sort)
 		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
-											cluster_idx, maintenance_work_mem,
+											cluster_idx,
+											maintenance_work_mem,
 #if PG_VERSION_NUM >= 110000
 											NULL,
 #endif
@@ -1918,9 +1974,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	bistate = GetBulkInsertState();
 
 	/*
-	 * There processing can take many iterations. In case any data
-	 * manipulation below leaked, try to defend against out-of-memory
-	 * conditions by using a separate memory context.
+	 * The processing can take many iterations. In case any data manipulation
+	 * below leaked, try to defend against out-of-memory conditions by using a
+	 * separate memory context.
 	 */
 	load_cxt = AllocSetContextCreate(CurrentMemoryContext,
 									 "pg_squeeze initial load cxt",
@@ -1968,13 +2024,37 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			}
 
 			/*
-			 * Perform the tuple retrieval in the original context so that any
-			 * scan data is not freed during the cleanup between batches.
+			 * Perform the tuple retrieval in the original context so that no
+			 * scan data is freed during the cleanup between batches.
 			 */
 			MemoryContextSwitchTo(old_cxt);
+#if PG_VERSION_NUM >= 120000
+			{
+				bool	res, shouldFree;
+
+				if (use_sort || cluster_idx == NULL)
+					res = table_scan_getnextslot(heap_scan,
+												 ForwardScanDirection,
+												 slot);
+				else
+					res = index_getnext_slot(index_scan,
+											 ForwardScanDirection,
+											 slot);
+
+				if (res)
+				{
+					tup_in = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
+					/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
+					Assert(!shouldFree);
+				}
+				else
+					tup_in = NULL;
+			}
+#else
 			tup_in = use_sort || cluster_idx == NULL ?
 				heap_getnext(heap_scan, ForwardScanDirection) :
 				index_getnext(index_scan, ForwardScanDirection);
+#endif
 			MemoryContextSwitchTo(load_cxt);
 
 			/*
@@ -2160,9 +2240,18 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		pfree(tuples);
 
 	if (heap_scan != NULL)
+#if PG_VERSION_NUM >= 120000
+		table_endscan(heap_scan);
+#else
 		heap_endscan(heap_scan);
+#endif
+
 	if (index_scan != NULL)
 		index_endscan(index_scan);
+
+#if PG_VERSION_NUM >= 120000
+	ExecDropSingleTupleTableSlot(slot);
+#endif
 
 	/*
 	 * Unlock the index, but not the relation yet - caller will do so when
@@ -2248,19 +2337,35 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 								 &isnull);
 	Assert(!isnull || reloptions == (Datum) 0);
 
-	result = heap_create_with_catalog(
-		relname->data,
-		form_class->relnamespace, tablespace,
-		InvalidOid, InvalidOid, InvalidOid,
-		form_class->relowner, tup_desc, NIL,
-		form_class->relkind, form_class->relpersistence,
-		false, false, true, 0,
-		ONCOMMIT_NOOP, reloptions,
-		false, false, false,
-#if PG_VERSION_NUM >= 110000
-		InvalidOid,
+	result = heap_create_with_catalog(relname->data,
+									  form_class->relnamespace,
+									  tablespace,
+									  InvalidOid,
+									  InvalidOid,
+									  InvalidOid,
+									  form_class->relowner,
+#if PG_VERSION_NUM >= 120000
+									  form_class->relam,
 #endif
-		NULL);
+									  tup_desc,
+									  NIL,
+									  form_class->relkind,
+									  form_class->relpersistence,
+									  false,
+									  false,
+#if PG_VERSION_NUM < 120000
+									  true, /* oidisloal */
+									  0,	/* oidinhcount */
+#endif
+									  ONCOMMIT_NOOP,
+									  reloptions,
+									  false,
+									  false,
+									  false,
+#if PG_VERSION_NUM >= 110000
+									  InvalidOid, /* relrewrite */
+#endif
+									  NULL);
 
 	Assert(OidIsValid(result));
 
@@ -2332,7 +2437,9 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		Relation	ind;
 		IndexInfo	*ind_info;
 		int	j, heap_col_id;
+#if PG_VERSION_NUM < 110000
 		StringInfo	col_name_buf = NULL;
+#endif
 		List	*colnames;
 		int16	indnatts;
 		Oid	*collations, *opclasses;
@@ -2461,6 +2568,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 				collations[j] = att->attcollation;
 				ReleaseSysCache(tuple);
 			}
+#if PG_VERSION_NUM < 120000
 			else if (heap_col_id == ObjectIdAttributeNumber)
 			{
 				/*
@@ -2479,6 +2587,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 				colname = pstrdup(col_name_buf->data);
 				collations[j] = InvalidOid;
 			}
+#endif
 			else
 				elog(ERROR, "Unexpected column number: %d",
 					 heap_col_id);
@@ -2614,13 +2723,13 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 
 			desc = rel_src->rd_att;
 			att = TupleDescAttr(desc, relattno - 1);
-		} else if (relattno == ObjectIdAttributeNumber)
-			att =
-#if PG_VERSION_NUM >= 120000
-				(Form_pg_attribute)
-#endif
+		}
+#if PG_VERSION_NUM < 120000
+		else if (relattno == ObjectIdAttributeNumber)
+			att = (Form_pg_attribute)
 				SystemAttributeDefinition(relattno,
 										  rel_src->rd_rel->relhasoids);
+#endif
 		else
 			elog(ERROR, "Unexpected attribute number %d in index", relattno);
 
@@ -2946,8 +3055,7 @@ swap_relation_files(Oid r1, Oid r2)
  *
  * The storage of TOAST tables and their indexes have already been swapped.
  *
- * On exit we hold AccessExclusiveLock on the TOAST relations and their
- * indexes.
+ * On exit we hold AccessExclusiveLock on the TOAST relations and their indexes.
  */
 static void
 swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
@@ -2974,7 +3082,11 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	 * unnecessary.
 	 */
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_", relid1);
+#if PG_VERSION_NUM >= 120000
+	RenameRelationInternal(toastrelid2, name, true, false);
+#else
 	RenameRelationInternal(toastrelid2, name, true);
+#endif
 
 	/*
 	 * XXX While toast_open_indexes (PG core) can retrieve multiple indexes,
@@ -2982,27 +3094,45 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	 * released someday, either generate the underscore-terminated names as
 	 * above or copy names of the indexes of toastrel1 (the number of indexes
 	 * should be identical). Order should never be important, as toastrel2
-	 * will eventually be dropped.q
+	 * will eventually be dropped.
 	 */
 	toastidxid = get_toast_index(toastrelid2);
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
+	/*
+	 * Pass is_index=false so that even the index is locked in
+	 * AccessExclusiveLock mode. ShareUpdateExclusiveLock mode (allowing
+	 * concurrent read / write access to the index or even its renaming)
+	 * should not be a problem at this stage of table squeezing, but it'd also
+	 * bring little benefit (the table is locked exclusively, so no one should
+	 * need read / write access to the TOAST indexes).
+	 */
+#if PG_VERSION_NUM >= 120000
+	RenameRelationInternal(toastidxid, name, true, false);
+#else
 	RenameRelationInternal(toastidxid, name, true);
+#endif
 	CommandCounterIncrement();
 
 	/* Now set the desired names on the TOAST stuff of relid1. */
 	snprintf(name, NAMEDATALEN, "pg_toast_%u", relid1);
+#if PG_VERSION_NUM >= 120000
+	RenameRelationInternal(toastrelid1, name, true, false);
+#else
 	RenameRelationInternal(toastrelid1, name, true);
+#endif
 	toastidxid = get_toast_index(toastrelid1);
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index", relid1);
+#if PG_VERSION_NUM >= 120000
+	RenameRelationInternal(toastidxid, name, true, false);
+#else
 	RenameRelationInternal(toastidxid, name, true);
+#endif
 	CommandCounterIncrement();
-
-	/* Do not bother to fix names for relid2 - they'll be dropped anyway. */
 }
 
 /*
  * The function is called after RenameRelationInternal() which does not
- * release AccessExclusiveLock.
+ * release the lock it acquired.
  */
 static Oid
 get_toast_index(Oid toastrelid)
