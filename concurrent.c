@@ -207,7 +207,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
 #if PG_VERSION_NUM >= 120000
-	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsMinimalTuple);
+	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
 #else
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc);
 #endif
@@ -248,16 +248,10 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		heap_deform_tuple(tup_change, dstate->tupdesc_change, values, isnull);
 		Assert(!isnull[0]);
 
-#if PG_VERSION_NUM >= 120000
-		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
-		Assert(shouldFree);
-		pfree(tup_change);
-#endif
-
 		/* This is bytea, but char* is easier to work with. */
 		change_raw = (char *) DatumGetByteaP(values[0]);
 
-		change = (ConcurrentChange *) (change_raw + MAXALIGN(VARHDRSZ));
+		change = (ConcurrentChange *) VARDATA(change_raw);
 
 		/*
 		 * Do not keep buffer pinned for insert if the current change is
@@ -366,12 +360,12 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #if PG_VERSION_NUM >= 120000
 			if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
 			{
-				bool	shouldFree;
+				bool	shouldFreeInd;
 
 				tup_exist = ExecFetchSlotHeapTuple(ind_slot, false,
-												   &shouldFree);
+												   &shouldFreeInd);
 				/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
-				Assert(!shouldFree);
+				Assert(!shouldFreeInd);
 			}
 			else
 				tup_exist = NULL;
@@ -432,6 +426,12 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			CommandCounterIncrement();
 			UpdateActiveSnapshotCommandId();
 		}
+
+#if PG_VERSION_NUM >= 120000
+		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
+		Assert(shouldFree);
+		pfree(tup_change);
+#endif
 	}
 
 	elog(DEBUG1,
@@ -693,7 +693,7 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 	MemoryContextSwitchTo(oldcontext);
 
 	SET_VARSIZE(change_raw, size);
-	change = (ConcurrentChange *) (change_raw + MAXALIGN(VARHDRSZ));
+	change = (ConcurrentChange *) VARDATA(change_raw);
 
 	/*
 	 * Copy the tuple.

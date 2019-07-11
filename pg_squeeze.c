@@ -1999,7 +1999,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			 * maintenance_work_mem itself, we must check if the tuple array
 			 * does.
 			 *
-			 * Since the tuple cannot be put back to the scan, it'd be make
+			 * Since the tuple cannot be put back to the scan, it'd make
 			 * things tricky if we involved the current tuple in the
 			 * computation. Since the unit of maintenance_work_mem is kB, one
 			 * extra tuple shouldn't hurt too much.
@@ -2030,7 +2030,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			MemoryContextSwitchTo(old_cxt);
 #if PG_VERSION_NUM >= 120000
 			{
-				bool	res, shouldFree;
+				bool	res;
 
 				if (use_sort || cluster_idx == NULL)
 					res = table_scan_getnextslot(heap_scan,
@@ -2043,6 +2043,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 				if (res)
 				{
+					bool	shouldFree;
+
 					tup_in = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
 					/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
 					Assert(!shouldFree);
@@ -2437,7 +2439,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		Relation	ind;
 		IndexInfo	*ind_info;
 		int	j, heap_col_id;
-#if PG_VERSION_NUM < 110000
+#if PG_VERSION_NUM < 120000
 		StringInfo	col_name_buf = NULL;
 #endif
 		List	*colnames;
