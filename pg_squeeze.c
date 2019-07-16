@@ -2395,10 +2395,12 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		Assert(!isnull || reloptions == (Datum) 0);
 
 		/*
-		 * No lock is needed on the target relation - no other transaction
-		 * should be able to see it yet.
+		 * No lock is needed on the target relation since no other transaction
+		 * should be able to see it until our transaction commits. However,
+		 * table_open() is eventually called and that would cause assertion
+		 * failure if we passed NoLock. We can pass any other lock mode.
 		 */
-		NewHeapCreateToastTable(result, reloptions, NoLock);
+		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock);
 
 		ReleaseSysCache(tuple);
 
