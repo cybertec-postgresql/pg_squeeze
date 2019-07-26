@@ -221,8 +221,8 @@ although the background worker does unregister non-existing tables
 periodically.
 
 
-Upgrade from pg_squeeze 1.0.x
------------------------------
+Upgrade from pg_squeeze 1.0.x or 1.1.x
+--------------------------------------
 
 1. Set PG_CONFIG environment variable to point to pg_config command of your
    PostgreSQL installation.

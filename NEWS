@@ -1,3 +1,29 @@
+Release 1.2.0
+=============
+
+New features
+------------
+
+1. Support for PostgreSQL 12.
+
+2. Do not hide old row versions from VACUUM for longer than necessary.
+
+   The "initial load" phase of the squeeze process uses a "historic snapshot"
+   to retrieve the table data as it was when the squeeze_table() function
+   started. This data must be protected from VACUUM.
+
+   pg_squeeze uses replication slot for this purpose, so it's not possible to
+   protect only one particular table from VACUUM. Since this approach affects
+   the whole cluster, the protection needs to be released as soon as the
+   initial load has completed.
+
+3. Try harder to make WAL segments available for archiving.
+
+   Data changes performed during the squeeze process are retrieved from
+   WAL. Now we check more often if particular WAL segment is still needed by
+   pg_squeeze.
+
+
 Release 1.1.1
 =============
 
