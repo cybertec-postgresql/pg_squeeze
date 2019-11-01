@@ -258,7 +258,7 @@ MVCC-unsafe behavior described in the first paragraph of [5].
 References
 ----------
 
-[1] http://reorg.github.com/pg_repack
+[1] https://reorg.github.io/pg_repack/
 
 [2] https://www.postgresql.org/docs/9.6/static/sql-cluster.html
 
