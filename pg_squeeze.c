@@ -65,6 +65,7 @@ PG_MODULE_MAGIC;
 #define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
+static void squeeze_table_internal(PG_FUNCTION_ARGS);
 static int index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* Index-to-tablespace mapping. */
@@ -282,6 +283,32 @@ extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
 Datum
 squeeze_table(PG_FUNCTION_ARGS)
+{
+	PG_TRY();
+	{
+		squeeze_table_internal(fcinfo);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Special effort is needed to release the replication slot because,
+		 * unlike other resources, AbortTransaction() does not release
+		 * it. While the transaction is aborted if an ERROR is caught in the
+		 * main loop of postgres.c, it would not do if the ERROR was trapped
+		 * at lower level in the stack. The typical case is that
+		 * squeeze_table() is called from pl/pgsql function.
+		 */
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	PG_RETURN_VOID();
+}
+
+static void
+squeeze_table_internal(PG_FUNCTION_ARGS)
 {
 	Name	   relschema, relname;
 	RangeVar   *relrv_src;
@@ -732,8 +759,6 @@ squeeze_table(PG_FUNCTION_ARGS)
 	object.objectSubId = 0;
 	object.objectId = relid_dst;
 	performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
-
-	PG_RETURN_VOID();
 }
 
 static int
@@ -837,14 +862,6 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	LogicalDecodingContext *ctx;
 	DecodingOutputState	*dstate;
 	MemoryContext oldcontext;
-
-	/*
-	 * postgres.c should have done the cleanup if the squeeze_table() was
-	 * called interactively, but that does not happen if it was called from
-	 * plpgsql function and the ERROR was trapped.
-	 */
-	if (MyReplicationSlot != NULL)
-		ReplicationSlotRelease();
 
 	/* check_permissions() "inlined", as logicalfuncs.c does not export it.*/
 	if (!superuser() && !has_rolreplication(GetUserId()))
