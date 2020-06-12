@@ -137,6 +137,19 @@ CAUTION! "squeeze.table" is the only table user should modify. If you want to
 change anything else, make sure you perfectly understand what you are doing.
 
 
+Ad-hoc processing for any table
+-------------------------------
+
+It's also possible to "squeeze" tables manually without registering, skipping any time and bloat
+checks.
+
+Function signature: `squeeze.squeeze_table(tabchema name, tabname name, clustering_index name, rel_tablespace name, ind_tablespaces name[])`
+
+Sample execution:
+
+    SELECT squeeze.squeeze_table('public', 'pgbench_accounts', null, null, null);
+
+
 Enable / disable table processing
 ---------------------------------
 
