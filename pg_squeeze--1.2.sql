@@ -238,43 +238,14 @@ AS $$
 			ON c.relnamespace = n.oid);
 $$;
 
--- Create tasks for newly qualifying tables.
-CREATE FUNCTION add_new_tasks() RETURNS void
+-- Update the information on free space for table that has valid
+-- tables_internal(class_id).
+CREATE FUNCTION update_free_space_info() RETURNS void
 LANGUAGE sql
 AS $$
-	-- The previous estimates are obsolete now.
 	UPDATE squeeze.tables_internal
-	SET free_space = NULL, class_id = NULL, class_id_toast = NULL;
-
-	-- Mark tables that we're interested in.
-	UPDATE	squeeze.tables_internal i
-	SET class_id = c.oid, class_id_toast = c.reltoastrelid
-	FROM	pg_catalog.pg_stat_user_tables s,
-		squeeze.tables t,
-		pg_class c, pg_namespace n
-	WHERE
-		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
-		i.table_id = t.id AND
-		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
-		c.relname = t.tabname AND
-		-- Is there a matching schedule?
-		EXISTS (
-		       SELECT	u.s
-		       FROM	squeeze.tables t_sub,
-		       		UNNEST(t_sub.schedule) u(s)
-		       WHERE	t_sub.id = t.id AND
-		       		-- The schedule must have passed ...
-		       		u.s <= now()::timetz AND
-				-- ... and it should be one for which no
-				-- task was created yet.
-				(u.s > i.last_task_created::timetz OR
-				i.last_task_created ISNULL OR
-				-- The next schedule can be in front of the
-				-- last task if a new day started.
-				i.last_task_created::date < current_date)
-		)
-		-- Ignore tables for which a task currently exists.
-		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks);
+	SET free_space = NULL
+	WHERE class_id NOTNULL;
 
 	-- If VACUUM completed recenly enough, we consider the percentage of
 	-- dead tuples negligible and so retrieve the free space from FSM.
@@ -312,6 +283,47 @@ AS $$
 	SET	free_space = a.free_space
 	FROM	t_approx a
 	WHERE	i.table_id = a.table_id;
+$$;
+
+-- Create tasks for newly qualifying tables.
+CREATE FUNCTION add_new_tasks() RETURNS void
+LANGUAGE sql
+AS $$
+	-- The previous estimates are obsolete now.
+	UPDATE squeeze.tables_internal
+	SET free_space = NULL, class_id = NULL, class_id_toast = NULL;
+
+	-- Mark tables that we're interested in.
+	UPDATE	squeeze.tables_internal i
+	SET class_id = c.oid, class_id_toast = c.reltoastrelid
+	FROM	pg_catalog.pg_stat_user_tables s,
+		squeeze.tables t,
+		pg_class c, pg_namespace n
+	WHERE
+		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
+		i.table_id = t.id AND
+		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
+		c.relname = t.tabname AND
+		-- Is there a matching schedule?
+		EXISTS (
+		       SELECT	u.s
+		       FROM	squeeze.tables t_sub,
+				UNNEST(t_sub.schedule) u(s)
+		       WHERE	t_sub.id = t.id AND
+				-- The schedule must have passed ...
+				u.s <= now()::timetz AND
+				-- ... and it should be one for which no
+				-- task was created yet.
+				(u.s > i.last_task_created::timetz OR
+				i.last_task_created ISNULL OR
+				-- The next schedule can be in front of the
+				-- last task if a new day started.
+				i.last_task_created::date < current_date)
+		)
+		-- Ignore tables for which a task currently exists.
+		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks);
+
+	SELECT squeeze.update_free_space_info();
 
 	-- Create a new task for each table having more free space than
 	-- needed.
