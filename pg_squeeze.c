@@ -132,8 +132,6 @@ static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
 static Oid get_toast_index(Oid toastrelid);
 
-int squeeze_worker_naptime;
-
 /*
  * The maximum time to hold AccessExclusiveLock during the final
  * processing. Note that it only process_concurrent_changes() execution time
@@ -162,8 +160,8 @@ _PG_init(void)
 {
 	DefineCustomStringVariable(
 		"squeeze.worker_autostart",
-		"OIDs of databases for which squeeze worker starts automatically.",
-		"Comma-separated list for which squeeze worker starts as soon as "
+		"OIDs of databases for which background workers start automatically.",
+		"Comma-separated list for of databases which squeeze worker starts as soon as "
 		"the cluster startup has completed.",
 		&squeeze_worker_autostart,
 		NULL,
@@ -173,24 +171,13 @@ _PG_init(void)
 
 	DefineCustomStringVariable(
 		"squeeze.worker_role",
-		"Role that background worker uses to connect to database.",
+		"Role that background workers use to connect to database.",
 		"If background worker was launched automatically on cluster startup, "
 		"it uses this role to initiate database connection(s).",
 		&squeeze_worker_role,
 		NULL,
 		PGC_POSTMASTER,
 		0,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"squeeze.worker_naptime",
-		"Sleep time (in seconds) of the squeeze worker.",
-		"If there are no tables eligible for squeezing, the background worker "
-		"sleeps this amount of seconds and then tries again.",
-		&squeeze_worker_naptime,
-		60, 1, INT_MAX,
-		PGC_SIGHUP,
-		GUC_UNIT_S,
 		NULL, NULL, NULL);
 
 	if (squeeze_worker_autostart)
@@ -255,8 +242,12 @@ _PG_init(void)
 			BackgroundWorker worker;
 
 			dbname = lfirst(lc);
-			con = allocate_worker_con_info(dbname, squeeze_worker_role);
 
+			con = allocate_worker_con_info(dbname, squeeze_worker_role, true);
+			squeeze_initialize_bgworker(&worker, con, NULL, 0);
+			RegisterBackgroundWorker(&worker);
+
+			con = allocate_worker_con_info(dbname, squeeze_worker_role, false);
 			squeeze_initialize_bgworker(&worker, con, NULL, 0);
 			RegisterBackgroundWorker(&worker);
 		}

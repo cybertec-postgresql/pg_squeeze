@@ -30,22 +30,25 @@
 
 extern Datum start_worker(PG_FUNCTION_ARGS);
 
-static void squeeze_worker_sighup(SIGNAL_ARGS);
-static void squeeze_worker_sigterm(SIGNAL_ARGS);
+static void start_worker_internal(bool scheduler);
+
+static void worker_sighup(SIGNAL_ARGS);
+static void worker_sigterm(SIGNAL_ARGS);
+
+static void scheduler_worker_loop(void);
+static void squeeze_worker_loop(void);
 
 static void run_command(char *command);
 static int64 get_task_count(void);
 
+/*
+ * The function name is ..._worker instead of ..._workers for historic reasons
+ * (originally there was only one worker). Is it worth changing?
+ */
 PG_FUNCTION_INFO_V1(squeeze_start_worker);
 Datum
 squeeze_start_worker(PG_FUNCTION_ARGS)
 {
-	WorkerConInteractive	con;
-	BackgroundWorker worker;
-	BackgroundWorkerHandle *handle;
-	BgwHandleStatus status;
-	pid_t		pid;
-
 	/*
 	 * The worker eventually runs squeeze_table() function, which in turn
 	 * creates a replication slot.
@@ -55,10 +58,31 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to start squeeze worker"))));
 
+	start_worker_internal(true);
+	start_worker_internal(false);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Register either scheduler or squeeze worker, according to the argument.
+ */
+static void
+start_worker_internal(bool scheduler)
+{
+	WorkerConInteractive	con;
+	BackgroundWorker worker;
+	BackgroundWorkerHandle *handle;
+	BgwHandleStatus status;
+	pid_t		pid;
+	char	*kind = scheduler ? "scheduler" : "squeeze";
+
 	con.dbid = MyDatabaseId;
 	con.roleid = GetUserId();
+	con.scheduler = scheduler;
 	squeeze_initialize_bgworker(&worker, NULL, &con, MyProcPid);
 
+	ereport(DEBUG1, (errmsg("registering pg_squeeze %s worker", kind)));
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
@@ -79,7 +103,8 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
 				 errhint("Kill all remaining database processes and restart the database.")));
 	Assert(status == BGWH_STARTED);
 
-	PG_RETURN_INT32(pid);
+	ereport(DEBUG1,
+			(errmsg("pg_squeeze %s worker started, pid=%d", kind, pid)));
 }
 
 /*
@@ -90,7 +115,7 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
  * provide enough space for us.)
  */
 WorkerConInit *
-allocate_worker_con_info(char *dbname, char *rolename)
+allocate_worker_con_info(char *dbname, char *rolename, bool scheduler)
 {
 	WorkerConInit	*result;
 
@@ -98,6 +123,7 @@ allocate_worker_con_info(char *dbname, char *rolename)
 													  sizeof(WorkerConInit));
 	result->dbname = MemoryContextStrdup(TopMemoryContext, dbname);
 	result->rolename = MemoryContextStrdup(TopMemoryContext, rolename);
+	result->scheduler = scheduler;
 	return result;
 }
 
@@ -106,9 +132,11 @@ void
 squeeze_initialize_bgworker(BackgroundWorker *worker,
 							WorkerConInit *con_init,
 							WorkerConInteractive *con_interactive,
-							Oid notify_pid)
+							pid_t notify_pid)
 {
 	char	*dbname;
+	bool	scheduler;
+	char	*kind;
 
 	worker->bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -121,6 +149,7 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 	{
 		worker->bgw_main_arg = (Datum) PointerGetDatum(con_init);
 		dbname = con_init->dbname;
+		scheduler = con_init->scheduler;
 	}
 	else if (con_interactive != NULL)
 	{
@@ -137,12 +166,15 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 		 * explains why we still must use the OID for worker registration.
 		 */
 		dbname = get_database_name(con_interactive->dbid);
+		scheduler = con_interactive->scheduler;
 	}
 	else
 		elog(ERROR, "Connection info not available for squeeze worker.");
 
-	snprintf(worker->bgw_name, BGW_MAXLEN, "squeeze worker for database %s",
-			 dbname);
+	kind = scheduler ? "scheduler" : "squeeze";
+	snprintf(worker->bgw_name, BGW_MAXLEN,
+			 "pg_squeeze %s worker for database %s",
+			 kind, dbname);
 #if PG_VERSION_NUM >= 110000
 	snprintf(worker->bgw_type, BGW_MAXLEN, "squeeze worker");
 #endif
@@ -153,6 +185,41 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
+/*
+ * Sleep time (in seconds) of the scheduler worker.
+ *
+ * If there are no tables eligible for squeezing, the worker sleeps this
+ * amount of seconds and then try again. The value should be low enough to
+ * ensure that no scheduled table processing is missed, while the schedule
+ * granularity is one minute.
+ *
+ * So far there seems to be no reason to have separate variables for the
+ * scheduler and the squeeze worker.
+ */
+static int worker_naptime = 20;
+
+/*
+ * There are 2 kinds of worker: 1) scheduler, which creates new tasks, 2) the
+ * actual "squeeze worker" which calls the squeeze_table() function. With
+ * scheduling independent from the actual table processing we check the table
+ * status exactly (with the granularity of one minute) at the scheduled
+ * time. This way we avoid the tricky question how long should particular
+ * schedule stay valid and thus we can use equality operator to check if the
+ * scheduled time is there.
+ *
+ * There are 2 alternatives to the equality test: 1) schedule is valid for
+ * some time interval which is hard to define, 2) the schedule is valid
+ * forever - this is bad because it allows table processing even hours after
+ * the schedule if the table happens to get bloated some time after the
+ * schedule.
+ *
+ * If the squeeze_table() function makes the following tasks delayed, it's
+ * another problem that we can address by increasing the number of "squeeze
+ * workers". (In that case we'd have to adjust the replication slot naming
+ * scheme so that there are no conflicts.)
+ */
+static bool am_i_scheduler = false;
+
 void
 squeeze_worker_main(Datum main_arg)
 {
@@ -160,11 +227,11 @@ squeeze_worker_main(Datum main_arg)
 	Oid	extension_id;
 	LOCKTAG		tag;
 	LockAcquireResult	lock_res;
-	long	delay;
-	int64	ntasks;
+	int16	objsubid;
+	char	*kind;
 
-	pqsignal(SIGHUP, squeeze_worker_sighup);
-	pqsignal(SIGTERM, squeeze_worker_sigterm);
+	pqsignal(SIGHUP, worker_sighup);
+	pqsignal(SIGTERM, worker_sigterm);
 	BackgroundWorkerUnblockSignals();
 
 	/* Retrieve connection info. */
@@ -176,6 +243,7 @@ squeeze_worker_main(Datum main_arg)
 		WorkerConInit	*con;
 
 		con = (WorkerConInit *) DatumGetPointer(arg);
+		am_i_scheduler = con->scheduler;
 		BackgroundWorkerInitializeConnection(con->dbname, con->rolename
 #if PG_VERSION_NUM >= 110000
 											 , 0 /* flags */
@@ -189,13 +257,15 @@ squeeze_worker_main(Datum main_arg)
 		/* Ensure aligned access. */
 		memcpy(&con, MyBgworkerEntry->bgw_extra,
 			   sizeof(WorkerConInteractive));
-
+		am_i_scheduler = con.scheduler;
 		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid
 #if PG_VERSION_NUM >= 110000
 												  , 0
 #endif
 			);
 	}
+
+	kind = am_i_scheduler ? "scheduler" : "squeeze";
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -213,26 +283,88 @@ squeeze_worker_main(Datum main_arg)
 	 * the tag manually elsewhere, to request the lock conditionally. So be
 	 * consistent.
 	 */
+	objsubid = am_i_scheduler ? 0 : 1;
 	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, ExtensionRelationId, extension_id,
-					   0);
+					   objsubid);
 	lock_res = LockAcquire(&tag, ExclusiveLock, false, true);
 
 	if (lock_res == LOCKACQUIRE_NOT_AVAIL)
 	{
 		elog(WARNING,
-			 "one squeeze worker is already running on %u database",
-			 MyDatabaseId);
+			 "one %s worker is already running on %u database",
+			 kind, MyDatabaseId);
 
 		proc_exit(0);
 	}
 	Assert(lock_res == LOCKACQUIRE_OK);
 
-	delay = 0L;
-	ntasks = get_task_count();
+	if (am_i_scheduler)
+		scheduler_worker_loop();
+	else
+		squeeze_worker_loop();
+
+	if (!LockRelease(&tag, ExclusiveLock, false))
+		elog(ERROR, "Failed to release extension lock");
+	proc_exit(0);
+}
+
+static void
+worker_sighup(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	got_sighup = true;
+	SetLatch(MyLatch);
+
+	errno = save_errno;
+}
+
+static void
+worker_sigterm(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	got_sigterm = true;
+	SetLatch(MyLatch);
+
+	errno = save_errno;
+}
+
+static void
+scheduler_worker_loop(void)
+{
+	long	delay = 0L;
 
 	while (!got_sigterm)
 	{
 		int	rc;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
+					   PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+
+		if (rc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
+
+		ereport(DEBUG1, (errmsg("scheduler worker: checking the schedule")));
+
+		run_command("SELECT squeeze.check_schedule()");
+
+		/* Check later if any table meets the schedule. */
+		delay = worker_naptime * 1000L;
+	}
+}
+
+static void
+squeeze_worker_loop(void)
+{
+	long	delay = 0L;
+
+	while (!got_sigterm)
+	{
+		int	rc;
+		int64	ntasks, i;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -249,92 +381,43 @@ squeeze_worker_main(Datum main_arg)
 		}
 
 		/*
-		 * Only try to add rows to "tasks" table if performed enough loops to
-		 * process the number we got last time.
+		 * Turn new tasks into ready (or processed if the tables should not
+		 * really be squeezed). The scheduler worker should not do this
+		 * because the checks can take some time.
 		 */
-		if (ntasks == 0)
-		{
-			/*
-			 * Unregister dropped tables instead of creating new tasks for
-			 * them.
-			 */
-			run_command("SELECT squeeze.cleanup_tables()");
+		run_command("SELECT squeeze.dispatch_new_tasks()");
 
-			run_command("SELECT squeeze.add_new_tasks()");
-			ntasks = get_task_count();
-			elog(DEBUG1, "pg_squeeze (dboid=%u): %zd tasks added to queue",
-				 MyDatabaseId, ntasks);
-		}
+		/* Process all the tasks currently ready for processing. */
+		ntasks = get_task_count();
+		ereport(DEBUG1,
+				(errmsg("squeeze worker: %zd tasks to process", ntasks)));
 
+		for (i = 0; i < ntasks; i++)
+			run_command("SELECT squeeze.process_next_task()");
+
+		/*
+		 * Release the replication slot explicitly, ERROR does not ensure
+		 * that. (PostgresMain does that for regular backend in the main
+		 * loop.)
+		 */
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+
+		/*
+		 * Check again if some task is ready for processing, and wait if there
+		 * is none.
+		 *
+		 * Better solution would be to have the scheduler set our latch, but
+		 * the background worker API does not provide an easy way for non-core
+		 * worker to publish his latch. In particular, the worker code cannot
+		 * do anything before the process is forked from the postmaster.
+		 */
+		ntasks = get_task_count();
 		if (ntasks == 0)
-		{
-			/*
-			 * As there's no urgent work, wait some time.
-			 *
-			 * We might calculate how much time the actual work took and
-			 * calculate how long we need to wait so that each iteration
-			 * starts exactly N minutes after the previous one. However tables
-			 * can have the "task_interval" configured to longer time than 1
-			 * minute, so excessive processing time can add to the actual
-			 * task_interval anyway. Simply, the task_interval should be
-			 * considered the *minimum*.
-			 */
-			delay = squeeze_worker_naptime * 1000L;
-			continue;
-		}
+			delay = worker_naptime * 1000L;
 		else
-		{
-			run_command("SELECT squeeze.start_next_task()");
-
-			/* Do the actual work. */
-			run_command("SELECT squeeze.process_current_task()");
-
-			/*
-			 * Release the replication slot explicitly, ERROR does not ensure
-			 * that. (PostgresMain does that for regular backend in the main
-			 * loop.)
-			 */
-			if (MyReplicationSlot != NULL)
-				ReplicationSlotRelease();
-
-			/*
-			 * We don't know if processing succeeded. This variable should
-			 * only minimize the number of calls of get_task_count().
-			 */
-			ntasks--;
-
-			/*
-			 * No reason to wait until ntasks is checked for zero value again.
-			 */
-			delay = 0L;
-		}
+			delay = 0;
 	}
-
-	if (!LockRelease(&tag, ExclusiveLock, false))
-		elog(ERROR, "Failed to release extension lock");
-	proc_exit(0);
-}
-
-static void
-squeeze_worker_sighup(SIGNAL_ARGS)
-{
-	int			save_errno = errno;
-
-	got_sighup = true;
-	SetLatch(MyLatch);
-
-	errno = save_errno;
-}
-
-static void
-squeeze_worker_sigterm(SIGNAL_ARGS)
-{
-	int			save_errno = errno;
-
-	got_sigterm = true;
-	SetLatch(MyLatch);
-
-	errno = save_errno;
 }
 
 /*
@@ -372,7 +455,7 @@ get_task_count(void)
 	Datum	res_datum;
 	bool	isnull;
 	int64	result;
-	char	*command = "SELECT count(*) FROM squeeze.tasks";
+	char	*command = "SELECT count(*) FROM squeeze.tasks WHERE state='ready'";
 #ifdef USE_ASSERT_CHECKING
 	Oid	restype;
 #endif

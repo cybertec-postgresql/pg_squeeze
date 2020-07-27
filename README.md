@@ -157,13 +157,17 @@ To enable automated processing, run this statement as superuser:
 
 	SELECT squeeze.start_worker();
 
-The function starts a background worker that periodically checks which of the
-registered tables are eligible for squeeze and creates and executes tasks for
-them. If the worker is already running for the current database, the function
-does return PID of a new worker, but that new worker will exit immediately.
+The function starts a background worker ("scheduler worker") that periodically
+checks which of the registered tables should be checked according to its
+schedule, and creates a new task for them. Another worker ("squeeze worker")
+is also launched that processes those tasks - note that the processing
+includes check whether the table is bloated enough.
 
-If the background worker is running, you can use the following statement to
-stop it:
+If the workers are already running for the current database, the function does
+not report any error but the new workers will exit immediately.
+
+If the background workers are running, you can use the following statement to
+stop them:
 
 	SELECT squeeze.stop_worker();
 
@@ -171,12 +175,8 @@ CAUTION! Only the functions mentioned in this section are considered user
 interface. If you want to call any other one, make sure you perfectly
 understand what you're doing.
 
-When there's no work to do, the worker sleeps before checking again. The delay
-is controlled by GUC parameter "squeeze.worker_naptime". It's measured in
-seconds and the default value is 1 minute.
-
-If you want the background worker to start automatically during startup of the
-whole PostgreSQL cluster, add entries like this to postgresql.conf file
+If you want the background workers to start automatically during startup of
+the whole PostgreSQL cluster, add entries like this to postgresql.conf file
 
 	squeeze.worker_autostart = 'my_database your_database'
 	squeeze.worker_role = postgres
@@ -192,6 +192,12 @@ will either reject to start or will stop without doing any work if
      2. squeeze.worker_role parameter specifies role which does not have the
      superuser privileges.
 
+Note: The functions/configuration variables explained above use singular form
+of the word "worker" although there are actually two workers. This is because
+only one worker existed in the previous versions of pg_squeeze, which ensured
+both scheduling and execution of the tasks. This implementation change is
+probably not worth to force all users to adjust their configuration files
+during upgrade.
 
 Control the impact on other backends
 ------------------------------------

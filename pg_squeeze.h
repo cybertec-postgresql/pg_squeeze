@@ -98,8 +98,6 @@ extern	XLogSegNo	squeeze_current_segment;
 
 extern void	_PG_init(void);
 
-extern int squeeze_worker_naptime;
-
 /* Everything we need to call ExecInsertIndexTuples(). */
 typedef struct IndexInsertState
 {
@@ -224,6 +222,7 @@ typedef struct WorkerConInit
 {
 	char	*dbname;
 	char	*rolename;
+	bool	scheduler;
 } WorkerConInit;
 
 /*
@@ -237,12 +236,14 @@ typedef struct WorkerConInteractive
 {
 	Oid	dbid;
 	Oid	roleid;
+	bool	scheduler;
 } WorkerConInteractive;
 
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
-											   char *rolename);
+											   char *rolename,
+											   bool scheduler);
 extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
 										WorkerConInit *con_init,
 										WorkerConInteractive *con_interactive,
-										Oid notify_pid);
+										pid_t notify_pid);
 extern void squeeze_worker_main(Datum main_arg);
