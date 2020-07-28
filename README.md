@@ -279,13 +279,13 @@ References
 
 [1] https://reorg.github.io/pg_repack/
 
-[2] https://www.postgresql.org/docs/9.6/static/sql-cluster.html
+[2] https://www.postgresql.org/docs/13/static/sql-cluster.html
 
-[3] https://www.postgresql.org/docs/9.6/static/bgworker.html
+[3] https://www.postgresql.org/docs/13/static/bgworker.html
 
-[4] https://www.postgresql.org/docs/9.6/static/logicaldecoding.html
+[4] https://www.postgresql.org/docs/13/static/logicaldecoding.html
 
-[5] https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html
+[5] https://www.postgresql.org/docs/13/static/mvcc-caveats.html
 
 
 Authors
