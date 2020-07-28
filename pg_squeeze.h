@@ -17,7 +17,9 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/relscan.h"
+#if PG_VERSION_NUM < 130000
 #include "access/tuptoaster.h"
+#endif
 #include "access/xlog_internal.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"

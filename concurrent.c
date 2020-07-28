@@ -11,6 +11,9 @@
 
 #include "pg_squeeze.h"
 
+#if PG_VERSION_NUM >= 130000
+#include "access/heaptoast.h"
+#endif
 #include "executor/executor.h"
 #include "replication/decode.h"
 #include "utils/rel.h"
@@ -131,7 +134,11 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			char	   *errm = NULL;
 			XLogRecPtr	end_lsn;
 
-			record = XLogReadRecord(ctx->reader, InvalidXLogRecPtr, &errm);
+			record = XLogReadRecord(ctx->reader,
+#if PG_VERSION_NUM < 130000
+									InvalidXLogRecPtr,
+#endif
+									&errm);
 			if (errm)
 				elog(ERROR, "%s", errm);
 
