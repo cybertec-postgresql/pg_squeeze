@@ -229,6 +229,7 @@ squeeze_worker_main(Datum main_arg)
 	LockAcquireResult	lock_res;
 	int16	objsubid;
 	char	*kind;
+	MemoryContext ccxt;
 
 	pqsignal(SIGHUP, worker_sighup);
 	pqsignal(SIGTERM, worker_sigterm);
@@ -286,7 +287,7 @@ squeeze_worker_main(Datum main_arg)
 	objsubid = am_i_scheduler ? 0 : 1;
 	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, ExtensionRelationId, extension_id,
 					   objsubid);
-	lock_res = LockAcquire(&tag, ExclusiveLock, false, true);
+	lock_res = LockAcquire(&tag, ExclusiveLock, true, true);
 
 	if (lock_res == LOCKACQUIRE_NOT_AVAIL)
 	{
@@ -298,13 +299,42 @@ squeeze_worker_main(Datum main_arg)
 	}
 	Assert(lock_res == LOCKACQUIRE_OK);
 
-	if (am_i_scheduler)
-		scheduler_worker_loop();
-	else
-		squeeze_worker_loop();
+	/*
+	 * If either loop encounters an error (which might include SIGINT),
+	 * control must not be passed to the background worker loop (bgworker.c)
+	 * until our lock has been released. So just catch the error and report it
+	 * at lower elevel.
+	 */
+	ccxt = CurrentMemoryContext;
+	PG_TRY();
+	{
+		if (am_i_scheduler)
+			scheduler_worker_loop();
+		else
+			squeeze_worker_loop();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *errdata;
+		MemoryContext	oldcxt;
+
+		oldcxt = MemoryContextSwitchTo(ccxt);
+		errdata = CopyErrorData();
+		if (errdata->message)
+			elog(LOG, "%s worker received an error (\"%s\")",
+				 kind, errdata->message);
+		else
+		{
+			/* Should not happen, but ... */
+			elog(LOG, "%s worker received an error", kind);
+		}
+		MemoryContextSwitchTo(oldcxt);
+	}
+	PG_END_TRY();
 
 	if (!LockRelease(&tag, ExclusiveLock, false))
 		elog(ERROR, "Failed to release extension lock");
+
 	proc_exit(0);
 }
 
