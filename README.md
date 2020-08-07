@@ -65,21 +65,40 @@ they were created.
 The simplest "registration" looks like
 
 	INSERT INTO squeeze.tables (tabschema, tabname, schedule)
-	VALUES ('public', 'foo', '{22:30, 03:00}');
+	VALUES ('public', 'foo', ('{30}', '{22}', NULL, NULL, '{3, 5}'));
 
 Additional columns can be specified optionally, for example:
 
 	INSERT INTO squeeze.tables
 	(tabschema, tabname, schedule, free_space_extra, vacuum_max_age,
 	max_retry)
-	VALUES ('public', 'bar', '{22:30, 03:00}', 30, '2 hours', 2);
+	VALUES ('public', 'bar', ('{30}', '{22}', NULL, NULL, '{3, 5}'), 30,
+	'2 hours', 2);
 
 Following is the complete description of table metadata.
 
 * "tabschema" and "tabname" are schema and table name respectively.
 
-* "schedule" column tells at which times of the day the table should be
-  checked. Such a check can possibly result in a new processing task.
+* "schedule" column tells when the table should be checked, and possibly
+  squeezed. The schedule is described by a value of the following composite
+  data type, which resembles a crontab [6] entry:
+
+	CREATE TYPE schedule AS (
+		minutes	minute[],
+		hours	hour[],
+		days_of_month dom[],
+		months month[],
+		days_of_week dow[]
+	);
+
+  Here, "minutes" (0 through 59) and "hours" (0 through 23) specify the time
+  of the check within a day, while "days_of_month" (1 through 31), "months" (1
+  through 12) and "days_of_week" (0 through 6, where 0 stands for Sunday)
+  determine the day of the check. NULL value in any field implies that check
+  of the field always passes.
+
+  For example, in the entries above tell that table "public"."bar" should be
+  checked every Wednesday and Friday at 22:30.
 
 * "free_space_extra" is the minimum percentage of "extra free space" needed to
   trigger processing of the table. The "extra" adjective refers to the fact
@@ -240,8 +259,16 @@ although the background worker does unregister non-existing tables
 periodically.
 
 
-Upgrade from pg_squeeze 1.0.x or 1.1.x
---------------------------------------
+Upgrade from pg_squeeze 1.2.x
+-----------------------------
+
+CAUTION! As there's no straightforward way to migrate the scheduling
+information (see the notes on the "schedule" column of the "squeeze"."tables"
+table) automatically, and as the "schedule" column must not contain NULL
+values, the upgrade deletes the contents of the "squeeze"."tables"
+table. Please export the table contents to a file before you perform the
+upgrade and configure the checks of those tables again as soon as the upgrade
+is done.
 
 1. Set PG_CONFIG environment variable to point to pg_config command of your
    PostgreSQL installation.
@@ -254,7 +281,7 @@ Upgrade from pg_squeeze 1.0.x or 1.1.x
 
 5. Restart the PG instance
 
-6. Connect to each database containing pg_squeeze 1.0.x and run this command:
+6. Connect to each database containing pg_squeeze 1.2.x and run this command:
 
    ALTER EXTENSION pg_squeeze UPDATE;
 
@@ -287,6 +314,7 @@ References
 
 [5] https://www.postgresql.org/docs/13/static/mvcc-caveats.html
 
+[6] https://www.freebsd.org/cgi/man.cgi?query=crontab&sektion=5&apropos=0&manpath=FreeBSD+12.1-RELEASE+and+Ports
 
 Authors
 -------

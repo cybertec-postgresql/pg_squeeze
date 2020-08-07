@@ -8,8 +8,23 @@ ALTER TABLE tables_internal DROP COLUMN class_id_toast;
 ALTER TABLE tables_internal DROP COLUMN free_space;
 ALTER TABLE tables_internal DROP COLUMN last_task_created;
 
-DROP TABLE tasks;
+DELETE FROM tables;
+ALTER TABLE tables DROP COLUMN schedule;
+CREATE DOMAIN minute AS int CHECK (VALUE BETWEEN 0 AND 59);
+CREATE DOMAIN hour AS int CHECK (VALUE BETWEEN 0 AND 23);
+CREATE DOMAIN dom AS int CHECK (VALUE BETWEEN 1 AND 31);
+CREATE DOMAIN month AS int CHECK (VALUE BETWEEN 1 AND 12);
+CREATE DOMAIN dow AS int CHECK (VALUE BETWEEN 0 AND 6);
+CREATE TYPE schedule AS (
+	minutes	minute[],
+	hours	hour[],
+	days_of_month dom[],
+	months month[],
+	days_of_week dow[]);
+ALTER TABLE tables ADD COLUMN schedule schedule NOT NULL;
 
+DROP TABLE tasks;
+CREATE DOMAIN task_state AS TEXT CHECK(VALUE IN ('new', 'ready', 'processed'));
 CREATE TABLE tasks (
 	id		serial	NOT NULL	PRIMARY KEY,
 
@@ -39,6 +54,43 @@ DROP FUNCTION cleanup_task(a_task_id int);
 DROP FUNCTION process_current_task();
 DROP FUNCTION stop_worker();
 
+CREATE VIEW scheduled_for_now AS
+	SELECT	i.table_id, t.tabschema, t.tabname
+	FROM	squeeze.tables_internal i,
+		pg_catalog.pg_stat_user_tables s,
+		squeeze.tables t,
+		pg_class c, pg_namespace n
+	WHERE
+		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
+		i.table_id = t.id AND
+		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
+		c.relname = t.tabname AND
+		(
+			((t.schedule).minutes ISNULL OR
+			EXTRACT(minute FROM now())::int = ANY((t.schedule).minutes))
+			AND
+			((t.schedule).hours ISNULL OR
+			EXTRACT(hour FROM now())::int = ANY((t.schedule).hours))
+			AND
+			((t.schedule).months ISNULL OR
+			EXTRACT(month FROM now())::int = ANY((t.schedule).months))
+			AND
+			(
+				-- At least one of the "days_of_month" and
+				-- "days_of_week" components must
+				-- match. However if one matches, NULL value
+				-- of the other must not be considered "any
+				-- day of month/week". Instead, NULL can only
+				-- cause a match if both components have it.
+				((t.schedule).days_of_month ISNULL AND
+				(t.schedule).days_of_week ISNULL)
+				OR
+				EXTRACT(day FROM now())::int = ANY((t.schedule).days_of_month)
+				OR
+				EXTRACT(isodow FROM now())::int = ANY((t.schedule).days_of_week)
+			)
+		);
+
 CREATE FUNCTION check_schedule() RETURNS void
 LANGUAGE sql
 AS $$
@@ -61,22 +113,20 @@ AS $$
 		(t.tabschema, t.tabname) = (s.schemaname, s.relname) AND
 		i.table_id = t.id AND
 		n.nspname = t.tabschema AND c.relnamespace = n.oid AND
-		c.relname = t.tabname AND
+		c.relname = t.tabname
 		-- Is there a matching schedule?
-		EXISTS (
-		       SELECT	u.s
-		       FROM	squeeze.tables t_sub,
-				UNNEST(t_sub.schedule) u(s)
-		       WHERE	t_sub.id = t.id AND
-		       		EXTRACT(HOUR FROM u.s) = EXTRACT(HOUR FROM now())
-				AND
-				EXTRACT(MINUTE FROM u.s) = EXTRACT(MINUTE FROM now())
+		AND EXISTS (
+			SELECT *
+			FROM squeeze.scheduled_for_now
+			WHERE table_id = i.table_id
 		)
 		-- Ignore tables for which a task currently exists.
 		AND NOT t.id IN (SELECT table_id FROM squeeze.tasks);
 $$;
 
-CREATE FUNCTION update_free_space_info() RETURNS void
+-- Update new tasks with the information on free space in the corresponding
+-- tables.
+CREATE OR REPLACE FUNCTION update_free_space_info() RETURNS void
 LANGUAGE sql
 AS $$
 	-- If VACUUM completed recenly enough, we consider the percentage of
