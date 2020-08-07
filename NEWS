@@ -1,3 +1,36 @@
+Release 1.3.0
+=============
+
+New features
+------------
+
+1. Support for PostgreSQL 13.
+
+2. Enhanced scheduling.
+
+   Instead of passing an array of timetz values, the DBA can now specify the
+   schedule in a way similar to crontab, i.e. days can be specified too. Note
+   that "ALTER EXTENSION pg_squeeze UPDATE" command does not handle conversion
+   of the schedule - instead it deletes the existing contents of the
+   "squeeze"."tables" configuration table.
+
+   Another enhancement is that two background workers are now used: one that
+   checks the schedule and another one that checks the amount of bloat and
+   possibly squeezes the tables. This makes the scheduling more accurate.
+
+
+Bug fixes
+---------
+
+1. Release the replication slot if ERROR is encountered by the background
+   worker during the call of the squeeze_table() function. For interactive
+   calls, pg_squeeze does not have to care because PG core does.
+
+2. Release lock on the pg_squeeze extension (which ensures that no more than
+   one instance of each background worker can be launched) when exiting due to
+   pg_cancel_backend().
+
+
 Release 1.2.0
 =============
 
