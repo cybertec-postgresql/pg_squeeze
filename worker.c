@@ -332,8 +332,7 @@ squeeze_worker_main(Datum main_arg)
 	}
 	PG_END_TRY();
 
-	if (!LockRelease(&tag, ExclusiveLock, false))
-		elog(ERROR, "Failed to release extension lock");
+	LockRelease(&tag, ExclusiveLock, true);
 
 	proc_exit(0);
 }
