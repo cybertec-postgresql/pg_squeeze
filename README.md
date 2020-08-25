@@ -93,9 +93,14 @@ Following is the complete description of table metadata.
 
   Here, "minutes" (0 through 59) and "hours" (0 through 23) specify the time
   of the check within a day, while "days_of_month" (1 through 31), "months" (1
-  through 12) and "days_of_week" (0 through 6, where 0 stands for Sunday)
-  determine the day of the check. NULL value in any field implies that check
-  of the field always passes.
+  through 12) and "days_of_week" (0 through 7, where both 0 and 7 stand for
+  Sunday) determine the day of the check.
+
+  The check is performed if "minute", "hour" and "month" all match the current
+  timestamp, while NULL value means any minute, hour and month
+  respectively. As for "days_of_month" and "days_of_week", at least one of
+  these needs to match the current timestamp, or both need to be NULL for the
+  check to take place.
 
   For example, in the entries above tell that table "public"."bar" should be
   checked every Wednesday and Friday at 22:30.

@@ -14,7 +14,7 @@ CREATE DOMAIN minute AS int CHECK (VALUE BETWEEN 0 AND 59);
 CREATE DOMAIN hour AS int CHECK (VALUE BETWEEN 0 AND 23);
 CREATE DOMAIN dom AS int CHECK (VALUE BETWEEN 1 AND 31);
 CREATE DOMAIN month AS int CHECK (VALUE BETWEEN 1 AND 12);
-CREATE DOMAIN dow AS int CHECK (VALUE BETWEEN 0 AND 6);
+CREATE DOMAIN dow AS int CHECK (VALUE BETWEEN 0 AND 7);
 CREATE TYPE schedule AS (
 	minutes	minute[],
 	hours	hour[],
@@ -87,6 +87,9 @@ CREATE VIEW scheduled_for_now AS
 				OR
 				EXTRACT(day FROM now())::int = ANY((t.schedule).days_of_month)
 				OR
+				EXTRACT(dow FROM now())::int = ANY((t.schedule).days_of_week)
+				OR
+				-- Sunday can be expressed as both 0 and 7.
 				EXTRACT(isodow FROM now())::int = ANY((t.schedule).days_of_week)
 			)
 		);
