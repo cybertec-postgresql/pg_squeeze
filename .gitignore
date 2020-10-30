@@ -1,6 +1,7 @@
 *~
 *.o
 *.so
+pg_squeeze--1.2--1.3.sql
 GPATH
 GRTAGS
 GTAGS
