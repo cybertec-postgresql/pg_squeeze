@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # # -*- coding: utf-8 -*-
 #
 # Copyright (c) 2016-2018, Cybertec Schönig & Schönig GmbH
@@ -76,7 +76,7 @@ def check(cur):
         raise Exception("pg_squeeze is not installed")
     ext_row = cur.fetchone()
     d = globals()
-    if ext_row[0] != "1.1":
+    if ext_row[0] != "1.3":
         raise Exception("Unexpected pg_squeeze version: %s" % (ext_row[0],))
 
     # Make sure that the squeeze worker is off.
@@ -108,7 +108,7 @@ class CommandThread(Thread):
                     self.cmds_executed.append(i)
             con.close()
         except Exception as e:
-            print e
+            print(e)
             stop_single_test(False)
 
 class SqueezeParams(object):
@@ -147,7 +147,7 @@ class SqueezeThread(Thread):
                 "SELECT squeeze.squeeze_table('public', '%s', %s, NULL, NULL)" %
                 (params.table, ind,))
         except Exception as e:
-            print e
+            print(e)
             stop_single_test(False)
 
 # cmds_setup is a list of commands to create the test table and any other
@@ -195,7 +195,7 @@ class Test(object):
 
 # Execute the test suite once.
 def run_single_test(squeeze_thread):
-    print 'Running test...'
+    print('Running test...')
     start_single_test()
 
     for test in tests:
@@ -218,7 +218,7 @@ verification_schema = "expected"
 # Run the same SQL statements on each table again, w/o the interference with
 # squeeze_table(). The resulting tables should be identical.
 def verify_single_test(squeeze_thread, con, con_vac):
-    print "Verifying results..."
+    print("Verifying results...")
     cur = con.cursor()
     cur_vac = con_vac.cursor()
 
@@ -270,9 +270,9 @@ def verify_single_test(squeeze_thread, con, con_vac):
         cur.execute(test.check_query)
         con.commit()
         if cur.rowcount == 0:
-            print 'Test passed for table "%s"' % test.table
+            print('Test passed for table "%s"' % test.table)
         else:
-            print 'Found difference for table "%s"' % test.table
+            print('Found difference for table "%s"' % test.table)
 
     con.close()
     con_vac.close()
@@ -339,7 +339,7 @@ try:
     check(cur)
     check_ok = True
 except Exception as e:
-    print e
+    print(e)
     check_ok = False
 finally:
     con.close()
@@ -347,7 +347,7 @@ finally:
 if not check_ok:
     sys.exit(1)
 
-for i in xrange(args.test_iterations):
+for i in range(args.test_iterations):
     con = get_connection()
     con.autocommit = False
 
@@ -373,7 +373,7 @@ for i in xrange(args.test_iterations):
         # Pay special attention to KeyboardInterrupt because the join() method
         # of Timer can be interrupted, in which case maybe_stop_single_test
         # never gets called.
-        print e
+        print(e)
         stop_single_test(False)
         con.close()
         con_vac.close()
@@ -383,7 +383,7 @@ for i in xrange(args.test_iterations):
             try:
                 verify_single_test(squeeze_thread, con, con_vac)
             except Exception as e:
-                print e
+                print(e)
                 con.close()
                 con_vac.close()
                 sys.exit(1)
