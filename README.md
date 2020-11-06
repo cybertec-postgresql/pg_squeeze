@@ -48,6 +48,11 @@ database has no "squeeze worker" (see "Enable / disable table processing"
 section) running. Otherwise the DROP EXTENSION command will hang until it's
 cancelled.
 
+Note: when upgrading a database cluster with pg_squeeze installed (either using
+`pg_dumpall`/restore or `pg_upgrade`), make sure that the new cluster has
+`pg_squeeze` in `shared_preload_libraries` *before* you upgrade, otherwise
+the upgrade will fail.
+
 
 Register table for regular processing
 -------------------------------------
