@@ -109,7 +109,8 @@ static void cache_composite_type_info(CatalogState *cat_state, Oid typid);
 static void get_composite_type_info(TypeCatInfo *tinfo);
 static IndexCatInfo *get_index_info(Oid relid, int *relninds,
 									bool *found_invalid,
-									bool invalid_check_only);
+									bool invalid_check_only,
+									bool *found_pk);
 static void check_attribute_changes(CatalogState *cat_state);
 static void check_index_changes(CatalogState *state);
 static void check_composite_type_changes(CatalogState *cat_state);
@@ -358,6 +359,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 */
 	ident_idx_src = RelationGetReplicaIndex(rel_src);
 	replident = rel_src->rd_rel->relreplident;
+
+	/* The table can have PK although the replica identity is FULL. */
+	if (ident_idx_src == InvalidOid && rel_src->rd_pkindex != InvalidOid)
+		ident_idx_src = rel_src->rd_pkindex;
+
 	relid_src = RelationGetRelid(rel_src);
 	rel_src_owner = RelationGetForm(rel_src)->relowner;
 	toastrelid_src = rel_src->rd_rel->reltoastrelid;
@@ -425,8 +431,14 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 				 (errmsg("Table \"%s\".\"%s\" has no identity index",
 						 NameStr(*relschema), NameStr(*relname)))));
 
-	/* Change processing w/o index is not a good idea. */
-	if (replident == REPLICA_IDENTITY_FULL)
+	/*
+	 * Change processing w/o PK index is not a good idea.
+	 *
+	 * Note that some users need the "full identity" although the table does
+	 * have PK. ("full identity" + UNIQUE constraint is also a valid setup,
+	 * but it's harder to check).
+	 */
+	if (replident == REPLICA_IDENTITY_FULL && !cat_state->have_pk_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
 				 (errmsg("Replica identity \"full\" not supported"))));
@@ -693,7 +705,7 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * requesting exclusive lock. We should recognize this scenario by
 	 * checking pg_index alone.
 	 */
-	ind_info = get_index_info(relid_src, NULL, &invalid_index, true);
+	ind_info = get_index_info(relid_src, NULL, &invalid_index, true, NULL);
 	if (invalid_index)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -1030,7 +1042,8 @@ get_catalog_state(Oid relid)
 	 * not change from "true" to "false", but let's be cautious anyway.)
 	 */
 	result->indexes = get_index_info(relid, &result->relninds,
-									 &result->invalid_index, false);
+									 &result->invalid_index, false,
+									 &result->have_pk_index);
 
 	/* If any index is "invalid", no more catalog information is needed. */
 	if (result->invalid_index)
@@ -1331,7 +1344,7 @@ get_composite_type_info(TypeCatInfo *tinfo)
  */
 static IndexCatInfo *
 get_index_info(Oid relid, int *relninds, bool *found_invalid,
-			   bool invalid_check_only)
+			   bool invalid_check_only, bool *found_pk)
 {
 	Relation	rel, rel_idx;
 	ScanKeyData key[1];
@@ -1348,6 +1361,8 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	bool		mismatch;
 
 	*found_invalid = false;
+	if (found_pk)
+		*found_pk = false;
 
 	/*
 	 * Open both pg_class and pg_index catalogs at once, so that we have a
@@ -1391,6 +1406,8 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 		res_entry = (IndexCatInfo *) &result[n++];
 		res_entry->oid = form->indexrelid;
 		res_entry->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+		if (found_pk && form->indisprimary)
+			*found_pk = true;
 
 		/*
 		 * Unlike get_attribute_info(), we can't receive the expected number
@@ -1656,6 +1673,7 @@ check_index_changes(CatalogState *cat_state)
 	int	relninds_new;
 	bool	failed = false;
 	bool	invalid_index;
+	bool	have_pk_index;
 
 	if (cat_state->relninds == 0)
 	{
@@ -1664,7 +1682,7 @@ check_index_changes(CatalogState *cat_state)
 	}
 
 	inds_new = get_index_info(cat_state->rel.relid, &relninds_new,
-							  &invalid_index, false);
+							  &invalid_index, false, &have_pk_index);
 
 	/*
 	 * If this field was set to true, no attention was paid to the other
@@ -1674,6 +1692,13 @@ check_index_changes(CatalogState *cat_state)
 		failed = true;
 
 	if (!failed && relninds_new != cat_state->relninds)
+		failed = true;
+
+	/*
+	 * It might be o.k. for the PK index to disappear if the table still has
+	 * an unique constraint, but this is too hard to check.
+	 */
+	if (!failed && cat_state->have_pk_index != have_pk_index)
 		failed = true;
 
 	if (!failed)

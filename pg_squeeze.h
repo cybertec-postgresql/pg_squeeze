@@ -193,6 +193,9 @@ typedef struct CatalogState
 	 * indislive?
 	 */
 	bool	invalid_index;
+
+	/* Does the table have primary key index? */
+	bool	have_pk_index;
 } CatalogState;
 
 extern void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
