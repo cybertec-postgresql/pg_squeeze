@@ -26,6 +26,7 @@
 #include "nodes/execnodes.h"
 #include "postmaster/bgworker.h"
 #include "replication/logical.h"
+#include "replication/origin.h"
 #include "utils/inval.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -85,12 +86,10 @@ typedef struct DecodingOutputState
 	TupleTableSlot	*tsslot;
 
 	/*
-	 * Total amount of space used by "change tuples". We use this field to
-	 * minimize the likelihood that tstore will have to be spilled to
-	 * disk. (Such a spilling should only be necessary for huge transactions,
-	 * because decoding of these cannot be split into multiple steps.)
+	 * WAL records having this origin have been created during the initial
+	 * load and should not be decoded.
 	 */
-	Size	data_size;
+	RepOriginId		rorigin;
 
 	ResourceOwner	resowner;
 } DecodingOutputState;
@@ -211,6 +210,9 @@ extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 									   IndexInsertState *iistate,
 									   LOCKMODE lock_held,
 									   struct timeval *must_complete);
+extern bool decode_concurrent_changes(LogicalDecodingContext *ctx,
+									  XLogRecPtr end_of_wal,
+									  struct timeval *must_complete);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
 /*

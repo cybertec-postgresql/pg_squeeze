@@ -18,9 +18,6 @@
 #include "replication/decode.h"
 #include "utils/rel.h"
 
-static bool decode_concurrent_changes(LogicalDecodingContext *ctx,
-									  XLogRecPtr end_of_wal,
-									  struct timeval *must_complete);
 static void apply_concurrent_changes(DecodingOutputState *dstate,
 									 Relation relation, ScanKey key,
 									 int nkeys, IndexInsertState *iistate);
@@ -38,6 +35,7 @@ static void plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
 static HeapTuple get_changed_tuple(ConcurrentChange *change);
+static bool plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id);
 
 /*
  * Decode and apply concurrent changes. If there are too many of them, split
@@ -96,14 +94,13 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
  * Returns true iff done (for now), i.e. no more changes below the end_of_wal
  * can be decoded.
  */
-static bool
+bool
 decode_concurrent_changes(LogicalDecodingContext *ctx,
 						  XLogRecPtr end_of_wal,
 						  struct timeval *must_complete)
 {
 	DecodingOutputState	*dstate;
 	ResourceOwner	resowner_old;
-	Size	maintenance_wm_bytes;
 
 	/*
 	 * Invalidate the "present" cache before moving to "(recent) history".
@@ -124,10 +121,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 
 	PG_TRY();
 	{
-		maintenance_wm_bytes = (Size) maintenance_work_mem * 1024L;
-
-		while (ctx->reader->EndRecPtr < end_of_wal &&
-			   dstate->data_size < maintenance_wm_bytes)
+		while (ctx->reader->EndRecPtr < end_of_wal)
 		{
 			XLogRecord *record;
 			XLogSegNo	segno_new;
@@ -447,7 +441,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 	tuplestore_clear(dstate->tstore);
 	dstate->nchanges = 0;
-	dstate->data_size = 0;
 
 	PopActiveSnapshot();
 
@@ -536,6 +529,7 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->begin_cb = plugin_begin_txn;
 	cb->change_cb = plugin_change;
 	cb->commit_cb = plugin_commit_txn;
+	cb->filter_by_origin_cb = plugin_filter;
 	cb->shutdown_cb = plugin_shutdown;
 }
 
@@ -726,7 +720,6 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 
 	/* Accounting. */
 	dstate->nchanges++;
-	dstate->data_size += size;
 
 	/* Cleanup. */
 	pfree(change_raw);
@@ -756,4 +749,21 @@ get_changed_tuple(ConcurrentChange *change)
 	memcpy(result->t_data, src, result->t_len);
 
 	return result;
+}
+
+/*
+ * A filter that recognizes changes produced by the initial load.
+ */
+static bool
+plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id)
+{
+	DecodingOutputState	*dstate;
+
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	/* dstate is not initialized during decoding setup - should it be? */
+	if (dstate && origin_id == dstate->rorigin)
+		return true;
+
+	return false;
 }

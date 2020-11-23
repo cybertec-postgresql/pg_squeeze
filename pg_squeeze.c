@@ -122,7 +122,8 @@ static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
 									 ArrayType *ind_tbsp_a);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
-								 Snapshot snap_hist, Relation rel_dst);
+								 Snapshot snap_hist, Relation rel_dst,
+								 LogicalDecodingContext *ctx);
 static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 								  Oid tablespace, Oid relowner);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
@@ -550,7 +551,7 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * The historic snapshot is used to retrieve data w/o concurrent
 	 * changes.
 	 */
-	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst);
+	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst, ctx);
 
 	/*
 	 * We no longer need to preserve the rows processed during the initial
@@ -988,7 +989,6 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change);
 #endif
 
-	dstate->data_size = 0;
 	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
 											"logical decoding");
 
@@ -1993,7 +1993,8 @@ build_historic_snapshot(SnapBuild *builder)
  */
 static void
 perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
-					 Snapshot snap_hist, Relation rel_dst)
+					 Snapshot snap_hist, Relation rel_dst,
+					 LogicalDecodingContext *ctx)
 {
 	bool	use_sort;
 	int	batch_size, batch_max_size;
@@ -2012,6 +2013,22 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	ResourceOwner	res_owner_old, res_owner_plan;
 	BulkInsertState bistate;
 	MemoryContext	load_cxt, old_cxt;
+	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
+	DecodingOutputState	*dstate;
+
+	/*
+	 * The session origin will be used to mark WAL records produced by the
+	 * load itself so that they are not decoded.
+	 */
+	Assert(replorigin_session_origin == InvalidRepOriginId);
+	replorigin_session_origin = replorigin_create("pg_squeeze");
+
+	/*
+	 * Also remember that the WAL records created during the load should not
+	 * be decoded later.
+	 */
+	dstate = (DecodingOutputState *) ctx->output_writer_private;
+	dstate->rorigin = replorigin_session_origin;
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -2081,8 +2098,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 											false);
 
 	/*
-	 * If tuplesort is not applicable, we store as much data as we can into
-	 * memory. The more memory is available, the fewer iterations.
+	 * If tuplesort is not applicable, we store as much data as we can store
+	 * in memory. The more memory is available, the fewer iterations.
 	 */
 	if (!use_sort)
 	{
@@ -2111,6 +2128,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		HeapTuple	tup_in = NULL;
 		int	i;
 		Size	data_size = 0;
+		XLogRecPtr	end_of_wal;
 
 		/* Sorting cannot be split into batches. */
 		for (i = 0;; i++)
@@ -2350,6 +2368,24 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		 * Free possibly-leaked memory.
 		 */
 		MemoryContextReset(load_cxt);
+
+		/*
+		 * Decode the WAL produced by the load, as well as by other
+		 * transactions, so that the replication slot can advance and WAL does
+		 * not pile up. Of course we must not apply the changes until the
+		 * initial load has completed.
+		 *
+		 * Note that the insertions into the new table shouldn't actually be
+		 * decoded, they should be filtered out by their origin.
+		 */
+		end_of_wal = GetFlushRecPtr();
+		if (end_of_wal > end_of_wal_prev)
+		{
+			MemoryContextSwitchTo(old_cxt);
+			decode_concurrent_changes(ctx, end_of_wal, NULL);
+			MemoryContextSwitchTo(load_cxt);
+		}
+		end_of_wal_prev = end_of_wal;
 	}
 	/*
 	 * At whichever stage the loop broke, the historic snapshot should no
@@ -2378,6 +2414,10 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	ExecDropSingleTupleTableSlot(slot);
 #endif
 
+	/* Drop the replication origin. */
+	replorigin_drop(replorigin_session_origin, false);
+	replorigin_session_origin = InvalidRepOriginId;
+
 	/*
 	 * Unlock the index, but not the relation yet - caller will do so when
 	 * appropriate.
@@ -2387,6 +2427,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 	MemoryContextSwitchTo(old_cxt);
 	MemoryContextDelete(load_cxt);
+
+	elog(DEBUG1, "pg_squeeze: the initial load completed");
 }
 
 
