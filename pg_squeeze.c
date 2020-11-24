@@ -734,7 +734,8 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 		}
 		else
 			elog(DEBUG1,
-				 "Exclusive lock on table %u had to be released.", relid_src);
+				 "pg_squeeze: exclusive lock on table %u had to be released.",
+				 relid_src);
 	}
 	if (!source_finalized)
 		ereport(ERROR,
@@ -2538,7 +2539,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 
 	ReleaseSysCache(tuple);
 
-	elog(DEBUG1, "Transient relation created: %u", result);
+	elog(DEBUG1, "pg_squeeze: transient relation created: %u", result);
 
 	/* Make sure the transient relation is visible.  */
 	CommandCounterIncrement();

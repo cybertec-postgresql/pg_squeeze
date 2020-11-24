@@ -155,7 +155,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			if (segno_new != squeeze_current_segment)
 			{
 				LogicalConfirmReceivedLocation(end_lsn);
-				elog(DEBUG1, "Confirmed receive location %X/%X",
+				elog(DEBUG1, "pg_squeeze: confirmed receive location %X/%X",
 					 (uint32) (end_lsn >> 32), (uint32) end_lsn);
 				squeeze_current_segment = segno_new;
 			}
@@ -173,7 +173,8 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 	}
 	PG_END_TRY();
 
-	elog(DEBUG1, "Decoded %.0f changes.", dstate->nchanges);
+	elog(DEBUG1, "pg_squeeze: %.0f changes decoded but not applied yet",
+		 dstate->nchanges);
 
 	return ctx->reader->EndRecPtr >= end_of_wal;
 }
@@ -436,7 +437,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	}
 
 	elog(DEBUG1,
-		 "Concurrent changes applied: %.0f inserts, %.0f updates, %.0f deletes.",
+		 "pg_squeeze: concurrent changes applied: %.0f inserts, %.0f updates, %.0f deletes.",
 		 ninserts, nupdates, ndeletes);
 
 	tuplestore_clear(dstate->tstore);
