@@ -129,7 +129,8 @@ static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes,
 									TablespaceInfo *tbsp_info,
-									CatalogState *cat_state);
+									CatalogState *cat_state,
+									LogicalDecodingContext *ctx);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
 static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
@@ -603,7 +604,8 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
-										  nindexes, tbsp_info, cat_state);
+										  nindexes, tbsp_info, cat_state,
+										  ctx);
 	PopActiveSnapshot();
 
 	/*
@@ -2590,11 +2592,13 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 static Oid *
 build_transient_indexes(Relation rel_dst, Relation rel_src,
 						Oid *indexes_src, int nindexes,
-						TablespaceInfo *tbsp_info, CatalogState *cat_state)
+						TablespaceInfo *tbsp_info, CatalogState *cat_state,
+						LogicalDecodingContext *ctx)
 {
 	StringInfo	ind_name;
 	int	i;
 	Oid	*result;
+	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
 
 	Assert(nindexes > 0);
 
@@ -2627,6 +2631,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 #else
 		bool	isconstraint;
 #endif
+		XLogRecPtr	end_of_wal;
 
 		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
@@ -2855,6 +2860,17 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		pfree(indoptions);
 		if (reloptions)
 			pfree(reloptions);
+
+		/*
+		 * Like in perform_initial_load(), process some WAL so that the
+		 * segment files can be recycled. Unlike the initial load, do not set
+		 * replorigin_session_origin because index changes are not decoded
+		 * anyway.
+		 */
+		end_of_wal = GetFlushRecPtr();
+		if (end_of_wal > end_of_wal_prev)
+			decode_concurrent_changes(ctx, end_of_wal, NULL);
+		end_of_wal_prev = end_of_wal;
 	}
 
 	return result;
