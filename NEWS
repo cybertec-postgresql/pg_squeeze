@@ -11,6 +11,9 @@ New features
    decoded. Thus only changes done by other transactions need to be stored,
    and applied as soon as the initial load has completed.
 
+2. Process even tables with FULL replica identity, as long as they do have a
+   primary key.
+
 
 Release 1.3.1
 =============
