@@ -285,9 +285,11 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
 						RelationGetRelationName(rel))));
 
+#if PG_VERSION_NUM >= 120000
 	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("only heap AM is supported")));
+#endif
 
 	statapprox_heap(rel, &stat);
 

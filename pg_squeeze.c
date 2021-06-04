@@ -1961,8 +1961,13 @@ build_historic_snapshot(SnapBuild *builder)
 	/*
 	 * Likewise, fake MyPgXact->xmin so that the corresponding check passes.
 	 */
+#if PG_VERSION_NUM >= 140000
 	xmin_save = MyProc->xmin;
 	MyProc->xmin = InvalidTransactionId;
+#else
+	xmin_save = MyPgXact->xmin;
+	MyPgXact->xmin = InvalidTransactionId;
+#endif
 
 	/*
 	 * Call the core function to actually build the snapshot.
@@ -1974,7 +1979,11 @@ build_historic_snapshot(SnapBuild *builder)
 	 */
 	FirstSnapshotSet = FirstSnapshotSet_save;
 	XactIsoLevel = XactIsoLevel_save;
+#if PG_VERSION_NUM >= 140000
 	MyProc->xmin = xmin_save;
+#else
+	MyPgXact->xmin = xmin_save;
+#endif
 
 	/*
 	 * Fix the "satisfies" function that PG core incorrectly sets to
