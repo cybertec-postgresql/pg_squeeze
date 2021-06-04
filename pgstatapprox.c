@@ -3,9 +3,9 @@
  * pgstatapprox.c
  *		  Bloat estimation functions
  *
- * Copyright (c) 2014-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2021, PostgreSQL Global Development Group
  *
- * Copyright (c) 2016, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
  *
  * IDENTIFICATION
  *		  contrib/pgstattuple/pgstatapprox.c
@@ -30,6 +30,7 @@
 #include "access/xact.h"
 #include "access/multixact.h"
 #include "access/htup_details.h"
+#include "catalog/pg_am.h"
 #include "catalog/namespace.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -80,9 +81,12 @@ statapprox_heap(Relation rel, output_type *stat)
 	Buffer		vmbuffer = InvalidBuffer;
 	BufferAccessStrategy bstrategy;
 	TransactionId OldestXmin;
-	uint64		misc_count = 0;
 
+#if PG_VERSION_NUM >= 140000
+	OldestXmin = GetOldestNonRemovableTransactionId(rel);
+#else
 	OldestXmin = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
+#endif
 	bstrategy = GetAccessStrategy(BAS_BULKREAD);
 
 	nblocks = RelationGetNumberOfBlocks(rel);
@@ -165,25 +169,23 @@ statapprox_heap(Relation rel, output_type *stat)
 			tuple.t_tableOid = RelationGetRelid(rel);
 
 			/*
-			 * We count live and dead tuples, but we also need to add up
-			 * others in order to feed vac_estimate_reltuples.
+			 * We follow VACUUM's lead in counting INSERT_IN_PROGRESS tuples
+			 * as "dead" while DELETE_IN_PROGRESS tuples are "live".  We don't
+			 * bother distinguishing tuples inserted/deleted by our own
+			 * transaction.
 			 */
 			switch (HeapTupleSatisfiesVacuum(&tuple, OldestXmin, buf))
 			{
-				case HEAPTUPLE_RECENTLY_DEAD:
-					misc_count++;
-					/* Fall through */
-				case HEAPTUPLE_DEAD:
-					stat->dead_tuple_len += tuple.t_len;
-					stat->dead_tuple_count++;
-					break;
 				case HEAPTUPLE_LIVE:
+				case HEAPTUPLE_DELETE_IN_PROGRESS:
 					stat->tuple_len += tuple.t_len;
 					stat->tuple_count++;
 					break;
+				case HEAPTUPLE_DEAD:
+				case HEAPTUPLE_RECENTLY_DEAD:
 				case HEAPTUPLE_INSERT_IN_PROGRESS:
-				case HEAPTUPLE_DELETE_IN_PROGRESS:
-					misc_count++;
+					stat->dead_tuple_len += tuple.t_len;
+					stat->dead_tuple_count++;
 					break;
 				default:
 					elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
@@ -196,12 +198,24 @@ statapprox_heap(Relation rel, output_type *stat)
 
 	stat->table_len = (uint64) nblocks * BLCKSZ;
 
+	/*
+	 * We don't know how many tuples are in the pages we didn't scan, so
+	 * extrapolate the live-tuple count to the whole table in the same way
+	 * that VACUUM does.  (Like VACUUM, we're not taking a random sample, so
+	 * just extrapolating linearly seems unsafe.)  There should be no dead
+	 * tuples in all-visible pages, so no correction is needed for that, and
+	 * we already accounted for the space in those pages, too.
+	 */
 	stat->tuple_count = vac_estimate_reltuples(rel,
 #if PG_VERSION_NUM < 110000
-						   false, /* is_analyze */
+											   false, /* is_analyze */
 #endif
-						   nblocks, scanned,
-											   stat->tuple_count + misc_count);
+											   nblocks,
+											   scanned,
+											   stat->tuple_count);
+
+	/* It's not clear if we could get -1 here, but be safe. */
+	stat->tuple_count = Max(stat->tuple_count, 0);
 
 	/*
 	 * Calculate percentages if the relation has one or more pages.
@@ -260,16 +274,20 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 				 errmsg("cannot access temporary tables of other sessions")));
 
 	/*
-	 * We support only ordinary relations and materialised views, because we
-	 * depend on the visibility map and free space map for our estimates about
-	 * unscanned pages.
+	 * We support only relation kinds with a visibility map and a free space
+	 * map.
 	 */
 	if (!(rel->rd_rel->relkind == RELKIND_RELATION ||
-		  rel->rd_rel->relkind == RELKIND_MATVIEW))
+		  rel->rd_rel->relkind == RELKIND_MATVIEW ||
+		  rel->rd_rel->relkind == RELKIND_TOASTVALUE))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" is not a table or materialized view",
+				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
 						RelationGetRelationName(rel))));
+
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("only heap AM is supported")));
 
 	statapprox_heap(rel, &stat);
 

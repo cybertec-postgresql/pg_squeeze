@@ -293,11 +293,18 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #else
 			ExecStoreTuple(tup, slot, InvalidBuffer, false);
 #endif
-			recheck = ExecInsertIndexTuples(slot,
+			recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 140000
+											iistate->rri,
+#endif
+											slot,
 #if PG_VERSION_NUM < 120000
 											&(tup->t_self),
 #endif
 											iistate->estate,
+#if PG_VERSION_NUM >= 140000
+											true, /* update */
+#endif
 											false,
 											NULL,
 											NIL);
@@ -392,11 +399,18 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 					ExecStoreTuple(tup, slot, InvalidBuffer, false);
 #endif
 
-					recheck = ExecInsertIndexTuples(slot,
+					recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 140000
+													iistate->rri,
+#endif
+													slot,
 #if PG_VERSION_NUM < 120000
 													&(tup->t_self),
 #endif
 													iistate->estate,
+#if PG_VERSION_NUM >= 140000
+													true, /* update */
+#endif
 													false,
 													NULL,
 													NIL);
@@ -504,9 +518,11 @@ get_index_insert_state(Relation	relation, Oid ident_index_id)
 		elog(ERROR, "Failed to open identity index");
 
 	/* Only initialize fields needed by ExecInsertIndexTuples(). */
+#if PG_VERSION_NUM < 140000
 	estate->es_result_relations = estate->es_result_relation_info =
 		result->rri;
 	estate->es_num_result_relations = 1;
+#endif
 	result->estate = estate;
 
 	return result;
