@@ -74,7 +74,14 @@ def check(cur):
     cur.execute("SELECT extversion FROM pg_extension WHERE extname='pg_squeeze'")
     if cur.rowcount == 0:
         raise Exception("pg_squeeze is not installed")
-    ext_row = cur.fetchone()
+
+    # maintenance_work_mem should be as small as possible so that the logical
+    # decoding is performed during the initial load for sure.
+    cur.execute("SHOW maintenance_work_mem")
+    row = cur.fetchone()
+    if row[0] != '1MB':
+        raise Exception("maintenance_work_mem must not be more than 1MB")
+
     d = globals()
 
     # Make sure that the squeeze worker is off.
