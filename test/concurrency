@@ -76,8 +76,6 @@ def check(cur):
         raise Exception("pg_squeeze is not installed")
     ext_row = cur.fetchone()
     d = globals()
-    if ext_row[0] != "1.3":
-        raise Exception("Unexpected pg_squeeze version: %s" % (ext_row[0],))
 
     # Make sure that the squeeze worker is off.
     cur.execute("SELECT squeeze.stop_worker()")
