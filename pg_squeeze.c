@@ -2030,7 +2030,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	BulkInsertState bistate;
 	MemoryContext	load_cxt, old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
+#if PG_VERSION_NUM >= 140000
 	DecodingOutputState	*dstate;
+#endif
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
@@ -2038,19 +2040,16 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	 */
 	Assert(replorigin_session_origin == InvalidRepOriginId);
 #if PG_VERSION_NUM >= 140000
-	replorigin_session_origin = DoNotReplicateId;
-#else
-	replorigin_session_origin = replorigin_create("pg_squeeze");
+#define REPLORIGIN_NAME		"pg_squeeze"
+	replorigin_session_origin = replorigin_create(REPLORIGIN_NAME);
 #endif
 
+#if PG_VERSION_NUM >= 140000
 	/*
 	 * Also remember that the WAL records created during the load should not
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
-#if PG_VERSION_NUM >= 140000
-	dstate->rorigin = DoNotReplicateId;
-#else
 	dstate->rorigin = replorigin_session_origin;
 #endif
 
@@ -2439,8 +2438,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 #endif
 
 	/* Drop the replication origin. */
-#if PG_VERSION_NUM < 140000
-	replorigin_drop(replorigin_session_origin, false);
+#if PG_VERSION_NUM >= 140000
+	replorigin_drop_by_name(REPLORIGIN_NAME, false, true);
 #endif
 	replorigin_session_origin = InvalidRepOriginId;
 
