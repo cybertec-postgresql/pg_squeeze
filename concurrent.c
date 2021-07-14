@@ -35,9 +35,7 @@ static void plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
 static HeapTuple get_changed_tuple(ConcurrentChange *change);
-#if PG_VERSION_NUM >= 140000
 static bool plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id);
-#endif
 
 /*
  * Decode and apply concurrent changes. If there are too many of them, split
@@ -548,11 +546,7 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->begin_cb = plugin_begin_txn;
 	cb->change_cb = plugin_change;
 	cb->commit_cb = plugin_commit_txn;
-#if PG_VERSION_NUM >= 140000
 	cb->filter_by_origin_cb = plugin_filter;
-#else
-	Assert(cb->filter_by_origin_cb == NULL);
-#endif
 	cb->shutdown_cb = plugin_shutdown;
 }
 
@@ -774,7 +768,6 @@ get_changed_tuple(ConcurrentChange *change)
 	return result;
 }
 
-#if PG_VERSION_NUM >= 140000
 /*
  * A filter that recognizes changes produced by the initial load.
  */
@@ -792,4 +785,3 @@ plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id)
 
 	return false;
 }
-#endif

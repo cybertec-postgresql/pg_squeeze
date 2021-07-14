@@ -85,13 +85,11 @@ typedef struct DecodingOutputState
 	/* Slot to retrieve data from tstore. */
 	TupleTableSlot	*tsslot;
 
-#if PG_VERSION_NUM >= 140000
 	/*
 	 * WAL records having this origin have been created by the initial load
 	 * and should not be decoded.
 	 */
 	RepOriginId		rorigin;
-#endif
 
 	ResourceOwner	resowner;
 } DecodingOutputState;

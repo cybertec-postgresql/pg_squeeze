@@ -279,6 +279,8 @@ _PG_init(void)
 		NULL, NULL, NULL);
 }
 
+#define REPLORIGIN_NAME		"pg_squeeze"
+
 /*
  * SQL interface to squeeze one table interactively.
  */
@@ -303,6 +305,20 @@ squeeze_table(PG_FUNCTION_ARGS)
 		 */
 		if (MyReplicationSlot != NULL)
 			ReplicationSlotRelease();
+
+		/*
+		 * There seems to be no automatic cleanup of the origin, so do it
+		 * here.
+		 */
+		if (replorigin_session_origin != InvalidRepOriginId)
+		{
+#if PG_VERSION_NUM >= 140000
+			replorigin_drop_by_name(REPLORIGIN_NAME, false, true);
+#else
+			replorigin_drop(replorigin_session_origin, false);
+#endif
+			replorigin_session_origin = InvalidRepOriginId;
+		}
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -2030,28 +2046,21 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	BulkInsertState bistate;
 	MemoryContext	load_cxt, old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
-#if PG_VERSION_NUM >= 140000
 	DecodingOutputState	*dstate;
-#endif
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
 	 * load itself so that they are not decoded.
 	 */
 	Assert(replorigin_session_origin == InvalidRepOriginId);
-#if PG_VERSION_NUM >= 140000
-#define REPLORIGIN_NAME		"pg_squeeze"
 	replorigin_session_origin = replorigin_create(REPLORIGIN_NAME);
-#endif
 
-#if PG_VERSION_NUM >= 140000
 	/*
 	 * Also remember that the WAL records created during the load should not
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 	dstate->rorigin = replorigin_session_origin;
-#endif
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -2440,6 +2449,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	/* Drop the replication origin. */
 #if PG_VERSION_NUM >= 140000
 	replorigin_drop_by_name(REPLORIGIN_NAME, false, true);
+#else
+	replorigin_drop(replorigin_session_origin, false);
 #endif
 	replorigin_session_origin = InvalidRepOriginId;
 
