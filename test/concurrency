@@ -96,9 +96,6 @@ class CommandThread(Thread):
                 i = random.randint(0, len(self.cmds) - 1)
                 next_cmd = self.cmds[i]
                 cur.execute(next_cmd)
-                # Get the transaction id.
-                cur.execute("SELECT txid_current()")
-                xid_row = cur.fetchone()
                 con.commit()
                 if self.cmds_executed != None:
                     # Record the command so it can be replayed during
