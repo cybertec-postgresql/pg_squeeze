@@ -26,6 +26,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
@@ -2379,9 +2380,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			 * a flat object (i.e. it does not point to any memory chunk that
 			 * the previous call of heap_insert() might have allocated) and
 			 * thus the cleanup between batches should not damage it, but
-			 * can't it get more complex in future PG versions?  If we switch
-			 * to old_ctx for the insert, an extra context seems to make more
-			 * sense than checking that heap_insert() does not leak memory.
+			 * can't it get more complex in future PG versions?
 			 */
 			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0,
 						bistate);
@@ -2994,6 +2993,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	int	i;
 	struct timeval t_end;
 	struct timeval *t_end_ptr = NULL;
+	char    dummy_rec_data = '\0';
 
 	/*
 	 * Lock the source table exclusively last time, to finalize the work.
@@ -3056,10 +3056,21 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	/*
 	 * Flush anything we see in WAL, to make sure that all changes committed
 	 * while we were creating indexes and waiting for the exclusive lock are
-	 * available for decoding. (This should be unnecessary if all backends had
-	 * synchronous_commit set, but we can't rely on this setting.)
+	 * available for decoding. This should not be necessary if all backends
+	 * had synchronous_commit set, but we can't rely on this setting.
+	 *
+	 * Unfortunately, GetInsertRecPtr() may lag behind the actual insert
+	 * position, and GetLastImportantRecPtr() points at the start of the last
+	 * record rather than at the end. Thus the simplest way to determine the
+	 * insert position is to insert a dummy record and use its LSN.
+	 *
+	 * XXX Consider using GetLastImportantRecPtr() and adding the size of the
+	 * last record (plus the total size of all the page headers the record
+	 * spans)?
 	 */
-	xlog_insert_ptr = GetInsertRecPtr();
+	XLogBeginInsert();
+	XLogRegisterData(&dummy_rec_data, 1);
+	xlog_insert_ptr = XLogInsert(RM_XLOG_ID, XLOG_NOOP);
 	XLogFlush(xlog_insert_ptr);
 	end_of_wal = GetFlushRecPtr();
 
