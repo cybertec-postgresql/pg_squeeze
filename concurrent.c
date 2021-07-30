@@ -303,7 +303,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #endif
 											iistate->estate,
 #if PG_VERSION_NUM >= 140000
-											true, /* update */
+											false, /* update */
 #endif
 											false,
 											NULL,
@@ -399,6 +399,11 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 					ExecStoreTuple(tup, slot, InvalidBuffer, false);
 #endif
 
+					/*
+					 * XXX Consider passing update=true, however it requires
+					 * es_range_table to be initialized. Is it worth the
+					 * complexity?
+					 */
 					recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 													iistate->rri,
@@ -409,7 +414,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #endif
 													iistate->estate,
 #if PG_VERSION_NUM >= 140000
-													true, /* update */
+													false, /* update */
 #endif
 													false,
 													NULL,
