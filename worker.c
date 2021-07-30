@@ -3,7 +3,7 @@
  * worker.c
  *     Background worker to call functions of pg_squeeze.c
  *
- * Copyright (c) 2016-2018, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
  *
  *---------------------------------------------------------
  */
