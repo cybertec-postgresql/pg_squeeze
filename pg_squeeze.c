@@ -2350,10 +2350,14 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		else
 		{
 			/*
-			 * It's probably safer not to do this test in the generic case: in
-			 * theory, the counter might end up zero as a result of
-			 * overflow. (For the unsorted case we assume reasonable batch
-			 * size.)
+			 * Has the previous batch processed all the remaining tuples?
+			 *
+			 * In theory, the counter might end up zero as a result of
+			 * overflow. However in practice 'i' should not overflow because
+			 * its upper limit is controlled by 'batch_max_size' which is also
+			 * of the int data type, and which in turn should not overflow
+			 * because value much lower than INT_MAX will make
+			 * AllocSizeIsValid(tuple_array_size_new) return false.
 			 */
 			if (i == 0)
 				break;
