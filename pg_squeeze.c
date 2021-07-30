@@ -280,7 +280,7 @@ _PG_init(void)
 		NULL, NULL, NULL);
 }
 
-#define REPLORIGIN_NAME		"pg_squeeze"
+#define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u"
 
 /*
  * SQL interface to squeeze one table interactively.
@@ -314,7 +314,11 @@ squeeze_table(PG_FUNCTION_ARGS)
 		if (replorigin_session_origin != InvalidRepOriginId)
 		{
 #if PG_VERSION_NUM >= 140000
-			replorigin_drop_by_name(REPLORIGIN_NAME, false, true);
+			char	replorigin_name[255];
+
+			snprintf(replorigin_name, sizeof(replorigin_name),
+					 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
+			replorigin_drop_by_name(replorigin_name, false, true);
 #else
 			replorigin_drop(replorigin_session_origin, false);
 #endif
@@ -2048,13 +2052,16 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	MemoryContext	load_cxt, old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
 	DecodingOutputState	*dstate;
+	char	replorigin_name[255];
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
 	 * load itself so that they are not decoded.
 	 */
 	Assert(replorigin_session_origin == InvalidRepOriginId);
-	replorigin_session_origin = replorigin_create(REPLORIGIN_NAME);
+	snprintf(replorigin_name, sizeof(replorigin_name),
+			 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
+	replorigin_session_origin = replorigin_create(replorigin_name);
 
 	/*
 	 * Also remember that the WAL records created during the load should not
@@ -2447,7 +2454,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 	/* Drop the replication origin. */
 #if PG_VERSION_NUM >= 140000
-	replorigin_drop_by_name(REPLORIGIN_NAME, false, true);
+	replorigin_drop_by_name(replorigin_name, false, true);
 #else
 	replorigin_drop(replorigin_session_origin, false);
 #endif
