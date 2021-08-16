@@ -1,6 +1,15 @@
 Release 1.4.0
 =============
 
+Bug fixes
+---------
+
+1. Fixed determination of WAL insert position before processing the concurrent
+   changes.
+
+   Without this fix, some data changes performed during the initial load by
+   sessions which have synchronous_commit=off can be lost.
+
 New features
 ------------
 

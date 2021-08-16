@@ -3,7 +3,7 @@
  * pg_squeeze.h
  *     A tool to eliminate table bloat.
  *
- * Copyright (c) 2016-2018, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
  *
  *-----------------------------------------------------
  */
@@ -85,13 +85,11 @@ typedef struct DecodingOutputState
 	/* Slot to retrieve data from tstore. */
 	TupleTableSlot	*tsslot;
 
-#if PG_VERSION_NUM >= 140000
 	/*
 	 * WAL records having this origin have been created by the initial load
 	 * and should not be decoded.
 	 */
 	RepOriginId		rorigin;
-#endif
 
 	ResourceOwner	resowner;
 } DecodingOutputState;

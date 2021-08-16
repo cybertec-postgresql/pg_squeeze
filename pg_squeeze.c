@@ -3,7 +3,7 @@
  * pg_squeeze.c
  *     A tool to eliminate table bloat.
  *
- * Copyright (c) 2016-2018, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
  *
  *-----------------------------------------------------
  */
@@ -26,6 +26,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
@@ -279,6 +280,8 @@ _PG_init(void)
 		NULL, NULL, NULL);
 }
 
+#define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u"
+
 /*
  * SQL interface to squeeze one table interactively.
  */
@@ -303,6 +306,24 @@ squeeze_table(PG_FUNCTION_ARGS)
 		 */
 		if (MyReplicationSlot != NULL)
 			ReplicationSlotRelease();
+
+		/*
+		 * There seems to be no automatic cleanup of the origin, so do it
+		 * here.
+		 */
+		if (replorigin_session_origin != InvalidRepOriginId)
+		{
+#if PG_VERSION_NUM >= 140000
+			char	replorigin_name[255];
+
+			snprintf(replorigin_name, sizeof(replorigin_name),
+					 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
+			replorigin_drop_by_name(replorigin_name, false, true);
+#else
+			replorigin_drop(replorigin_session_origin, false);
+#endif
+			replorigin_session_origin = InvalidRepOriginId;
+		}
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -2030,28 +2051,24 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	BulkInsertState bistate;
 	MemoryContext	load_cxt, old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
-#if PG_VERSION_NUM >= 140000
 	DecodingOutputState	*dstate;
-#endif
+	char	replorigin_name[255];
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
 	 * load itself so that they are not decoded.
 	 */
 	Assert(replorigin_session_origin == InvalidRepOriginId);
-#if PG_VERSION_NUM >= 140000
-#define REPLORIGIN_NAME		"pg_squeeze"
-	replorigin_session_origin = replorigin_create(REPLORIGIN_NAME);
-#endif
+	snprintf(replorigin_name, sizeof(replorigin_name),
+			 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
+	replorigin_session_origin = replorigin_create(replorigin_name);
 
-#if PG_VERSION_NUM >= 140000
 	/*
 	 * Also remember that the WAL records created during the load should not
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 	dstate->rorigin = replorigin_session_origin;
-#endif
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -2333,10 +2350,14 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		else
 		{
 			/*
-			 * It's probably safer not to do this test in the generic case: in
-			 * theory, the counter might end up zero as a result of
-			 * overflow. (For the unsorted case we assume reasonable batch
-			 * size.)
+			 * Has the previous batch processed all the remaining tuples?
+			 *
+			 * In theory, the counter might end up zero as a result of
+			 * overflow. However in practice 'i' should not overflow because
+			 * its upper limit is controlled by 'batch_max_size' which is also
+			 * of the int data type, and which in turn should not overflow
+			 * because value much lower than INT_MAX will make
+			 * AllocSizeIsValid(tuple_array_size_new) return false.
 			 */
 			if (i == 0)
 				break;
@@ -2370,9 +2391,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			 * a flat object (i.e. it does not point to any memory chunk that
 			 * the previous call of heap_insert() might have allocated) and
 			 * thus the cleanup between batches should not damage it, but
-			 * can't it get more complex in future PG versions?  If we switch
-			 * to old_ctx for the insert, an extra context seems to make more
-			 * sense than checking that heap_insert() does not leak memory.
+			 * can't it get more complex in future PG versions?
 			 */
 			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0,
 						bistate);
@@ -2439,7 +2458,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 	/* Drop the replication origin. */
 #if PG_VERSION_NUM >= 140000
-	replorigin_drop_by_name(REPLORIGIN_NAME, false, true);
+	replorigin_drop_by_name(replorigin_name, false, true);
+#else
+	replorigin_drop(replorigin_session_origin, false);
 #endif
 	replorigin_session_origin = InvalidRepOriginId;
 
@@ -2983,6 +3004,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	int	i;
 	struct timeval t_end;
 	struct timeval *t_end_ptr = NULL;
+	char    dummy_rec_data = '\0';
 
 	/*
 	 * Lock the source table exclusively last time, to finalize the work.
@@ -3045,10 +3067,21 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	/*
 	 * Flush anything we see in WAL, to make sure that all changes committed
 	 * while we were creating indexes and waiting for the exclusive lock are
-	 * available for decoding. (This should be unnecessary if all backends had
-	 * synchronous_commit set, but we can't rely on this setting.)
+	 * available for decoding. This should not be necessary if all backends
+	 * had synchronous_commit set, but we can't rely on this setting.
+	 *
+	 * Unfortunately, GetInsertRecPtr() may lag behind the actual insert
+	 * position, and GetLastImportantRecPtr() points at the start of the last
+	 * record rather than at the end. Thus the simplest way to determine the
+	 * insert position is to insert a dummy record and use its LSN.
+	 *
+	 * XXX Consider using GetLastImportantRecPtr() and adding the size of the
+	 * last record (plus the total size of all the page headers the record
+	 * spans)?
 	 */
-	xlog_insert_ptr = GetInsertRecPtr();
+	XLogBeginInsert();
+	XLogRegisterData(&dummy_rec_data, 1);
+	xlog_insert_ptr = XLogInsert(RM_XLOG_ID, XLOG_NOOP);
 	XLogFlush(xlog_insert_ptr);
 	end_of_wal = GetFlushRecPtr();
 

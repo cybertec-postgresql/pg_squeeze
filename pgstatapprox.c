@@ -130,13 +130,14 @@ statapprox_heap(Relation rel, output_type *stat)
 		else
 			stat->free_space += BLCKSZ - SizeOfPageHeaderData;
 
+		/* We may count the page as scanned even if it's new/empty */
+		scanned++;
+
 		if (PageIsNew(page) || PageIsEmpty(page))
 		{
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
-
-		scanned++;
 
 		/*
 		 * Look at each tuple on the page and decide whether it's live or

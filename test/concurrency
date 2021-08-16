@@ -74,14 +74,7 @@ def check(cur):
     cur.execute("SELECT extversion FROM pg_extension WHERE extname='pg_squeeze'")
     if cur.rowcount == 0:
         raise Exception("pg_squeeze is not installed")
-
-    # maintenance_work_mem should be as small as possible so that the logical
-    # decoding is performed during the initial load for sure.
-    cur.execute("SHOW maintenance_work_mem")
-    row = cur.fetchone()
-    if row[0] != '1MB':
-        raise Exception("maintenance_work_mem must not be more than 1MB")
-
+    ext_row = cur.fetchone()
     d = globals()
 
     # Make sure that the squeeze worker is off.
@@ -103,9 +96,6 @@ class CommandThread(Thread):
                 i = random.randint(0, len(self.cmds) - 1)
                 next_cmd = self.cmds[i]
                 cur.execute(next_cmd)
-                # Get the transaction id.
-                cur.execute("SELECT txid_current()")
-                xid_row = cur.fetchone()
                 con.commit()
                 if self.cmds_executed != None:
                     # Record the command so it can be replayed during
@@ -148,6 +138,7 @@ class SqueezeThread(Thread):
         params = random.choice(self.params_array)
         try:
             ind = "'%s'" % params.index if params.index else "NULL"
+            self.cur.execute("SET maintenance_work_mem='1MB'")
             self.cur.execute(
                 "SELECT squeeze.squeeze_table('public', '%s', %s, NULL, NULL)" %
                 (params.table, ind,))
