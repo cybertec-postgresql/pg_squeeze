@@ -2610,8 +2610,22 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 * should be able to see it until our transaction commits. However,
 		 * table_open() is eventually called and that would cause assertion
 		 * failure if we passed NoLock. We can pass any other lock mode.
+		 *
+		 * On PG versions: the OIDOldToast argument was added to
+		 * NewHeapCreateToastTable() in v14, but the change was back-patched
+		 * to the minor releases down to v11. Regarding the value of
+		 * OIDOldToast, it does not matter here because the auxiliary table
+		 * will eventually be dropped.
 		 */
+#if (PG_VERSION_NUM >= 140000) || \
+	(PG_VERSION_NUM < 140000 && PG_VERSION_NUM > 130004) || \
+	(PG_VERSION_NUM < 130000 && PG_VERSION_NUM > 120008) || \
+	(PG_VERSION_NUM < 120000 && PG_VERSION_NUM > 110013)
+		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock,
+								InvalidOid);
+#else
 		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock);
+#endif
 
 		ReleaseSysCache(tuple);
 

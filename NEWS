@@ -1,3 +1,15 @@
+Release 1.4.1
+=============
+
+Bug fixes
+---------
+
+1. Adapted the code to changed API of PostgreSQL core code.
+
+   Signature of NewHeapCreateToastTable() changed between PG 14beta3 and
+   14rc1.
+
+
 Release 1.4.0
 =============
 
