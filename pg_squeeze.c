@@ -2264,7 +2264,15 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 * No lock is needed on the target relation - no other transaction
 		 * should be able to see it yet.
 		 */
+#if (PG_VERSION_NUM >= 140000) || \
+	(PG_VERSION_NUM < 140000 && PG_VERSION_NUM > 130004) || \
+	(PG_VERSION_NUM < 130000 && PG_VERSION_NUM > 120008) || \
+	(PG_VERSION_NUM < 120000 && PG_VERSION_NUM > 110013)
+		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock,
+					InvalidOid);
+#else
 		NewHeapCreateToastTable(result, reloptions, NoLock);
+#endif
 
 		ReleaseSysCache(tuple);
 
