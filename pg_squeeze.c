@@ -70,6 +70,12 @@
 #error "PostgreSQL version 10 or higher is required"
 #endif
 
+#if PG_VERSION_NUM < 110000
+/* the last argument didn't exist before v11 */
+#define NewHeapCreateToastTable(relOid, reloptions, lockmode, OIDOldToast) \
+		NewHeapCreateToastTable(relOid, reloptions, lockmode)
+#endif
+
 PG_MODULE_MAGIC;
 
 #define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
@@ -2611,7 +2617,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 * table_open() is eventually called and that would cause assertion
 		 * failure if we passed NoLock. We can pass any other lock mode.
 		 */
-		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock);
+		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock, toastrelid);
 
 		ReleaseSysCache(tuple);
 
