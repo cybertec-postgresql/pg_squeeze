@@ -13,7 +13,7 @@
 # test (from table creation to verification of results) runs many times.
 
 import argparse
-import psycopg2
+import psycopg
 import random
 import sys
 import threading
@@ -40,8 +40,8 @@ args = parser.parse_args()
 test_succeeded = True
 
 def get_connection():
-    return psycopg2.connect(host=args.host, port=args.port,
-                            database=args.database, user=args.user)
+    return psycopg.connect(host=args.host, port=args.port,
+                           dbname=args.database, user=args.user)
 
 def start_single_test():
     d = globals()
