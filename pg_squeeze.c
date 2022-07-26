@@ -17,6 +17,9 @@
 #if PG_VERSION_NUM >= 130000
 #include "access/xlogutils.h"
 #endif
+#if PG_VERSION_NUM >= 150000
+#include "access/xloginsert.h"
+#endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -701,7 +704,11 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * Since we'll do some more changes, all the WAL records flushed so far
 	 * need to be decoded for sure.
 	 */
+#if PG_VERSION_NUM >= 150000
+	end_of_wal = GetFlushRecPtr(NULL);
+#else
 	end_of_wal = GetFlushRecPtr();
+#endif
 
 	/*
 	 * Decode and apply the data changes that occurred while the initial load
@@ -2078,8 +2085,13 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		 * Use the cluster.c API to check if the index can be used for
 		 * clustering.
 		 */
+#if PG_VERSION_NUM >= 150000
+		check_index_is_clusterable(rel_src, RelationGetRelid(cluster_idx),
+								   NoLock);
+#else
 		check_index_is_clusterable(rel_src, RelationGetRelid(cluster_idx),
 								   false, NoLock);
+#endif
 
 		/*
 		 * Decide whether index scan or explicit sort should be used.
@@ -2420,7 +2432,11 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		 * Note that the insertions into the new table shouldn't actually be
 		 * decoded, they should be filtered out by their origin.
 		 */
+#if PG_VERSION_NUM >= 150000
+		end_of_wal = GetFlushRecPtr(NULL);
+#else
 		end_of_wal = GetFlushRecPtr();
+#endif
 		if (end_of_wal > end_of_wal_prev)
 		{
 			MemoryContextSwitchTo(old_cxt);
@@ -2924,7 +2940,11 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		 * replorigin_session_origin because index changes are not decoded
 		 * anyway.
 		 */
+#if PG_VERSION_NUM >= 150000
+		end_of_wal = GetFlushRecPtr(NULL);
+#else
 		end_of_wal = GetFlushRecPtr();
+#endif
 		if (end_of_wal > end_of_wal_prev)
 			decode_concurrent_changes(ctx, end_of_wal, NULL);
 		end_of_wal_prev = end_of_wal;
@@ -3097,7 +3117,11 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 	XLogRegisterData(&dummy_rec_data, 1);
 	xlog_insert_ptr = XLogInsert(RM_XLOG_ID, XLOG_NOOP);
 	XLogFlush(xlog_insert_ptr);
+#if PG_VERSION_NUM >= 150000
+	end_of_wal = GetFlushRecPtr(NULL);
+#else
 	end_of_wal = GetFlushRecPtr();
+#endif
 
 	/*
 	 * Process the changes that might have taken place while we were waiting
@@ -3505,9 +3529,14 @@ get_heap_freespace(PG_FUNCTION_ARGS)
 	 */
 	if (free == 0)
 	{
+#if PG_VERSION_NUM >= 150000
+		if (!smgrexists(RelationGetSmgr(rel), FSM_FORKNUM))
+			fsm_exists = false;
+#else
 		RelationOpenSmgr(rel);
 		if (!smgrexists(rel->rd_smgr, FSM_FORKNUM))
 			fsm_exists = false;
+#endif
 		RelationCloseSmgr(rel);
 	}
 #if PG_VERSION_NUM >= 120000
