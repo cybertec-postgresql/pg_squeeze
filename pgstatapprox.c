@@ -3,7 +3,7 @@
  * pgstatapprox.c
  *		  Bloat estimation functions
  *
- * Copyright (c) 2014-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2022, PostgreSQL Global Development Group
  *
  * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
  *
@@ -282,9 +282,16 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 		  rel->rd_rel->relkind == RELKIND_MATVIEW ||
 		  rel->rd_rel->relkind == RELKIND_TOASTVALUE))
 		ereport(ERROR,
+#if PG_VERSION_NUM >= 150000
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("relation \"%s\" is of wrong relation kind",
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
+#else
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
 						RelationGetRelationName(rel))));
+#endif
 
 #if PG_VERSION_NUM >= 120000
 	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
