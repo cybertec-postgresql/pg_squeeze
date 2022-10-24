@@ -311,6 +311,15 @@ might help you to avoid disruptions.
 MVCC-unsafe behavior described in the first paragraph of [5].
 
 
+Disk Space Requirements
+-----------------------
+
+Performing a full-table squeeze requires free disk space about twice as large
+as the target table and its indexes. For example, if the total size of the
+tables and indexes to be squeezed is 1GB, an additional 2GB of disk space is
+required.
+
+
 References
 ----------
 
@@ -325,6 +334,7 @@ References
 [5] https://www.postgresql.org/docs/13/static/mvcc-caveats.html
 
 [6] https://www.freebsd.org/cgi/man.cgi?query=crontab&sektion=5&apropos=0&manpath=FreeBSD+12.1-RELEASE+and+Ports
+
 
 Authors
 -------
