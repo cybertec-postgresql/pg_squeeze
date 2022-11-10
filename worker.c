@@ -175,9 +175,7 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 	snprintf(worker->bgw_name, BGW_MAXLEN,
 			 "pg_squeeze %s worker for database %s",
 			 kind, dbname);
-#if PG_VERSION_NUM >= 110000
 	snprintf(worker->bgw_type, BGW_MAXLEN, "squeeze worker");
-#endif
 
 	worker->bgw_notify_pid = notify_pid;
 }
@@ -245,10 +243,7 @@ squeeze_worker_main(Datum main_arg)
 
 		con = (WorkerConInit *) DatumGetPointer(arg);
 		am_i_scheduler = con->scheduler;
-		BackgroundWorkerInitializeConnection(con->dbname, con->rolename
-#if PG_VERSION_NUM >= 110000
-											 , 0 /* flags */
-#endif
+		BackgroundWorkerInitializeConnection(con->dbname, con->rolename, 0 /* flags */
 			);
 	}
 	else
@@ -259,11 +254,7 @@ squeeze_worker_main(Datum main_arg)
 		memcpy(&con, MyBgworkerEntry->bgw_extra,
 			   sizeof(WorkerConInteractive));
 		am_i_scheduler = con.scheduler;
-		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid
-#if PG_VERSION_NUM >= 110000
-												  , 0
-#endif
-			);
+		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid, 0);
 	}
 
 	kind = am_i_scheduler ? "scheduler" : "squeeze";

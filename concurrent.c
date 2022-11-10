@@ -148,11 +148,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			 * we no longer need the previous segment.
 			 */
 			end_lsn = ctx->reader->EndRecPtr;
-#if PG_VERSION_NUM >= 110000
 			XLByteToSeg(end_lsn, segno_new, wal_segment_size);
-#else
-			XLByteToSeg(end_lsn, segno_new);
-#endif
 			if (segno_new != squeeze_current_segment)
 			{
 				LogicalConfirmReceivedLocation(end_lsn);

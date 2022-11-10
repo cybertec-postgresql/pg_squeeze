@@ -980,24 +980,18 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 #endif
 									NULL, NULL, NULL);
 
-#if PG_VERSION_NUM >= 110000
 	/*
 	 * We don't have control on setting fast_forward, so at least check it.
 	 */
 	Assert(!ctx->fast_forward);
-#endif
 
 	DecodingContextFindStartpoint(ctx);
 
 	/* Some WAL records should have been read. */
 	Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
 
-#if PG_VERSION_NUM >= 110000
 	XLByteToSeg(ctx->reader->EndRecPtr, squeeze_current_segment,
 				wal_segment_size);
-#else
-	XLByteToSeg(ctx->reader->EndRecPtr, squeeze_current_segment);
-#endif
 
 	/*
 	 * Setup structures to store decoded changes.
@@ -2144,9 +2138,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		tuplesort = tuplesort_begin_cluster(RelationGetDescr(rel_src),
 											cluster_idx,
 											maintenance_work_mem,
-#if PG_VERSION_NUM >= 110000
 											NULL,
-#endif
 											false);
 
 	/*
@@ -2528,11 +2520,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		aclresult = pg_tablespace_aclcheck(tablespace, relowner, ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult,
-#if PG_VERSION_NUM >= 110000
 						   OBJECT_TABLESPACE,
-#else
-						   ACL_KIND_TABLESPACE,
-#endif
 						   get_tablespace_name(tablespace));
 	}
 	if (tablespace == GLOBALTABLESPACE_OID)
@@ -2591,9 +2579,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 									  false,
 									  false,
 									  false,
-#if PG_VERSION_NUM >= 110000
 									  InvalidOid, /* relrewrite */
-#endif
 									  NULL);
 
 	Assert(OidIsValid(result));
@@ -2699,11 +2685,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		size_t	int2_arr_size;
 		int16	*indoptions;
 		text	*reloptions = NULL;
-#if PG_VERSION_NUM >= 110000
 		bits16	flags;
-#else
-		bool	isconstraint;
-#endif
 		XLogRecPtr	end_of_wal;
 
 		ind_oid = indexes_src[i];
@@ -2766,14 +2748,9 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		resetStringInfo(ind_name);
 		appendStringInfo(ind_name, "ind_%d", i);
 
-#if PG_VERSION_NUM >= 110000
 		flags = 0;
 		if (ind->rd_index->indisprimary)
 			flags |= INDEX_CREATE_IS_PRIMARY;
-#else
-		isconstraint = ind->rd_index->indisprimary || ind_info->ii_Unique ||
-			ind->rd_index->indisexclusion;
-#endif
 
 		colnames = NIL;
 		indnatts = ind->rd_index->indnatts;
@@ -2870,13 +2847,11 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		reloptions = !isnull ? DatumGetTextPCopy(d) : NULL;
 		ReleaseSysCache(tup);
 
-#if PG_VERSION_NUM >= 110000
 		/*
 		 * Publish information on what we're going to do. This is especially
 		 * important if parallel workers are used to build the index.
 		 */
 		debug_query_string = "pg_squeeze index build";
-#endif
 
 		/*
 		 * Neither parentIndexRelid nor parentConstraintId needs to be passed
@@ -2887,10 +2862,8 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		ind_oid_new = index_create(rel_dst,
 								   ind_name->data,
 								   InvalidOid,
-#if PG_VERSION_NUM >= 110000
 								   InvalidOid, /* parentIndexRelid */
 								   InvalidOid, /* parentConstraintId */
-#endif
 								   InvalidOid,
 								   ind_info,
 								   colnames,
@@ -2900,31 +2873,15 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   opclasses,
 								   indoptions,
 								   PointerGetDatum(reloptions),
-#if PG_VERSION_NUM >= 110000
 								   flags, /* flags */
 								   0,	  /* constr_flags */
-#else
-								   ind->rd_index->indisprimary, /* isprimary */
-								   isconstraint, /* isconstraint */
-								   false, /* deferrable */
-								   false, /* initdeferred */
-#endif
 								   false, /* allow_system_table_mods */
-#if PG_VERSION_NUM >= 110000
 								   false, /* is_internal */
 								   NULL	  /* constraintId */
-#else
-								   false, /* skip_build */
-								   false, /* concurrent */
-								   false, /* is_internal */
-								   false  /* if_not_exists */
-#endif
 );
 		result[i] = ind_oid_new;
 
-#if PG_VERSION_NUM >= 110000
 		debug_query_string = NULL;
-#endif
 
 		index_close(ind, AccessShareLock);
 		list_free_deep(colnames);
