@@ -1,0 +1,48 @@
+name: Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: sh
+
+    strategy:
+      matrix:
+        pgversion:
+          - 15
+          - 14
+          - 13
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+
+    steps:
+    - name: checkout
+      uses: actions/checkout@v3
+
+    - name: install pg
+      run: |
+        sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -v $PGVERSION -p -i
+        sudo -u postgres createuser -s "$USER"
+
+    - name: build
+      run: |
+        make PROFILE="-Werror"
+        sudo -E make install
+
+    - name: test
+      run: |
+        sudo pg_conftool set shared_preload_libraries pg_squeeze
+        sudo pg_conftool set wal_level logical
+        sudo pg_conftool set max_replication_slots 1
+        sudo pg_ctlcluster $PGVERSION main restart
+        make installcheck
+
+    - name: show regression diffs
+      if: ${{ failure() }}
+      run: |
+        cat regression.diffs
