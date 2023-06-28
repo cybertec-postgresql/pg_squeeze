@@ -1,6 +1,7 @@
 *~
 *.o
 *.so
+results/
 GPATH
 GRTAGS
 GTAGS
