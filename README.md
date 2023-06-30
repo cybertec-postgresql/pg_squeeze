@@ -334,11 +334,3 @@ References
 [5] https://www.postgresql.org/docs/13/static/mvcc-caveats.html
 
 [6] https://www.freebsd.org/cgi/man.cgi?query=crontab&sektion=5&apropos=0&manpath=FreeBSD+12.1-RELEASE+and+Ports
-
-
-Authors
--------
-
-The extension was developed by Cybertec Schönig & Schönig GmbH
-(https://www.cybertec-postgresql.com). Please use this page to report issues:
-https://github.com/cybertec-postgresql/pg_squeeze/issues
