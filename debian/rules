@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --with pgxs
+
+override_dh_installdocs:
+#	dh_installdocs --all README.*
+
+override_dh_pgxs_test:
+	+LANG=C pg_buildext \
+		-o 'shared_preload_libraries=pg_squeeze' \
+		-o 'wal_level=logical' \
+		-o 'max_replication_slots=1' \
+		installcheck . . postgresql-%v-squeeze
