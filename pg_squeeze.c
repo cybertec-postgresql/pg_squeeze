@@ -2517,7 +2517,12 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 * do things that the table owner is not allowed to. (For indexes we
 		 * assume they all have the same owner as the table.)
 		 */
+#if PG_VERSION_NUM >= 160000
+		aclresult = object_aclcheck(TableSpaceRelationId, tablespace,
+									relowner, ACL_CREATE);
+#else
 		aclresult = pg_tablespace_aclcheck(tablespace, relowner, ACL_CREATE);
+#endif
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult,
 						   OBJECT_TABLESPACE,

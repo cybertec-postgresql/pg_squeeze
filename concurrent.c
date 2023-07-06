@@ -302,9 +302,15 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #if PG_VERSION_NUM >= 140000
 											false, /* update */
 #endif
-											false,
-											NULL,
-											NIL);
+											false, /* noDupErr */
+											NULL,  /* specConflict */
+											NIL	   /* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+											,
+											false/* onlySummarizing */
+#endif
+				);
+
 
 			/*
 			 * If recheck is required, it must have been preformed on the
@@ -385,7 +391,16 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 			if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
-				simple_heap_update(relation, &ctid, tup);
+#if PG_VERSION_NUM >= 160000
+				TU_UpdateIndexes update_indexes;
+#endif
+
+				simple_heap_update(relation, &ctid, tup
+#if PG_VERSION_NUM >= 160000
+								   ,
+								   &update_indexes
+#endif
+);
 				if (!HeapTupleIsHeapOnly(tup))
 				{
 					List	*recheck;
@@ -413,9 +428,15 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #if PG_VERSION_NUM >= 140000
 													false, /* update */
 #endif
-													false,
-													NULL,
-													NIL);
+													false, /* noDupErr */
+													NULL,  /* specConflict */
+													NIL	   /* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+													,
+													/* onlySummarizing */
+													(update_indexes == TU_Summarizing)
+#endif
+						);
 					list_free(recheck);
 				}
 
