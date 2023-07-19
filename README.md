@@ -304,15 +304,7 @@ It's also a good practice to unregister table that you're going to drop,
 although the background worker does unregister non-existing tables
 periodically.
 
-# Upgrade from 1.2.x
-
-**As there's no straightforward way to migrate the scheduling
-information (see the notes on the `schedule` column of the `squeeze.tables`
-table) automatically, and as the `schedule` column must not contain NULL
-values, the upgrade deletes the contents of the `squeeze.tables`
-table. Please export the table contents to a file before you perform the
-upgrade and configure the checks of those tables again as soon as the upgrade
-is done.**
+# Upgrade
 
 Make sure to install PostgreSQL and `pg_config`, see [install](#install)
 section.
@@ -329,6 +321,17 @@ Connect to each database containing `pg_squeeze` 1.2.x and run this command:
 ```
 ALTER EXTENSION pg_squeeze UPDATE;
 ```
+
+# Upgrade from 1.2.x
+
+**As there's no straightforward way to migrate the scheduling
+information (see the notes on the `schedule` column of the `squeeze.tables`
+table) automatically, and as the `schedule` column must not contain NULL
+values, the upgrade deletes the contents of the `squeeze.tables`
+table. Please export the table contents to a file before you perform the
+upgrade and configure the checks of those tables again as soon as the upgrade
+is done.**
+
 
 # Concurrency
 
