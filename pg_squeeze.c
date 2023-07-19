@@ -78,7 +78,8 @@ PG_MODULE_MAGIC;
 #define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
-static void squeeze_table_internal(PG_FUNCTION_ARGS);
+static void squeeze_table_internal(Name relschema, Name relname, Name indname,
+								   Name tbspname, ArrayType	*ind_tbsp);
 static int index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* Index-to-tablespace mapping. */
@@ -171,9 +172,28 @@ char *squeeze_worker_autostart = NULL;
  */
 char *squeeze_worker_role = NULL;
 
+#if PG_VERSION_NUM >= 150000
+shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
+shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
 void
 _PG_init(void)
 {
+	if (!process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errmsg("pg_squeeze must be loaded via shared_preload_libraries")));
+
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = squeeze_worker_shmem_request;
+#else
+	squeeze_worker_shmem_request();
+#endif
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = squeeze_worker_shmem_startup;
+
 	DefineCustomStringVariable(
 		"squeeze.worker_autostart",
 		"OIDs of databases for which background workers start automatically.",
@@ -287,57 +307,120 @@ _PG_init(void)
 
 /*
  * SQL interface to squeeze one table interactively.
+ *
+ * This function should only be used by pg_squeeze versions <= 1.5.
  */
 extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
 Datum
 squeeze_table(PG_FUNCTION_ARGS)
 {
+	Name	relschema, relname;
+	Name	indname = NULL;
+	Name	tbspname = NULL;
+	ArrayType	*ind_tbsp = NULL;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 (errmsg("Both schema and table name must be specified"))));
+
+	relschema = PG_GETARG_NAME(0);
+	relname = PG_GETARG_NAME(1);
+
+	if (!PG_ARGISNULL(2))
+		indname = PG_GETARG_NAME(2);
+
+	if (!PG_ARGISNULL(3))
+		tbspname = PG_GETARG_NAME(3);
+
+	if (!PG_ARGISNULL(4))
+		ind_tbsp = PG_GETARG_ARRAYTYPE_P(4);
+
+	squeeze_table_impl(relschema, relname, indname, tbspname, ind_tbsp, NULL,
+					   NULL);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Introduced in pg_squeeze 1.6, to be called directly as opposed to calling
+ * via FMGR.
+ *
+ * Return true if succeeded. If failed, either copy useful information into
+ * *edata_p and return false, or (if edata_p==NULL), raise ERROR.
+ */
+bool
+squeeze_table_impl(Name relschema, Name relname, Name indname,
+				   Name tbspname, ArrayType	*ind_tbsp, ErrorData **edata_p,
+				   MemoryContext edata_cxt)
+{
+	bool	result;
+
 	PG_TRY();
 	{
-		squeeze_table_internal(fcinfo);
+		squeeze_table_internal(relschema, relname, indname, tbspname,
+							   ind_tbsp);
+		result = true;
 	}
 	PG_CATCH();
 	{
+		HOLD_INTERRUPTS();
+
+		result = false;
+
+		/*
+		 * There seems to be no automatic cleanup of the origin, so do it
+		 * here. The insertion into the ReplicationOriginRelationId catalog
+		 * will be rolled back due to the transaction abort - either here or,
+		 * in the PG_RE_THROW() case, higher in the stack.
+		 */
+		if (replorigin_session_origin != InvalidRepOriginId)
+			replorigin_session_origin = InvalidRepOriginId;
+
+		if (edata_p)
+		{
+			MemoryContext old_context = CurrentMemoryContext;
+
+			/* Save error info in caller's context */
+			MemoryContextSwitchTo(edata_cxt);
+			*edata_p = CopyErrorData();
+			MemoryContextSwitchTo(old_context);
+
+			FlushErrorState();
+
+			/*
+			 * Abort the transaction as we do not call PG_RETHROW() below in
+			 * this case.
+			 */
+			AbortOutOfAnyTransaction();
+		}
+
 		/*
 		 * Special effort is needed to release the replication slot because,
 		 * unlike other resources, AbortTransaction() does not release
 		 * it. While the transaction is aborted if an ERROR is caught in the
 		 * main loop of postgres.c, it would not do if the ERROR was trapped
-		 * at lower level in the stack. The typical case is that
-		 * squeeze_table() is called from pl/pgsql function.
+		 * at lower level in the stack (typically, in order to log the error
+		 * and process the next table).
 		 */
 		if (MyReplicationSlot != NULL)
 			ReplicationSlotRelease();
 
-		/*
-		 * There seems to be no automatic cleanup of the origin, so do it
-		 * here.
-		 */
-		if (replorigin_session_origin != InvalidRepOriginId)
-		{
-#if PG_VERSION_NUM >= 140000
-			char	replorigin_name[255];
+		RESUME_INTERRUPTS();
 
-			snprintf(replorigin_name, sizeof(replorigin_name),
-					 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
-			replorigin_drop_by_name(replorigin_name, false, true);
-#else
-			replorigin_drop(replorigin_session_origin, false);
-#endif
-			replorigin_session_origin = InvalidRepOriginId;
-		}
-		PG_RE_THROW();
+		if (edata_p == NULL)
+			PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	PG_RETURN_VOID();
+	return result;
 }
 
 static void
-squeeze_table_internal(PG_FUNCTION_ARGS)
+squeeze_table_internal(Name relschema, Name relname, Name indname,
+					   Name tbspname, ArrayType	*ind_tbsp)
 {
-	Name	   relschema, relname;
 	RangeVar   *relrv_src;
 	RangeVar	*relrv_cl_idx = NULL;
 	Relation	rel_src, rel_dst;
@@ -364,13 +447,6 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	ObjectAddress	object;
 	bool	source_finalized;
 
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 (errmsg("Both schema and table name must be specified"))));
-
-	relschema = PG_GETARG_NAME(0);
-	relname = PG_GETARG_NAME(1);
 	relrv_src = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
 #if PG_VERSION_NUM >= 120000
 	rel_src = table_openrv(relrv_src, AccessShareLock);
@@ -480,14 +556,9 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * consequence of not locking is that perform_initial_load() will error
 	 * out.
 	 */
-	if (!PG_ARGISNULL(2))
-	{
-		Name	indname;
-
-		indname = PG_GETARG_NAME(2);
+	if (indname)
 		relrv_cl_idx = makeRangeVar(NameStr(*relschema),
 									NameStr(*indname), -1);
-	}
 
 	/*
 	 * Process tablespace arguments, if provided.
@@ -501,25 +572,15 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	 * changes worth making check_catalog_changes() more expensive?
 	 */
 	tbsp_info = (TablespaceInfo *) palloc0(sizeof(TablespaceInfo));
-	if (!PG_ARGISNULL(3))
-	{
-		Name	tbspname;
-
-
-		tbspname = PG_GETARG_NAME(3);
+	if (tbspname)
 		tbsp_info->table = get_tablespace_oid(pstrdup(NameStr(*tbspname)),
 											  false);
-	}
 	else
 		tbsp_info->table = cat_state->form_class->reltablespace;
 
 	/* Index-to-tablespace mappings. */
-	if (!PG_ARGISNULL(4))
-	{
-		ArrayType	*ind_tbsp = PG_GETARG_ARRAYTYPE_P(4);
-
+	if (ind_tbsp)
 		resolve_index_tablepaces(tbsp_info, cat_state, ind_tbsp);
-	}
 
 	nindexes = cat_state->relninds;
 
@@ -573,6 +634,13 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	check_catalog_changes(cat_state, NoLock);
 
 	/*
+	 * This is to satisfy the check introduced by the commit 2776922201f in PG
+	 * core. (Per HeapTupleSatisfiesToast() the snapshot shouldn't actually be
+	 * used for visibility checks of the TOAST values.)
+	 */
+	PushActiveSnapshot(snap_hist);
+
+	/*
 	 * The historic snapshot is used to retrieve data w/o concurrent
 	 * changes.
 	 */
@@ -594,6 +662,7 @@ squeeze_table_internal(PG_FUNCTION_ARGS)
 	/*
 	 * The historic snapshot won't be needed anymore.
 	 */
+	PopActiveSnapshot();
 	pfree(snap_hist);
 
 	/*
@@ -2250,13 +2319,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			if (tup_in == NULL)
 				break;
 
-			/*
-			 * Even though special snapshot is used to retrieve values from
-			 * TOAST relation (see toast_fetch_datum), we'd better flatten the
-			 * tuple and thus retrieve the TOAST while the historic snapshot
-			 * is active. One particular reason is that tuptoaster.c does
-			 * access catalog.
-			 */
+			/* Flatten the tuple if needed. */
 			if (HeapTupleHasExternal(tup_in))
 			{
 				tup_in = toast_flatten_tuple(tup_in,

@@ -75,10 +75,6 @@ def check(cur):
     if cur.rowcount == 0:
         raise Exception("pg_squeeze is not installed")
     ext_row = cur.fetchone()
-    d = globals()
-
-    # Make sure that the squeeze worker is off.
-    cur.execute("SELECT squeeze.stop_worker()")
 
 class CommandThread(Thread):
     def __init__(self, cmds, cmds_executed):
@@ -140,8 +136,14 @@ class SqueezeThread(Thread):
             ind = "'%s'" % params.index if params.index else "NULL"
             self.cur.execute("SET maintenance_work_mem='1MB'")
             self.cur.execute(
-                "SELECT squeeze.squeeze_table('public', '%s', %s, NULL, NULL)" %
+                "SELECT squeeze.squeeze_table('public', '%s', %s)" %
                 (params.table, ind,))
+            self.cur.execute("SELECT count(*) FROM squeeze.errors")
+            row = self.cur.fetchone()
+            if row[0] > 0:
+                # XXX The failure could be caused by a concurrent call of
+                # squeeze_table(). Nevertheless, it's a reason to stop.
+                raise Exception("squeeze_table() failed")
         except Exception as e:
             print(e)
             stop_single_test(False)
@@ -334,6 +336,11 @@ cur = con.cursor()
 try:
     check(cur)
     check_ok = True
+
+    # Prepare for error checking.
+    cur.execute("TRUNCATE TABLE squeeze.errors")
+    # Make sure that the squeeze worker is on.
+    cur.execute("SELECT squeeze.start_worker()")
 except Exception as e:
     print(e)
     check_ok = False
@@ -388,3 +395,6 @@ for i in range(args.test_iterations):
         con_vac.close()
         sys.exit(1)
 
+con = get_connection()
+cur = con.cursor()
+cur.execute("SELECT squeeze.stop_worker()")

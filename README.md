@@ -180,8 +180,9 @@ anything else, make sure you perfectly understand what you are doing.**
 
 # Ad-hoc processing for any table
 
-It's also possible to `squeeze` tables manually without registering, skipping
-any time and bloat checks.
+It's also possible to squeeze tables manually without registering
+(i.e. inserting the corresponding record into `squeeze.tables`), and without
+prior checking of the actual bloat.
 
 Function signature:
 
@@ -198,8 +199,21 @@ squeeze.squeeze_table(
 Sample execution:
 
 ```
-SELECT squeeze.squeeze_table('public', 'pgbench_accounts', null, null, null);
+SELECT squeeze.squeeze_table('public', 'pgbench_accounts', null);
 ```
+
+Please note that:
+
+1. the function is there primarily for testing and troubleshooting. In a
+   typical setup the processing should be done by background workers.
+
+2. the function does not throw errors. It just inserts a record either into
+   `squeeze.log` or `squeeze.errors`, depending on whether it succeeded or
+   failed.
+
+3. the function hangs if no squeeze worker is running on the current database
+   or if the worker is just working on other tables.
+
 
 # Enable / disable table processing
 

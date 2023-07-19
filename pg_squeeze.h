@@ -27,6 +27,8 @@
 #include "postmaster/bgworker.h"
 #include "replication/logical.h"
 #include "replication/origin.h"
+#include "storage/ipc.h"
+#include "utils/array.h"
 #include "utils/inval.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -215,6 +217,11 @@ extern bool decode_concurrent_changes(LogicalDecodingContext *ctx,
 									  struct timeval *must_complete);
 extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
+#if PG_VERSION_NUM >= 150000
+extern shmem_request_hook_type prev_shmem_request_hook;
+#endif
+extern shmem_startup_hook_type prev_shmem_startup_hook;
+
 /*
  * Connection information the squeeze worker needs to connect to database if
  * starting automatically. Strings are more convenient for admin than OIDs and
@@ -253,4 +260,12 @@ extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
 										WorkerConInit *con_init,
 										WorkerConInteractive *con_interactive,
 										pid_t notify_pid);
-extern void squeeze_worker_main(Datum main_arg);
+
+extern void squeeze_worker_shmem_request(void);
+extern void squeeze_worker_shmem_startup(void);
+
+extern PGDLLEXPORT void squeeze_worker_main(Datum main_arg);
+
+extern bool squeeze_table_impl(Name relschema, Name relname, Name indname,
+							   Name tbspname, ArrayType	*ind_tbsp,
+							   ErrorData **edata_p, MemoryContext edata_cxt);
