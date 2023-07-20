@@ -115,6 +115,24 @@ static WorkerSlot *MyWorkerSlot = NULL;
 /* Local pointer to the task in the shared memory. */
 static WorkerTask *MyWorkerTask = NULL;
 
+/* Information retrieved from the "tasks" and "tables" functions. */
+typedef struct TaskDetails
+{
+	uint32		id;
+	NameData	relschema;
+	NameData	relname;
+	NameData	cl_index;
+	NameData	rel_tbsp;
+	ArrayType	*ind_tbsps;
+	bool		last_try;
+	bool		skip_analyze;
+} TaskDetails;
+
+static void init_task_details(TaskDetails *task, int32 task_id,
+							  Name relschema, Name relname, Name cl_index,
+							  Name rel_tbsp, ArrayType *ind_tbsps,
+							  bool last_try, bool skip_analyze);
+
 static Size
 worker_shmem_size(void)
 {
@@ -226,10 +244,9 @@ static void worker_sigterm(SIGNAL_ARGS);
 
 static void scheduler_worker_loop(void);
 static void squeeze_worker_loop(void);
-static void process_next_task(MemoryContext task_cxt);
+static void process_tasks(MemoryContext task_cxt);
 
 static void run_command(char *command, int rc);
-static int64 get_task_count(void);
 
 /*
  * The function name is ..._worker instead of ..._workers for historic reasons
@@ -760,7 +777,6 @@ squeeze_worker_loop(void)
 	while (!got_sigterm)
 	{
 		int	rc;
-		int64	ntasks, i;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -783,20 +799,9 @@ squeeze_worker_loop(void)
 		 */
 		run_command("SELECT squeeze.dispatch_new_tasks()", SPI_OK_SELECT);
 
-		/* Process all the tasks currently ready for processing. */
-		ntasks = get_task_count();
-		ereport(DEBUG1,
-				(errmsg("squeeze worker: %zd tasks to process", ntasks)));
-
-		/*
-		 * One extra iteration, as there might be a task in the shared memory
-		 * (while there's no useful task in the "tasks" table)
-		 */
-		for (i = 0; i < ntasks + 1; i++)
-		{
-			MemoryContextReset(task_cxt);
-			process_next_task(task_cxt);
-		}
+		/* Process the pending task(s). */
+		MemoryContextReset(task_cxt);
+		process_tasks(task_cxt);
 
 		/*
 		 * Release the replication slot explicitly, ERROR does not ensure
@@ -807,87 +812,79 @@ squeeze_worker_loop(void)
 		if (MyReplicationSlot != NULL)
 			ReplicationSlotRelease();
 
-		/*
-		 * Check again if some task is ready for processing, and wait if there
-		 * is none.
-		 *
-		 * Better solution would be to have the scheduler set our latch, but
-		 * the background worker API does not provide an easy way for non-core
-		 * worker to publish his latch. In particular, the worker code cannot
-		 * do anything before the process is forked from the postmaster.
-		 */
-		ntasks = get_task_count();
-		if (ntasks == 0)
-			delay = worker_naptime * 1000L;
-		else
-			delay = 0;
+		delay = worker_naptime * 1000L;
 	}
 
 	MemoryContextDelete(task_cxt);
 }
 
 /*
- * This function used to be implemented in pl/pgsql. However, since it calls
- * the squeeze_table() function and since the commit 240e0dbacd in PG core
- * makes it impossible to call squeeze_table() via FMGR, this function must be
- * implemented in C and call squeeze_table() directly.
+ * process_next_task() function used to be implemented in pl/pgsql. However,
+ * since it calls the squeeze_table() function and since the commit 240e0dbacd
+ * in PG core makes it impossible to call squeeze_table() via FMGR, this
+ * function must be implemented in C and call squeeze_table() directly.
+ *
+ * The name was also changed so it reflects the fact that multiple tasks can
+ * be processed by a single call.
  */
 static void
-process_next_task(MemoryContext task_cxt)
+process_tasks(MemoryContext task_cxt)
 {
 	StringInfoData	query;
 	int		ret;
-	TupleTableSlot	*slot;
-	Datum	datum;
-	bool	isnull;
 	Name	relschema, relname;
 	Name	cl_index = NULL;
-	Name	rel_tbsp = NULL;
-	ArrayType	*ind_tbsps = NULL;
-	int32	task_id;
-	bool	last_try, skip_analyze;
-	HeapTuple	tup;
-	TupleDesc	tupdesc;
-	bool	success;
 	ErrorData	*edata;
 	MemoryContext	oldcxt;
-	TimestampTz		start_ts;
-	Oid		outfunc;
-	bool	isvarlena;
-	FmgrInfo	fmgrinfo;
-	char	*start_ts_str;
-	WorkerTask	*task = &workerData->task;
+	TaskDetails	*tasks = NULL;
+	uint64		ntasks = 0;
+	int		i;
 
 	initStringInfo(&query);
 
 	/* First, check for a task in the shared memory. */
-	LWLockAcquire(task->lock, LW_SHARED);
-	if (task->dbid == MyDatabaseId)
+	LWLockAcquire(workerData->task.lock, LW_SHARED);
+	if (workerData->task.dbid == MyDatabaseId)
 	{
-		relschema = &task->relschema;
-		relname = &task->relname;
-		if (strlen(NameStr(task->indname)) > 0)
-			cl_index = &task->indname;
-
 		Assert(MyWorkerTask == NULL);
-		MyWorkerTask = task;
+		MyWorkerTask = &workerData->task;
+
+		relschema = &MyWorkerTask->relschema;
+		relname = &MyWorkerTask->relname;
+		if (strlen(NameStr(MyWorkerTask->indname)) > 0)
+			cl_index = &MyWorkerTask->indname;
+
+		/* Create a single-element array of tasks for further processing. */
+		ntasks = 1;
+		oldcxt = CurrentMemoryContext;
+		MemoryContextSwitchTo(task_cxt);
+		tasks = (TaskDetails *) palloc(sizeof(TaskDetails));
+		init_task_details(tasks, 0, relschema, relname, cl_index, NULL, NULL,
+						  false, false);
+		MemoryContextSwitchTo(oldcxt);
 	}
-	LWLockRelease(task->lock);
+	LWLockRelease(workerData->task.lock);
 
 	if (MyWorkerTask == NULL)
 	{
+		TupleDesc	tupdesc;
+		TupleTableSlot	*slot;
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		appendStringInfoString(&query,
+		/* Fetch this many tasks per query execution. */
+#define TASK_BATCH_SIZE		4
+
+		appendStringInfo(&query,
 "SELECT tb.tabschema, tb.tabname, tb.clustering_index,\
 tb.rel_tablespace, tb.ind_tablespaces, t.id, \
 t.tried >= tb.max_retry, tb.skip_analyze \
 FROM squeeze.tasks t, squeeze.tables tb \
 WHERE t.table_id = tb.id AND t.state = 'ready' \
 ORDER BY t.created \
-LIMIT 1");
+LIMIT %d", TASK_BATCH_SIZE);
 
 		if (SPI_connect() != SPI_OK_CONNECT)
 			ereport(ERROR, (errmsg("could not connect to SPI manager")));
@@ -899,10 +896,11 @@ LIMIT 1");
 			ereport(ERROR, (errmsg("SELECT command failed: %s", query.data)));
 
 #if PG_VERSION_NUM >= 130000
-		if (SPI_tuptable->numvals == 0)
+		ntasks = SPI_tuptable->numvals;
 #else
-		if (SPI_processed == 0)
+		ntasks = SPI_processed;
 #endif
+		if (ntasks == 0)
 		{
 			if (SPI_finish() != SPI_OK_FINISH)
 				ereport(ERROR, (errmsg("SPI_finish failed")));
@@ -912,15 +910,11 @@ LIMIT 1");
 			return;
 		}
 
-#if PG_VERSION_NUM >= 130000
-		Assert(SPI_tuptable->numvals == 1);
-#else
-		Assert(SPI_processed == 1);
-#endif
+		Assert(ntasks <= TASK_BATCH_SIZE);
 
 		/*
-		 * Create both the slot and the tuple copy in a separate memory context,
-		 * so that it survives the SPI session.
+		 * Create the tuple descriptor, slot and the task details in a
+		 * separate memory context, so that it survives the SPI session.
 		 */
 		oldcxt = CurrentMemoryContext;
 		MemoryContextSwitchTo(task_cxt);
@@ -930,181 +924,220 @@ LIMIT 1");
 #else
 		slot = MakeSingleTupleTableSlot(tupdesc);
 #endif
-		tup = heap_copytuple(SPI_tuptable->vals[0]);
-#if PG_VERSION_NUM >= 120000
-		ExecStoreHeapTuple(tup, slot, true);
-#else
-		ExecStoreTuple(tup, slot, InvalidBuffer, true);
-#endif
-		MemoryContextSwitchTo(oldcxt);
+		tasks = (TaskDetails *) palloc(ntasks * sizeof(TaskDetails));
+		for (i = 0; i < ntasks; i++)
+		{
+			HeapTuple	tup;
+			Datum	datum;
+			bool	isnull;
+			Name	rel_tbsp = NULL;
+			ArrayType	*ind_tbsps = NULL;
+			int32	task_id;
+			bool	last_try, skip_analyze;
 
+			/* Retrieve the tuple attributes. */
+			tup = heap_copytuple(SPI_tuptable->vals[i]);
+			ExecClearTuple(slot);
+#if PG_VERSION_NUM >= 120000
+			ExecStoreHeapTuple(tup, slot, true);
+#else
+			ExecStoreTuple(tup, slot, InvalidBuffer, true);
+#endif
+
+			datum = slot_getattr(slot, 1, &isnull);
+			Assert(!isnull);
+			relschema = DatumGetName(datum);
+
+			datum = slot_getattr(slot, 2, &isnull);
+			Assert(!isnull);
+			relname = DatumGetName(datum);
+
+			datum = slot_getattr(slot, 3, &isnull);
+			if (!isnull)
+				cl_index = DatumGetName(datum);
+
+			datum = slot_getattr(slot, 4, &isnull);
+			if (!isnull)
+				rel_tbsp = DatumGetName(datum);
+
+			datum = slot_getattr(slot, 5, &isnull);
+			if (!isnull)
+				ind_tbsps = DatumGetArrayTypeP(datum);
+
+			datum = slot_getattr(slot, 6, &isnull);
+			Assert(!isnull);
+			task_id = DatumGetInt32(datum);
+
+			datum = slot_getattr(slot, 7, &isnull);
+			Assert(!isnull);
+			last_try = DatumGetBool(datum);
+
+			datum = slot_getattr(slot, 8, &isnull);
+			Assert(!isnull);
+			skip_analyze = DatumGetBool(datum);
+
+			init_task_details(&tasks[i], task_id, relschema, relname,
+							  cl_index, rel_tbsp, ind_tbsps, last_try,
+							  skip_analyze);
+
+		}
+		MemoryContextSwitchTo(oldcxt);
+		ExecDropSingleTupleTableSlot(slot);
+		FreeTupleDesc(tupdesc);
+
+		/* Finish the data retrieval. */
 		if (SPI_finish() != SPI_OK_FINISH)
 			ereport(ERROR, (errmsg("SPI_finish failed")));
-
-		datum = slot_getattr(slot, 1, &isnull);
-		Assert(!isnull);
-		relschema = DatumGetName(datum);
-
-		datum = slot_getattr(slot, 2, &isnull);
-		Assert(!isnull);
-		relname = DatumGetName(datum);
-
-		datum = slot_getattr(slot, 3, &isnull);
-		if (!isnull)
-			cl_index = DatumGetName(datum);
-
-		datum = slot_getattr(slot, 4, &isnull);
-		if (!isnull)
-			rel_tbsp = DatumGetName(datum);
-
-		datum = slot_getattr(slot, 5, &isnull);
-		if (!isnull)
-			ind_tbsps = DatumGetArrayTypeP(datum);
-
-		datum = slot_getattr(slot, 6, &isnull);
-		Assert(!isnull);
-		task_id = DatumGetInt32(datum);
-
-		datum = slot_getattr(slot, 7, &isnull);
-		Assert(!isnull);
-		last_try = DatumGetBool(datum);
-
-		datum = slot_getattr(slot, 8, &isnull);
-		Assert(!isnull);
-		skip_analyze = DatumGetBool(datum);
-
-		ereport(DEBUG1,
-				(errmsg("task for table %s.%s is ready for processing",
-						NameStr(*relschema), NameStr(*relname))));
-
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
 
-	/* Perform the actual work. */
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-
-	start_ts = GetCurrentTimestamp();
-	success = squeeze_table_impl(relschema, relname, cl_index, rel_tbsp,
-								 ind_tbsps, &edata, task_cxt);
-
-	if (success)
-		CommitTransactionCommand();
-	else
+	/* Now process the tasks. */
+	for (i = 0; i < ntasks; i++)
 	{
-		/*
-		 * The transaction should be aborted by squeeze_table_impl().
-		 *
-		 * Here we are especially interested in errors like incorrect user
-		 * input (e.g. non-existing table specified) or expiration of the
-		 * squeeze_max_xlock_time parameter. If the squeezing succeeded, the
-		 * following operations should succeed too, unless there's a bug in
-		 * the extension - in such a case it's o.k. to let the ERROR stop the
-		 * worker.
-		 */
-		resetStringInfo(&query);
-		appendStringInfo(&query,
+		TimestampTz		start_ts;
+		bool	success;
+		TaskDetails		*td = &tasks[i];
+		Name	cl_index = NULL;
+		Name	rel_tbsp = NULL;
+
+		ereport(DEBUG1,
+				(errmsg("task for table %s.%s is ready for processing",
+						NameStr(td->relschema), NameStr(td->relname))));
+
+		if (strlen(NameStr(td->cl_index)) > 0)
+			cl_index = &td->cl_index;
+		if (strlen(NameStr(td->rel_tbsp)) > 0)
+			rel_tbsp = &td->rel_tbsp;
+
+		/* Perform the actual work. */
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		start_ts = GetCurrentTimestamp();
+		success = squeeze_table_impl(&td->relschema, &td->relname, cl_index,
+									 rel_tbsp, td->ind_tbsps, &edata, task_cxt);
+
+		if (success)
+			CommitTransactionCommand();
+		else
+		{
+			/*
+			 * The transaction should be aborted by squeeze_table_impl().
+			 *
+			 * Here we are especially interested in errors like incorrect user
+			 * input (e.g. non-existing table specified) or expiration of the
+			 * squeeze_max_xlock_time parameter. If the squeezing succeeded,
+			 * the following operations should succeed too, unless there's a
+			 * bug in the extension - in such a case it's o.k. to let the
+			 * ERROR stop the worker.
+			 */
+			resetStringInfo(&query);
+			appendStringInfo(&query,
 "INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
 VALUES ('%s', '%s', '%s', '%s', '%s')",
-						 NameStr(*relschema),
-						 NameStr(*relname),
-						 unpack_sql_state(edata->sqlerrcode),
-						 edata->message,
-						 edata->detail ? edata->detail : "");
-		run_command(query.data, SPI_OK_INSERT);
+							 NameStr(td->relschema),
+							 NameStr(td->relname),
+							 unpack_sql_state(edata->sqlerrcode),
+							 edata->message,
+							 edata->detail ? edata->detail : "");
+			run_command(query.data, SPI_OK_INSERT);
 
-		if (MyWorkerTask == NULL)
-		{
-			/* If the active task failed too many times, cancel it. */
-			resetStringInfo(&query);
-			if (last_try)
+			if (MyWorkerTask == NULL)
 			{
-				appendStringInfo(&query,
-								 "SELECT squeeze.cancel_task(%d)",
-								 task_id);
-				run_command(query.data, SPI_OK_SELECT);
-			}
-			else
-			{
-				/* Account for the current attempt. */
-				appendStringInfo(&query,
-								 "UPDATE squeeze.tasks SET tried = tried + 1 WHERE id = %d",
-								 task_id);
-				run_command(query.data, SPI_OK_UPDATE);
-			}
-
-			ExecDropSingleTupleTableSlot(slot);
-			FreeTupleDesc(tupdesc);
-
-			return;
-		}
-	}
-
-	/* Insert an entry into the "squeeze.log" table. */
-	if (success)
-	{
-		StartTransactionCommand();
-		getTypeOutputInfo(TIMESTAMPTZOID, &outfunc, &isvarlena);
-		fmgr_info(outfunc, &fmgrinfo);
-		start_ts_str = OutputFunctionCall(&fmgrinfo, start_ts);
-		/* Make sure the string survives TopTransactionContext. */
-		MemoryContextSwitchTo(task_cxt);
-		start_ts_str = pstrdup(start_ts_str);
-		MemoryContextSwitchTo(oldcxt);
-		CommitTransactionCommand();
-		resetStringInfo(&query);
-		appendStringInfo(&query,
-"INSERT INTO squeeze.log(tabschema, tabname, started, finished) \
-VALUES ('%s', '%s', '%s', clock_timestamp())",
-						 NameStr(*relschema),
-						 NameStr(*relname),
-						 start_ts_str);
-		run_command(query.data, SPI_OK_INSERT);
-
-		if (MyWorkerTask == NULL)
-		{
-			/* Finalize the task. */
-			resetStringInfo(&query);
-			appendStringInfo(&query, "SELECT squeeze.finalize_task(%d)", task_id);
-			run_command(query.data, SPI_OK_SELECT);
-
-			if (!skip_analyze)
-			{
-				/* Analyze the new table, unless user rejects it explicitly.
-				 *
-				 * XXX Besides updating planner statistics in general, this
-				 * sets pg_class(relallvisible) to 0, so that planner is not
-				 * too optimistic about this figure. The preferrable solution
-				 * would be to run (lazy) VACUUM (with the ANALYZE option) to
-				 * initialize visibility map. However, to make the effort
-				 * worthwile, we shouldn't do it until all transactions can
-				 * see all the changes done by squeeze_table()
-				 * function. What's the most suitable way to wait?
-				 * Asynchronous execution of the VACUUM is probably needed in
-				 * any case.
-				 */
+				/* If the active task failed too many times, cancel it. */
 				resetStringInfo(&query);
-				appendStringInfo(&query, "ANALYZE %s.%s",
-								 NameStr(*relschema),
-								 NameStr(*relname));
-				run_command(query.data, SPI_OK_UTILITY);
+				if (td->last_try)
+				{
+					appendStringInfo(&query,
+									 "SELECT squeeze.cancel_task(%d)",
+									 td->id);
+					run_command(query.data, SPI_OK_SELECT);
+				}
+				else
+				{
+					/* Account for the current attempt. */
+					appendStringInfo(&query,
+									 "UPDATE squeeze.tasks SET tried = tried + 1 WHERE id = %d",
+									 td->id);
+					run_command(query.data, SPI_OK_UPDATE);
+				}
+
+				return;
 			}
 		}
-	}
 
-	if (MyWorkerTask)
-	{
-		/* Make room for the next task. */
-		LWLockAcquire(task->lock, LW_EXCLUSIVE);
-		task->dbid = InvalidOid;
-		task->id++;
-		LWLockRelease(task->lock);
+		/* Insert an entry into the "squeeze.log" table. */
+		if (success)
+		{
+			Oid		outfunc;
+			bool	isvarlena;
+			FmgrInfo	fmgrinfo;
+			char	*start_ts_str;
 
-		/* Notify the next backend that is trying to create a new task. */
-		ConditionVariableSignal(&task->cv);
+			StartTransactionCommand();
+			getTypeOutputInfo(TIMESTAMPTZOID, &outfunc, &isvarlena);
+			fmgr_info(outfunc, &fmgrinfo);
+			start_ts_str = OutputFunctionCall(&fmgrinfo, start_ts);
+			/* Make sure the string survives TopTransactionContext. */
+			MemoryContextSwitchTo(task_cxt);
+			start_ts_str = pstrdup(start_ts_str);
+			MemoryContextSwitchTo(oldcxt);
+			CommitTransactionCommand();
 
-		MyWorkerTask = NULL;
+			resetStringInfo(&query);
+			appendStringInfo(&query,
+							 "INSERT INTO squeeze.log(tabschema, tabname, started, finished) \
+VALUES ('%s', '%s', '%s', clock_timestamp())",
+							 NameStr(td->relschema),
+							 NameStr(td->relname),
+							 start_ts_str);
+			run_command(query.data, SPI_OK_INSERT);
+
+			if (MyWorkerTask == NULL)
+			{
+				/* Finalize the task. */
+				resetStringInfo(&query);
+				appendStringInfo(&query, "SELECT squeeze.finalize_task(%d)", td->id);
+				run_command(query.data, SPI_OK_SELECT);
+
+				if (!td->skip_analyze)
+				{
+					/* Analyze the new table, unless user rejects it
+					 * explicitly.
+					 *
+					 * XXX Besides updating planner statistics in general,
+					 * this sets pg_class(relallvisible) to 0, so that planner
+					 * is not too optimistic about this figure. The
+					 * preferrable solution would be to run (lazy) VACUUM
+					 * (with the ANALYZE option) to initialize visibility
+					 * map. However, to make the effort worthwile, we
+					 * shouldn't do it until all transactions can see all the
+					 * changes done by squeeze_table() function. What's the
+					 * most suitable way to wait?  Asynchronous execution of
+					 * the VACUUM is probably needed in any case.
+					 */
+					resetStringInfo(&query);
+					appendStringInfo(&query, "ANALYZE %s.%s",
+									 NameStr(td->relschema),
+									 NameStr(td->relname));
+					run_command(query.data, SPI_OK_UTILITY);
+				}
+			}
+		}
+
+		if (MyWorkerTask)
+		{
+			/* Make room for the next task. */
+			LWLockAcquire(MyWorkerTask->lock, LW_EXCLUSIVE);
+			MyWorkerTask->dbid = InvalidOid;
+			MyWorkerTask->id++;
+			LWLockRelease(MyWorkerTask->lock);
+
+			/* Notify the next backend that is trying to create a new task. */
+			ConditionVariableSignal(&MyWorkerTask->cv);
+
+			MyWorkerTask = NULL;
+		}
 	}
 }
 
@@ -1134,49 +1167,20 @@ run_command(char *command, int rc)
 	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
-
-/* Return the number pending tasks, i.e. of rows of squeeze.tasks table. */
-static int64
-get_task_count(void)
+static void
+init_task_details(TaskDetails *task, int32 task_id, Name relschema,
+				  Name relname, Name cl_index, Name rel_tbsp,
+				  ArrayType *ind_tbsps, bool last_try, bool skip_analyze)
 {
-	int	ret;
-	Datum	res_datum;
-	bool	isnull;
-	int64	result;
-	char	*command = "SELECT count(*) FROM squeeze.tasks WHERE state='ready'";
-#ifdef USE_ASSERT_CHECKING
-	Oid	restype;
-#endif
-
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	pgstat_report_activity(STATE_RUNNING, command);
-
-	ret = SPI_execute(command, true, 0);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "SELECT command failed: %s", command);
-
-	Assert(SPI_tuptable->tupdesc != NULL);
-#ifdef USE_ASSERT_CHECKING
-	restype = SPI_gettypeid(SPI_tuptable->tupdesc, 1);
-	Assert(restype == INT8OID);
-#endif
-
-	Assert(SPI_processed == 1);
-	Assert(SPI_tuptable->vals != NULL);
-	res_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
-							  &isnull);
-	Assert(!isnull);
-
-	result = DatumGetInt64(res_datum);
-
-	SPI_finish();
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-	pgstat_report_stat(false);
-	pgstat_report_activity(STATE_IDLE, NULL);
-
-	return result;
+	memset(task, 0, sizeof(TaskDetails));
+	task->id = task_id;
+	namestrcpy(&task->relschema, NameStr(*relschema));
+	namestrcpy(&task->relname, NameStr(*relname));
+	if (cl_index)
+		namestrcpy(&task->cl_index, NameStr(*cl_index));
+	if (rel_tbsp)
+		namestrcpy(&task->rel_tbsp, NameStr(*rel_tbsp));
+	task->ind_tbsps = ind_tbsps;
+	task->last_try = last_try;
+	task->skip_analyze = skip_analyze;
 }
