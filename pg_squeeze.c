@@ -159,7 +159,7 @@ static Oid get_toast_index(Oid toastrelid);
 int squeeze_max_xlock_time = 0;
 
 /*
- * List of database OIDs for which the background worker should start started
+ * List of database names for which the background worker should start started
  * during cluster startup. (We require OIDs because there seems to be now good
  * way to pass list of database name w/o adding restrictions on character set
  * characters.)
@@ -171,6 +171,9 @@ char *squeeze_worker_autostart = NULL;
  * database(s).
  */
 char *squeeze_worker_role = NULL;
+
+/* The number of squeeze workers per database. */
+int squeeze_workers_per_database = 1;
 
 #if PG_VERSION_NUM >= 150000
 shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -196,7 +199,7 @@ _PG_init(void)
 
 	DefineCustomStringVariable(
 		"squeeze.worker_autostart",
-		"OIDs of databases for which background workers start automatically.",
+		"Names of databases for which background workers start automatically.",
 		"Comma-separated list for of databases which squeeze worker starts as soon as "
 		"the cluster startup has completed.",
 		&squeeze_worker_autostart,
@@ -214,6 +217,25 @@ _PG_init(void)
 		NULL,
 		PGC_POSTMASTER,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"squeeze.workers_per_database",
+		"Maximum number of squeeze worker processes launched for each database.",
+		NULL,
+		&squeeze_workers_per_database,
+		1, 1, max_worker_processes,
+		PGC_POSTMASTER,
+		0,
+		/*
+		 * Assume that the in-core GUC max_worker_processes should already be
+		 * assigned and checked before the loading of the modules
+		 * starts. Since the context of both this GUC and the
+		 * max_worker_processes is PGC_POSTMASTER, no future check should be
+		 * needed. (Some in-core GUCs that reference other ones have the hooks
+		 * despite being PGC_POSTMASTER, but the reason seems to be that those
+		 * cannot assume anything about the order of checking.)
+		 */
 		NULL, NULL, NULL);
 
 	if (squeeze_worker_autostart)
@@ -276,6 +298,7 @@ _PG_init(void)
 		{
 			WorkerConInit	*con;
 			BackgroundWorker worker;
+			int		i;
 
 			dbname = lfirst(lc);
 
@@ -285,7 +308,8 @@ _PG_init(void)
 
 			con = allocate_worker_con_info(dbname, squeeze_worker_role, false);
 			squeeze_initialize_bgworker(&worker, con, NULL, 0);
-			RegisterBackgroundWorker(&worker);
+			for (i = 0; i < squeeze_workers_per_database; i++)
+				RegisterBackgroundWorker(&worker);
 		}
 		list_free_deep(dbnames);
 	}
@@ -1012,13 +1036,13 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 
 	/*
-	 * Each database has a separate background worker, so multiple squeezes
-	 * can be in progress anytime. Thus the slot name should be
-	 * database-specific.
+	 * Each database has a single background worker, so database-specific slot
+	 * name should be fine. However, an user might want to squeeze arbitrary
+	 * number of tables manually, therefore we include relid in the slot name.
 	 */
 	buf = makeStringInfo();
 	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
-	appendStringInfo(buf, "%u", MyDatabaseId);
+	appendStringInfo(buf, "%u_%u", MyDatabaseId, relid);
 #if PG_VERSION_NUM >= 140000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
 #else

@@ -287,6 +287,17 @@ is exceeded a few more times. If that happens, you should either increase the
 setting or schedule processing of the problematic table to a different daytime,
 when the write activity is lower.
 
+# Running multiple workers per database
+
+If you think that a single squeeze worker does not cope with the load,
+consider setting the `squeeze.workers_per_database` to value higher than
+1. Then the `pg_squeeze` extension will be able to process multiple tables at
+a time - one table per squeeze worker. However, be aware that this setting
+affects all databases in which you actively use the `pg_squeeze`
+extension. The total number of all the squeeze workers in the cluster
+(including the "scheduler workers") cannot exceed the in-core configuration
+variable `max_worker_processes`.
+
 # Monitoring
 
 * `squeeze.log` table contains one entry per successfully squeezed table.

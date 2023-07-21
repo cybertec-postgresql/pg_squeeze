@@ -17,6 +17,7 @@
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "executor/spi.h"
+#include "nodes/makefuncs.h"
 #include "replication/slot.h"
 #include "storage/condition_variable.h"
 #include "storage/latch.h"
@@ -36,6 +37,10 @@
  * The shmem_request_hook_type hook was introduced in PG 15. Since the number
  * of slots depends on the max_worker_processes GUC, the maximum number of
  * squeeze workers must be a compile time constant for PG < 15.
+ *
+ * XXX Maybe we don't need to worry about dependency on an in-core GUC - the
+ * value should be known at the load time and no loadable module should be
+ * able to change it.
  */
 static int
 max_squeeze_workers(void)
@@ -61,6 +66,7 @@ max_squeeze_workers(void)
 typedef struct WorkerSlot
 {
 	Oid		dbid;				/* database the worker is connected to */
+	Oid		relid;				/* relation the worker is working on */
 	int		pid;				/* the PID */
 	bool	scheduler;			/* true if scheduler, false if the "squeeze
 								 * worker" */
@@ -75,7 +81,9 @@ typedef struct WorkerTask
 {
 	int		id;					/* the task id */
 
-	Oid		dbid;
+	Oid		dbid;				/* also indicates whether the task is valid */
+	bool	in_progress;		/* for workers to avoid processing the same
+								 * task */
 	NameData	relschema;
 	NameData	relname;
 	NameData	indname;		/* clustering index */
@@ -181,6 +189,7 @@ squeeze_worker_shmem_startup(void)
 		task = &workerData->task;
 		task->id = 0;
 		task->dbid = InvalidOid;
+		task->in_progress = false;
 		task->lock = &locks->lock;
 		locks++;
 		ConditionVariableInit(&task->cv);
@@ -193,6 +202,7 @@ squeeze_worker_shmem_startup(void)
 			WorkerSlot	*slot = &workerData->slots[i];
 
 			slot->dbid = InvalidOid;
+			slot->relid = InvalidOid;
 			slot->pid = InvalidPid;
 			slot->latch = NULL;
 		}
@@ -212,6 +222,7 @@ worker_shmem_shutdown(int code, Datum arg)
 		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 		Assert(MyWorkerSlot->dbid != InvalidOid);
 		MyWorkerSlot->dbid = InvalidOid;
+		MyWorkerSlot->relid = InvalidOid;
 		MyWorkerSlot->pid = InvalidPid;
 		MyWorkerSlot->latch = NULL;
 		LWLockRelease(workerData->lock);
@@ -224,6 +235,7 @@ worker_shmem_shutdown(int code, Datum arg)
 	{
 		LWLockAcquire(MyWorkerTask->lock, LW_EXCLUSIVE);
 		MyWorkerTask->dbid = InvalidOid;
+		MyWorkerTask->in_progress = false;
 		MyWorkerTask->id++;
 		LWLockRelease(MyWorkerTask->lock);
 
@@ -256,13 +268,17 @@ PG_FUNCTION_INFO_V1(squeeze_start_worker);
 Datum
 squeeze_start_worker(PG_FUNCTION_ARGS)
 {
+	int		i;
+
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to start squeeze worker"))));
 
 	start_worker_internal(true);
-	start_worker_internal(false);
+
+	for (i = 0; i < squeeze_workers_per_database; i++)
+		start_worker_internal(false);
 
 	PG_RETURN_VOID();
 }
@@ -296,12 +312,12 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 }
 
 static void
-wake_up_squeeze_worker(void)
+wake_up_squeeze_workers(void)
 {
 	int		i;
 	bool	found = false;
 
-	/* Wake up a worker for this database. */
+	/* Wake up all squeeze workers connected to this database. */
 	LWLockAcquire(workerData->lock, LW_SHARED);
 	for (i = 0; i < workerData->nslots; i++)
 	{
@@ -315,7 +331,6 @@ wake_up_squeeze_worker(void)
 		{
 			SetLatch(slot->latch);
 			found = true;
-			break;
 		}
 	}
 	LWLockRelease(workerData->lock);
@@ -394,6 +409,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 
 	/* Fill-in the task information. */
 	task->dbid = MyDatabaseId;
+	Assert(!task->in_progress);
 	namestrcpy(&task->relschema, NameStr(*relschema));
 	namestrcpy(&task->relname, NameStr(*relname));
 	if (indname)
@@ -404,7 +420,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	task_id = task->id;
 	LWLockRelease(task->lock);
 
-	wake_up_squeeze_worker();
+	wake_up_squeeze_workers();
 
 	/*
 	 * Wait for the task to complete (again, no busy loop like above.)
@@ -641,32 +657,34 @@ squeeze_worker_main(Datum main_arg)
 	/* The worker should do its cleanup when exiting. */
 	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
 
-	/* Make sure this kind of worker is not yet running on this database. */
-	found = false;
-	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
-	for (i = 0; i < workerData->nslots; i++)
+	/* Make sure that another scheduler is not running on this database. */
+	if (am_i_scheduler)
 	{
-		WorkerSlot	*slot = &workerData->slots[i];
-
-		if (slot->dbid == MyDatabaseId &&
-			slot->scheduler == am_i_scheduler)
+		found = false;
+		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+		for (i = 0; i < workerData->nslots; i++)
 		{
-			elog(WARNING,
-				 "one %s worker is already running on database oid=%u",
-				 kind, MyDatabaseId);
+			WorkerSlot	*slot = &workerData->slots[i];
 
-			found = true;
-			break;
+			if (slot->dbid == MyDatabaseId && slot->scheduler)
+			{
+				elog(WARNING,
+					 "one %s worker is already running on database oid=%u",
+					 kind, MyDatabaseId);
+
+				found = true;
+				break;
+			}
 		}
-	}
-	if (found)
-	{
 		LWLockRelease(workerData->lock);
-		goto done;
+		if (found)
+			goto done;
 	}
 
 	/* Find and initialize a slot for this worker. */
 	Assert(MyWorkerSlot == NULL);
+	found = false;
+	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
 		WorkerSlot	*slot = &workerData->slots[i];
@@ -674,6 +692,7 @@ squeeze_worker_main(Datum main_arg)
 		if (slot->dbid == InvalidOid)
 		{
 			slot->dbid = MyDatabaseId;
+			Assert(slot->relid == InvalidOid);
 			Assert(slot->pid == InvalidPid);
 			slot->pid = MyProcPid;
 			slot->scheduler = am_i_scheduler;
@@ -756,7 +775,7 @@ scheduler_worker_loop(void)
 		 * If worker is idle, there's no reason to let it wait until its
 		 * naptime is over.
 		 */
-		wake_up_squeeze_worker();
+		wake_up_squeeze_workers();
 
 		/* Check later if any table meets the schedule. */
 		delay = worker_naptime * 1000L;
@@ -833,18 +852,29 @@ process_tasks(MemoryContext task_cxt)
 	StringInfoData	query;
 	int		ret;
 	Name	relschema, relname;
-	Name	cl_index = NULL;
+	Name	cl_index;
 	ErrorData	*edata;
 	MemoryContext	oldcxt;
 	TaskDetails	*tasks = NULL;
-	uint64		ntasks = 0;
+	uint64		ntasks;
 	int		i;
 
 	initStringInfo(&query);
 
+ restart:
+	cl_index = NULL;
+	if (tasks)
+	{
+		pfree(tasks);
+		tasks = NULL;
+	}
+	ntasks = 0;
+	resetStringInfo(&query);
+
 	/* First, check for a task in the shared memory. */
 	LWLockAcquire(workerData->task.lock, LW_SHARED);
-	if (workerData->task.dbid == MyDatabaseId)
+	if (workerData->task.dbid == MyDatabaseId &&
+		!workerData->task.in_progress)
 	{
 		Assert(MyWorkerTask == NULL);
 		MyWorkerTask = &workerData->task;
@@ -862,6 +892,9 @@ process_tasks(MemoryContext task_cxt)
 		init_task_details(tasks, 0, relschema, relname, cl_index, NULL, NULL,
 						  false, false);
 		MemoryContextSwitchTo(oldcxt);
+
+		/* No other worker should pick this task. */
+		MyWorkerTask->in_progress = true;
 	}
 	LWLockRelease(workerData->task.lock);
 
@@ -998,12 +1031,67 @@ LIMIT %d", TASK_BATCH_SIZE);
 		TimestampTz		start_ts;
 		bool	success;
 		TaskDetails		*td = &tasks[i];
+		RangeVar	*relrv;
+		Relation	rel;
+		Oid		relid;
 		Name	cl_index = NULL;
 		Name	rel_tbsp = NULL;
+		int		j;
+		bool	found;
 
 		ereport(DEBUG1,
 				(errmsg("task for table %s.%s is ready for processing",
 						NameStr(td->relschema), NameStr(td->relname))));
+
+		/* Check if another worker is already processing this table. */
+		StartTransactionCommand();
+		relrv = makeRangeVar(NameStr(td->relschema), NameStr(td->relname), -1);
+#if PG_VERSION_NUM >= 120000
+		rel = table_openrv(relrv, AccessShareLock);
+		relid = RelationGetRelid(rel);
+		table_close(rel, AccessShareLock);
+#else
+		rel = heap_openrv(relrv, AccessShareLock);
+		relid = RelationGetRelid(rel);
+		heap_close(rel, AccessShareLock);
+#endif
+		CommitTransactionCommand();
+
+		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+		found = false;
+		for (j = 0; j < workerData->nslots; j++)
+		{
+			WorkerSlot	*slot = &workerData->slots[j];
+
+			if (slot->dbid == MyDatabaseId &&
+				slot->relid == relid)
+			{
+				found = true;
+				break;
+			}
+		}
+		if (found)
+		{
+			/* XXX Print out the PID of the other worker? */
+			ereport(DEBUG1,
+					(errmsg("task for table %s.%s is being processed by another worker",
+							NameStr(td->relschema), NameStr(td->relname))));
+			LWLockRelease(workerData->lock);
+			continue;
+		}
+		/* Declare that this worker takes care of the relation. */
+		Assert(MyWorkerSlot->dbid == MyDatabaseId);
+		MyWorkerSlot->relid = relid;
+		LWLockRelease(workerData->lock);
+		/*
+		 * In theory, the table can be dropped now, created again (with a
+		 * different OID), scheduled for processing and picked by another
+		 * worker. Concurrent processing of the same table should make
+		 * squeeze_table() fail because both (all) the backends will try to
+		 * create a replication slot of the same name. It doesn't make sense
+		 * to spend more effort on protection against such a rare conditions
+		 * here.
+		 */
 
 		if (strlen(NameStr(td->cl_index)) > 0)
 			cl_index = &td->cl_index;
@@ -1062,7 +1150,19 @@ VALUES ('%s', '%s', '%s', '%s', '%s')",
 					run_command(query.data, SPI_OK_UPDATE);
 				}
 
-				return;
+				/* Clear the relid field of this worker's slot. */
+				LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+				MyWorkerSlot->relid = InvalidOid;
+				LWLockRelease(workerData->lock);
+
+				/*
+				 * Some of the next tasks we have in the 'tasks' array could
+				 * have been already processed by other workers. Those should
+				 * have the state set to 'processed' (before the other slot
+				 * could set MyWorkerSlot->relid to InvalidOid), so we just
+				 * need to run the query above again.
+				 */
+				goto restart;
 			}
 		}
 
@@ -1130,6 +1230,7 @@ VALUES ('%s', '%s', '%s', clock_timestamp())",
 			/* Make room for the next task. */
 			LWLockAcquire(MyWorkerTask->lock, LW_EXCLUSIVE);
 			MyWorkerTask->dbid = InvalidOid;
+			MyWorkerTask->in_progress = false;
 			MyWorkerTask->id++;
 			LWLockRelease(MyWorkerTask->lock);
 
@@ -1138,6 +1239,14 @@ VALUES ('%s', '%s', '%s', clock_timestamp())",
 
 			MyWorkerTask = NULL;
 		}
+
+		/* Clear the relid field of this worker's slot. */
+		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+		MyWorkerSlot->relid = InvalidOid;
+		LWLockRelease(workerData->lock);
+
+		/* See above */
+		goto restart;
 	}
 }
 

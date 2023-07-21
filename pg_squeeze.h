@@ -222,6 +222,8 @@ extern shmem_request_hook_type prev_shmem_request_hook;
 #endif
 extern shmem_startup_hook_type prev_shmem_startup_hook;
 
+extern int squeeze_workers_per_database;
+
 /*
  * Connection information the squeeze worker needs to connect to database if
  * starting automatically. Strings are more convenient for admin than OIDs and
