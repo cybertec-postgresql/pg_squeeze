@@ -87,6 +87,18 @@ typedef struct WorkerTask
 	NameData	relschema;
 	NameData	relname;
 	NameData	indname;		/* clustering index */
+	NameData	tbspname;		/* destination tablespace */
+	/*
+	 * index destination tablespaces.
+	 *
+	 * text[][] array is stored here. The space should only be used by the
+	 * interactive squeeze_table() function, which is only there for testing
+	 * and troubleshooting purposes. If the array doesn't fit here, the user
+	 * needs to use the regular UI (ie register the table for squeezing and
+	 * insert a record into the "tasks" table).
+	 */
+#define IND_TABLESPACES_ARRAY_SIZE	1024
+	char	ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
 
 	/*
 	 * Exclusive lock is needed to change the contents. Note that for the
@@ -371,6 +383,8 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 {
 	Name	relschema, relname;
 	Name	indname = NULL;
+	Name	tbspname = NULL;
+	ArrayType	*ind_tbsps = NULL;
 	WorkerTask	*task = &workerData->task;
 	int		task_id;
 
@@ -383,6 +397,15 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	relname = PG_GETARG_NAME(1);
 	if (!PG_ARGISNULL(2))
 		indname = PG_GETARG_NAME(2);
+	if (!PG_ARGISNULL(3))
+		tbspname = PG_GETARG_NAME(3);
+	if (!PG_ARGISNULL(4))
+	{
+		ind_tbsps = PG_GETARG_ARRAYTYPE_P(4);
+		if (VARSIZE(ind_tbsps) >= IND_TABLESPACES_ARRAY_SIZE)
+			ereport(ERROR,
+					(errmsg("the value of \"ind_tablespaces\" is too big")));
+	}
 
 	/*
 	 * Wait until there's no pending task.
@@ -416,6 +439,14 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 		namestrcpy(&task->indname, NameStr(*indname));
 	else
 		NameStr(task->indname)[0] = '\0';
+	if (tbspname)
+		namestrcpy(&task->tbspname, NameStr(*tbspname));
+	else
+		NameStr(task->tbspname)[0] = '\0';
+	if (ind_tbsps)
+		memcpy(task->ind_tbsps, ind_tbsps, VARSIZE(ind_tbsps));
+	else
+		SET_VARSIZE(task->ind_tbsps, 0);
 
 	task_id = task->id;
 	LWLockRelease(task->lock);
@@ -852,7 +883,8 @@ process_tasks(MemoryContext task_cxt)
 	StringInfoData	query;
 	int		ret;
 	Name	relschema, relname;
-	Name	cl_index;
+	Name	cl_index, rel_tbsp;
+	ArrayType	*ind_tbsps;
 	ErrorData	*edata;
 	MemoryContext	oldcxt;
 	TaskDetails	*tasks = NULL;
@@ -863,8 +895,17 @@ process_tasks(MemoryContext task_cxt)
 
  restart:
 	cl_index = NULL;
+	rel_tbsp = NULL;
+	ind_tbsps = NULL;
 	if (tasks)
 	{
+		for (i = 0; i < ntasks; i++)
+		{
+			TaskDetails	*task = &tasks[i];
+
+			if (task->ind_tbsps)
+				pfree(task->ind_tbsps);
+		}
 		pfree(tasks);
 		tasks = NULL;
 	}
@@ -876,6 +917,8 @@ process_tasks(MemoryContext task_cxt)
 	if (workerData->task.dbid == MyDatabaseId &&
 		!workerData->task.in_progress)
 	{
+		uint32	arr_size;
+
 		Assert(MyWorkerTask == NULL);
 		MyWorkerTask = &workerData->task;
 
@@ -883,14 +926,29 @@ process_tasks(MemoryContext task_cxt)
 		relname = &MyWorkerTask->relname;
 		if (strlen(NameStr(MyWorkerTask->indname)) > 0)
 			cl_index = &MyWorkerTask->indname;
+		if (strlen(NameStr(MyWorkerTask->tbspname)) > 0)
+			rel_tbsp = &MyWorkerTask->tbspname;
 
 		/* Create a single-element array of tasks for further processing. */
 		ntasks = 1;
 		oldcxt = CurrentMemoryContext;
 		MemoryContextSwitchTo(task_cxt);
 		tasks = (TaskDetails *) palloc(sizeof(TaskDetails));
-		init_task_details(tasks, 0, relschema, relname, cl_index, NULL, NULL,
-						  false, false);
+
+		/*
+		 * Now that we're in the suitable memory context, we can copy the
+		 * tablespace mapping array, if one is passed.
+		 */
+		arr_size = VARSIZE(MyWorkerTask->ind_tbsps);
+		if (arr_size > 0)
+		{
+			Assert(arr_size <= IND_TABLESPACES_ARRAY_SIZE);
+			ind_tbsps = palloc(arr_size);
+			memcpy(ind_tbsps, MyWorkerTask->ind_tbsps, arr_size);
+		}
+
+		init_task_details(tasks, 0, relschema, relname, cl_index, rel_tbsp,
+						  ind_tbsps, false, false);
 		MemoryContextSwitchTo(oldcxt);
 
 		/* No other worker should pick this task. */
@@ -963,10 +1021,12 @@ LIMIT %d", TASK_BATCH_SIZE);
 			HeapTuple	tup;
 			Datum	datum;
 			bool	isnull;
-			Name	rel_tbsp = NULL;
-			ArrayType	*ind_tbsps = NULL;
 			int32	task_id;
 			bool	last_try, skip_analyze;
+
+			cl_index = NULL;
+			rel_tbsp = NULL;
+			ind_tbsps = NULL;
 
 			/* Retrieve the tuple attributes. */
 			tup = heap_copytuple(SPI_tuptable->vals[i]);
@@ -995,7 +1055,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 
 			datum = slot_getattr(slot, 5, &isnull);
 			if (!isnull)
-				ind_tbsps = DatumGetArrayTypeP(datum);
+				ind_tbsps = DatumGetArrayTypePCopy(datum);
 
 			datum = slot_getattr(slot, 6, &isnull);
 			Assert(!isnull);

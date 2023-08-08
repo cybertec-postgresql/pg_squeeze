@@ -10,7 +10,12 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_stop_worker'
 LANGUAGE C;
 
-CREATE FUNCTION squeeze_table(name, name, name)
+CREATE FUNCTION squeeze_table(
+       tabchema		name,
+       tabname		name,
+       clustering_index name,
+       rel_tablespace 	name,
+       ind_tablespaces	name[][])
 RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_table_new'
 LANGUAGE C;
