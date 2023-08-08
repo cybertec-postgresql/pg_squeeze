@@ -255,9 +255,7 @@ worker_shmem_shutdown(int code, Datum arg)
 	}
 }
 
-extern Datum start_worker(PG_FUNCTION_ARGS);
 #if PG_VERSION_NUM >= 150000
-extern Datum stop_worker(PG_FUNCTION_ARGS);
 extern Datum create_squeeze_worker_task(PG_FUNCTION_ARGS);
 #endif
 
