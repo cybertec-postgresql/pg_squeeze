@@ -253,10 +253,10 @@ squeeze.worker_autostart = 'my_database your_database'
 squeeze.worker_role = postgres
 ```
 
-Next time you start the cluster, one worker will be launched for `my_database`
-and one for `your_database`. If you take this approach, note that any worker
-will either reject to start or will stop without doing any work if either is
-true:
+Next time you start the cluster, two or more workers will be launched for
+`my_database` and the same for `your_database`. If you take this approach,
+note that any worker will either reject to start or will stop without doing
+any work if either is true:
 
 1. The `pg_squeeze` extension does not exist in the database.
 2. `squeeze.worker_role` parameter specifies role which does not have the
@@ -292,13 +292,13 @@ when the write activity is lower.
 # Running multiple workers per database
 
 If you think that a single squeeze worker does not cope with the load,
-consider setting the `squeeze.workers_per_database` to value higher than
-1. Then the `pg_squeeze` extension will be able to process multiple tables at
-a time - one table per squeeze worker. However, be aware that this setting
-affects all databases in which you actively use the `pg_squeeze`
-extension. The total number of all the squeeze workers in the cluster
-(including the "scheduler workers") cannot exceed the in-core configuration
-variable `max_worker_processes`.
+consider setting the `squeeze.workers_per_database` configuration variable to
+value higher than 1. Then the `pg_squeeze` extension will be able to process
+multiple tables at a time - one table per squeeze worker. However, be aware
+that this setting affects all databases in which you actively use the
+`pg_squeeze` extension. The total number of all the squeeze workers in the
+cluster (including the "scheduler workers") cannot exceed the in-core
+configuration variable `max_worker_processes`.
 
 # Monitoring
 
