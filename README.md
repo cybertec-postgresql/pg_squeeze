@@ -204,17 +204,12 @@ SELECT squeeze.squeeze_table('public', 'pgbench_accounts', null, null, null);
 
 Please note that:
 
-1. The function is there primarily for testing and troubleshooting. In a
-   typical setup the processing should be done by background workers.
-
-2. The function does not throw errors. It just inserts a record either into
+1. The function does not throw errors. It just inserts a record either into
    `squeeze.log` or `squeeze.errors`, depending on whether it succeeded or
    failed.
 
 3. The function hangs if no squeeze worker is running on the current database
-   or if the squeeze worker processes are just working on other tables.
-
-4. Concurrent calls (for different tables) are currently not supported.
+   or if no worker is available for the table being passed to the function.
 
 
 # Enable / disable table processing

@@ -4,6 +4,12 @@ DROP FUNCTION process_next_task();
 
 DROP FUNCTION squeeze_table(name, name, name, name, name[][]);
 
+DROP FUNCTION start_worker();
+CREATE FUNCTION start_worker()
+RETURNS void
+AS 'MODULE_PATHNAME', 'squeeze_start_worker'
+LANGUAGE C;
+
 DROP FUNCTION stop_worker();
 CREATE FUNCTION stop_worker()
 RETURNS void

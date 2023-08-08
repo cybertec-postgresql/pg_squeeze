@@ -74,8 +74,7 @@ typedef struct WorkerSlot
 } WorkerSlot;
 
 /*
- * Primarily for testing purposes, a single task can be assigned to the worker
- * via shared memory.
+ * This structure represents a task assigned to the worker via shared memory.
  */
 typedef struct WorkerTask
 {
@@ -113,9 +112,19 @@ typedef struct WorkerTask
 	ConditionVariable	cv;
 } WorkerTask;
 
+/*
+ * The maximum number of tasks submitted by the squeeze_table() user function
+ * that can be in progress at a time (as long as there's enough workers). Note
+ * that this is cluster-wide constant.
+ */
+#define	NUM_WORKER_TASKS	8
+
 typedef struct WorkerData
 {
-	WorkerTask	task;
+	WorkerTask	tasks[NUM_WORKER_TASKS];
+
+	/* The next task for a backend to use is (next_task % NUM_WORKER_TASKS) */
+	pg_atomic_uint32	next_task;
 
 	/*
 	 * A lock to synchronize access to slots. Lock in exclusive mode to add /
@@ -174,7 +183,7 @@ squeeze_worker_shmem_request(void)
 #endif	/* PG_VERSION_NUM >= 150000 */
 
 	RequestAddinShmemSpace(worker_shmem_size());
-	RequestNamedLWLockTranche("pg_squeeze", 2);
+	RequestNamedLWLockTranche("pg_squeeze", NUM_WORKER_TASKS + 1);
 }
 
 void
@@ -194,17 +203,22 @@ squeeze_worker_shmem_startup(void)
 	{
 		int		i;
 		LWLockPadded	*locks;
-		WorkerTask	*task;
 
 		locks = GetNamedLWLockTranche("pg_squeeze");
 
-		task = &workerData->task;
-		task->id = 0;
-		task->dbid = InvalidOid;
-		task->in_progress = false;
-		task->lock = &locks->lock;
-		locks++;
-		ConditionVariableInit(&task->cv);
+		for (i = 0; i < NUM_WORKER_TASKS; i++)
+		{
+			WorkerTask	*task;
+
+			task = &workerData->tasks[i];
+			task->id = 0;
+			task->dbid = InvalidOid;
+			task->in_progress = false;
+			task->lock = &locks->lock;
+			locks++;
+			ConditionVariableInit(&task->cv);
+		}
+		pg_atomic_init_u32(&workerData->next_task, 0);
 
 		workerData->lock = &locks->lock;
 		workerData->nslots = max_squeeze_workers();
@@ -221,7 +235,6 @@ squeeze_worker_shmem_startup(void)
 	}
 
 	LWLockRelease(AddinShmemInitLock);
-
 }
 
 /* Mark this worker's slot unused. */
@@ -244,15 +257,7 @@ worker_shmem_shutdown(int code, Datum arg)
 	}
 
 	if (MyWorkerTask)
-	{
-		LWLockAcquire(MyWorkerTask->lock, LW_EXCLUSIVE);
-		MyWorkerTask->dbid = InvalidOid;
-		MyWorkerTask->in_progress = false;
-		MyWorkerTask->id++;
-		LWLockRelease(MyWorkerTask->lock);
-
-		MyWorkerTask = NULL;
-	}
+		release_task();
 }
 
 #if PG_VERSION_NUM >= 150000
@@ -267,6 +272,7 @@ static void worker_sigterm(SIGNAL_ARGS);
 static void scheduler_worker_loop(void);
 static void squeeze_worker_loop(void);
 static void process_tasks(MemoryContext task_cxt);
+static void release_task(void);
 
 static void run_command(char *command, int rc);
 
@@ -310,8 +316,9 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 		WorkerSlot	*slot = &workerData->slots[i];
 
 		/*
-		 * There should be two workers per database: one scheduler and one
-		 * worker.
+		 * There should be at least two workers per database: one scheduler
+		 * and one or more workers. Therefore we need to check all the slots
+		 * even if a match is found.
 		 */
 		if (slot->dbid == MyDatabaseId)
 			kill(slot->pid, SIGTERM);
@@ -334,8 +341,9 @@ wake_up_squeeze_workers(void)
 		WorkerSlot	*slot = &workerData->slots[i];
 
 		/*
-		 * There should be two workers per database: one scheduler and one
-		 * worker.
+		 * There should be at least two workers per database: one scheduler
+		 * and one or more workers. Therefore we need to check all the slots
+		 * even if a match is found.
 		 */
 		if (slot->dbid == MyDatabaseId && !slot->scheduler)
 		{
@@ -383,7 +391,8 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	Name	indname = NULL;
 	Name	tbspname = NULL;
 	ArrayType	*ind_tbsps = NULL;
-	WorkerTask	*task = &workerData->task;
+	WorkerTask	*task;
+	uint32	next_task_idx;
 	int		task_id;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
@@ -404,6 +413,10 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errmsg("the value of \"ind_tablespaces\" is too big")));
 	}
+
+	/* Pick the task. */
+	next_task_idx = pg_atomic_fetch_add_u32(&workerData->next_task, 1);
+	task = &workerData->tasks[next_task_idx % NUM_WORKER_TASKS];
 
 	/*
 	 * Wait until there's no pending task.
@@ -888,6 +901,8 @@ process_tasks(MemoryContext task_cxt)
 	TaskDetails	*tasks = NULL;
 	uint64		ntasks;
 	int		i;
+	static int	next_task = 0;
+	WorkerTask	*task;
 
 	initStringInfo(&query);
 
@@ -899,60 +914,77 @@ process_tasks(MemoryContext task_cxt)
 	{
 		for (i = 0; i < ntasks; i++)
 		{
-			TaskDetails	*task = &tasks[i];
+			TaskDetails	*this = &tasks[i];
 
-			if (task->ind_tbsps)
-				pfree(task->ind_tbsps);
+			if (this->ind_tbsps)
+				pfree(this->ind_tbsps);
 		}
 		pfree(tasks);
-		tasks = NULL;
 	}
+	tasks = NULL;
 	ntasks = 0;
 	resetStringInfo(&query);
 
+	Assert(MyWorkerTask == NULL);
+
 	/* First, check for a task in the shared memory. */
-	LWLockAcquire(workerData->task.lock, LW_SHARED);
-	if (workerData->task.dbid == MyDatabaseId &&
-		!workerData->task.in_progress)
+	for (i = 0; i < NUM_WORKER_TASKS; i++)
 	{
-		uint32	arr_size;
-
-		Assert(MyWorkerTask == NULL);
-		MyWorkerTask = &workerData->task;
-
-		relschema = &MyWorkerTask->relschema;
-		relname = &MyWorkerTask->relname;
-		if (strlen(NameStr(MyWorkerTask->indname)) > 0)
-			cl_index = &MyWorkerTask->indname;
-		if (strlen(NameStr(MyWorkerTask->tbspname)) > 0)
-			rel_tbsp = &MyWorkerTask->tbspname;
-
-		/* Create a single-element array of tasks for further processing. */
-		ntasks = 1;
-		oldcxt = CurrentMemoryContext;
-		MemoryContextSwitchTo(task_cxt);
-		tasks = (TaskDetails *) palloc(sizeof(TaskDetails));
-
 		/*
-		 * Now that we're in the suitable memory context, we can copy the
-		 * tablespace mapping array, if one is passed.
+		 * Start where we've ended last time. If we always started at 0, the
+		 * tasks at lower positions would have higher chance to get a worker
+		 * assigned than those at higher positions.
 		 */
-		arr_size = VARSIZE(MyWorkerTask->ind_tbsps);
-		if (arr_size > 0)
+		next_task++;
+		next_task %= NUM_WORKER_TASKS;
+		task = &workerData->tasks[next_task];
+
+		LWLockAcquire(task->lock, LW_SHARED);
+		if (task->dbid == MyDatabaseId && !task->in_progress)
 		{
-			Assert(arr_size <= IND_TABLESPACES_ARRAY_SIZE);
-			ind_tbsps = palloc(arr_size);
-			memcpy(ind_tbsps, MyWorkerTask->ind_tbsps, arr_size);
+			uint32	arr_size;
+
+			relschema = &task->relschema;
+			relname = &task->relname;
+			if (strlen(NameStr(task->indname)) > 0)
+				cl_index = &task->indname;
+			if (strlen(NameStr(task->tbspname)) > 0)
+				rel_tbsp = &task->tbspname;
+
+			/*
+			 * Create a single-element array of tasks for further processing.
+			 */
+			ntasks = 1;
+			oldcxt = CurrentMemoryContext;
+			MemoryContextSwitchTo(task_cxt);
+			tasks = (TaskDetails *) palloc(sizeof(TaskDetails));
+
+			/*
+			 * Now that we're in the suitable memory context, we can copy the
+			 * tablespace mapping array, if one is passed.
+			 */
+			arr_size = VARSIZE(task->ind_tbsps);
+			if (arr_size > 0)
+			{
+				Assert(arr_size <= IND_TABLESPACES_ARRAY_SIZE);
+				ind_tbsps = palloc(arr_size);
+				memcpy(ind_tbsps, task->ind_tbsps, arr_size);
+			}
+
+			init_task_details(tasks, 0, relschema, relname, cl_index, rel_tbsp,
+							  ind_tbsps, false, false);
+			MemoryContextSwitchTo(oldcxt);
+
+			/* No other worker should pick this task. */
+			task->in_progress = true;
+
+			MyWorkerTask = task;
 		}
+		LWLockRelease(task->lock);
 
-		init_task_details(tasks, 0, relschema, relname, cl_index, rel_tbsp,
-						  ind_tbsps, false, false);
-		MemoryContextSwitchTo(oldcxt);
-
-		/* No other worker should pick this task. */
-		MyWorkerTask->in_progress = true;
+		if (MyWorkerTask)
+			break;
 	}
-	LWLockRelease(workerData->task.lock);
 
 	if (MyWorkerTask == NULL)
 	{
@@ -1135,6 +1167,14 @@ LIMIT %d", TASK_BATCH_SIZE);
 					(errmsg("task for table %s.%s is being processed by another worker",
 							NameStr(td->relschema), NameStr(td->relname))));
 			LWLockRelease(workerData->lock);
+
+			if (MyWorkerTask)
+			{
+				Assert(ntasks == 1);
+
+				release_task();
+			}
+
 			continue;
 		}
 		/* Declare that this worker takes care of the relation. */
@@ -1284,19 +1324,7 @@ VALUES ('%s', '%s', '%s', clock_timestamp())",
 		}
 
 		if (MyWorkerTask)
-		{
-			/* Make room for the next task. */
-			LWLockAcquire(MyWorkerTask->lock, LW_EXCLUSIVE);
-			MyWorkerTask->dbid = InvalidOid;
-			MyWorkerTask->in_progress = false;
-			MyWorkerTask->id++;
-			LWLockRelease(MyWorkerTask->lock);
-
-			/* Notify the next backend that is trying to create a new task. */
-			ConditionVariableSignal(&MyWorkerTask->cv);
-
-			MyWorkerTask = NULL;
-		}
+			release_task();
 
 		/* Clear the relid field of this worker's slot. */
 		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
@@ -1306,6 +1334,22 @@ VALUES ('%s', '%s', '%s', clock_timestamp())",
 		/* See above */
 		goto restart;
 	}
+}
+
+static void
+release_task(void)
+{
+	/* Make room for the next task. */
+	LWLockAcquire(MyWorkerTask->lock, LW_EXCLUSIVE);
+	MyWorkerTask->dbid = InvalidOid;
+	MyWorkerTask->in_progress = false;
+	MyWorkerTask->id++;
+	LWLockRelease(MyWorkerTask->lock);
+
+	/* Notify the next backend that is trying to create a new task. */
+	ConditionVariableSignal(&MyWorkerTask->cv);
+
+	MyWorkerTask = NULL;
 }
 
 /*
