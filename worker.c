@@ -1465,6 +1465,8 @@ init_task_details(TaskDetails *task, int32 task_id, Name relschema,
 	task->skip_analyze = skip_analyze;
 }
 
+#define	ACTIVE_WORKERS_RES_ATTRS	7
+
 /* Get information on squeeze workers on the current database. */
 PG_FUNCTION_INFO_V1(squeeze_get_active_workers);
 Datum
@@ -1472,9 +1474,15 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 {
 	WorkerSlot	*slots, *dst;
 	int		i, nslots = 0;
+#if PG_VERSION_NUM >= 150000
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	InitMaterializedSRF(fcinfo, 0);
+#else
+	FuncCallContext		*funcctx;
+	int					 call_cntr, max_calls;
+	HeapTuple		*tuples;
+#endif
 
 	/*
 	 * Copy the slots information so that we don't have to keep the slot array
@@ -1498,18 +1506,18 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 	}
 	LWLockRelease(workerData->lock);
 
+#if PG_VERSION_NUM >= 150000
 	for (i = 0; i < nslots; i++)
 	{
 		WorkerSlot	*slot = &slots[i];
 		WorkerProgress	*progress = &slot->progress;
-#define	RES_ATTRS	7
-		Datum	values[RES_ATTRS];
-		bool	isnull[RES_ATTRS];
+		Datum	values[ACTIVE_WORKERS_RES_ATTRS];
+		bool	isnull[ACTIVE_WORKERS_RES_ATTRS];
 		char	*relnspc = NULL;
 		char	*relname = NULL;
 		NameData	tabname, tabschema;
 
-		memset(isnull, false, RES_ATTRS * sizeof(bool));
+		memset(isnull, false, ACTIVE_WORKERS_RES_ATTRS * sizeof(bool));
 		values[0] = Int32GetDatum(slot->pid);
 
 		if (OidIsValid(slot->relid))
@@ -1520,7 +1528,7 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 			 * It's possible that processing of the relation has finished and
 			 * the relation (or even the namespace) was dropped. Therefore,
 			 * stop catalog lookups as soon as any object is missing. XXX
-			 * Furthermore, the relid can already be in used by another
+			 * Furthermore, the relid can already be in use by another
 			 * relation, but that's very unlikely, not worth special effort.
 			 */
 			nspid = get_rel_namespace(slot->relid);
@@ -1545,4 +1553,87 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 	}
 
 	return (Datum) 0;
+#else
+	/* Less trivial implementation, to be removed when PG 14 is EOL. */
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext	oldcontext;
+		TupleDesc			 tupdesc;
+		int		ntuples = 0;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+		/* XXX Is this necessary? */
+		funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+		/* Process only the slots that we really can display. */
+		tuples = (HeapTuple *) palloc0(nslots * sizeof(HeapTuple));
+		for (i = 0; i < nslots; i++)
+		{
+			WorkerSlot	*slot = &slots[i];
+			WorkerProgress	*progress = &slot->progress;
+			char	*relnspc = NULL;
+			char	*relname = NULL;
+			NameData	tabname, tabschema;
+			Datum	*values;
+			bool	*isnull;
+
+			values = (Datum *) palloc(ACTIVE_WORKERS_RES_ATTRS * sizeof(Datum));
+			isnull = (bool *) palloc0(ACTIVE_WORKERS_RES_ATTRS * sizeof(bool));
+
+			if (OidIsValid(slot->relid))
+			{
+				Oid		nspid;
+
+				/* See the PG 15 implementation above. */
+				nspid = get_rel_namespace(slot->relid);
+				if (OidIsValid(nspid))
+					relnspc = get_namespace_name(nspid);
+				if (relnspc)
+					relname = get_rel_name(slot->relid);
+			}
+			if (relnspc == NULL || relname == NULL)
+				continue;
+
+			values[0] = Int32GetDatum(slot->pid);
+			namestrcpy(&tabschema, relnspc);
+			values[1] = NameGetDatum(&tabschema);
+			namestrcpy(&tabname, relname);
+			values[2] = NameGetDatum(&tabname);
+			values[3] = Int64GetDatum(progress->ins_initial);
+			values[4] = Int64GetDatum(progress->ins);
+			values[5] = Int64GetDatum(progress->upd);
+			values[6] = Int64GetDatum(progress->del);
+
+			tuples[ntuples++] = heap_form_tuple(tupdesc, values, isnull);
+		}
+		funcctx->user_fctx = tuples;
+		funcctx->max_calls = ntuples;;
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+
+	call_cntr = funcctx->call_cntr;
+	max_calls = funcctx->max_calls;
+	tuples = (HeapTuple *) funcctx->user_fctx;
+
+	if (call_cntr < max_calls)
+	{
+		HeapTuple	 tuple = tuples[call_cntr];
+		Datum		 result;
+
+		result = HeapTupleGetDatum(tuple);
+		SRF_RETURN_NEXT(funcctx, result);
+	}
+	else
+		SRF_RETURN_DONE(funcctx);
+#endif
 }
