@@ -30,6 +30,9 @@
 #include "utils/memutils.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#if PG_VERSION_NUM < 120000
+#include "utils/rel.h"
+#endif
 #include "utils/snapmgr.h"
 
 #include "pg_squeeze.h"
