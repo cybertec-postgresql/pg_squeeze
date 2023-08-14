@@ -1,5 +1,8 @@
 /* pg_squeeze--1.5--1.6.sql */
 
+-- complain if script is sourced in psql, rather than via ALTER EXTENSION
+\echo Use "ALTER EXTENSION pg_squeeze UPDATE TO '1.6'" to load this file. \quit
+
 DROP FUNCTION process_next_task();
 
 DROP FUNCTION squeeze_table(name, name, name, name, name[][]);
