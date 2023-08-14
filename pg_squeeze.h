@@ -290,3 +290,5 @@ extern PGDLLEXPORT void squeeze_worker_main(Datum main_arg);
 extern bool squeeze_table_impl(Name relschema, Name relname, Name indname,
 							   Name tbspname, ArrayType	*ind_tbsp,
 							   ErrorData **edata_p, MemoryContext edata_cxt);
+extern void squeeze_handle_error_db(ErrorData **edata_p,
+									MemoryContext edata_cxt);

@@ -330,52 +330,11 @@ _PG_init(void)
 #define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u"
 
 /*
- * SQL interface to squeeze one table interactively.
- *
- * This function should only be used by pg_squeeze versions <= 1.5.
- *
- * XXX Should we really care about installations where the binary was upgraded
- * but the "ALTER EXTENSION pg_squeeze UPDATE" command wasn't run?
- */
-extern Datum squeeze_table(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(squeeze_table);
-Datum
-squeeze_table(PG_FUNCTION_ARGS)
-{
-	Name	relschema, relname;
-	Name	indname = NULL;
-	Name	tbspname = NULL;
-	ArrayType	*ind_tbsp = NULL;
-
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 (errmsg("Both schema and table name must be specified"))));
-
-	relschema = PG_GETARG_NAME(0);
-	relname = PG_GETARG_NAME(1);
-
-	if (!PG_ARGISNULL(2))
-		indname = PG_GETARG_NAME(2);
-
-	if (!PG_ARGISNULL(3))
-		tbspname = PG_GETARG_NAME(3);
-
-	if (!PG_ARGISNULL(4))
-		ind_tbsp = PG_GETARG_ARRAYTYPE_P(4);
-
-	squeeze_table_impl(relschema, relname, indname, tbspname, ind_tbsp, NULL,
-					   NULL);
-
-	PG_RETURN_VOID();
-}
-
-/*
  * Introduced in pg_squeeze 1.6, to be called directly as opposed to calling
  * via the postgres executor.
  *
- * Return true if succeeded. If failed, either copy useful information into
- * *edata_p and return false, or (if edata_p==NULL), raise ERROR.
+ * Return true if succeeded. If failed, copy useful information into *edata_p
+ * and return false.
  */
 bool
 squeeze_table_impl(Name relschema, Name relname, Name indname,
@@ -392,52 +351,8 @@ squeeze_table_impl(Name relschema, Name relname, Name indname,
 	}
 	PG_CATCH();
 	{
-		HOLD_INTERRUPTS();
-
+		squeeze_handle_error_db(edata_p, edata_cxt);
 		result = false;
-
-		/*
-		 * There seems to be no automatic cleanup of the origin, so do it
-		 * here. The insertion into the ReplicationOriginRelationId catalog
-		 * will be rolled back due to the transaction abort - either here or,
-		 * in the PG_RE_THROW() case, higher in the stack.
-		 */
-		if (replorigin_session_origin != InvalidRepOriginId)
-			replorigin_session_origin = InvalidRepOriginId;
-
-		if (edata_p)
-		{
-			MemoryContext old_context = CurrentMemoryContext;
-
-			/* Save error info in caller's context */
-			MemoryContextSwitchTo(edata_cxt);
-			*edata_p = CopyErrorData();
-			MemoryContextSwitchTo(old_context);
-
-			FlushErrorState();
-
-			/*
-			 * Abort the transaction as we do not call PG_RETHROW() below in
-			 * this case.
-			 */
-			AbortOutOfAnyTransaction();
-		}
-
-		/*
-		 * Special effort is needed to release the replication slot because,
-		 * unlike other resources, AbortTransaction() does not release
-		 * it. While the transaction is aborted if an ERROR is caught in the
-		 * main loop of postgres.c, it would not do if the ERROR was trapped
-		 * at lower level in the stack (typically, in order to log the error
-		 * and process the next table).
-		 */
-		if (MyReplicationSlot != NULL)
-			ReplicationSlotRelease();
-
-		RESUME_INTERRUPTS();
-
-		if (edata_p == NULL)
-			PG_RE_THROW();
 	}
 	PG_END_TRY();
 
@@ -3609,3 +3524,48 @@ get_heap_freespace(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
+/*
+ * Handle an error from the perspective of postgres
+ */
+void
+squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
+{
+	MemoryContext old_context = CurrentMemoryContext;
+
+	HOLD_INTERRUPTS();
+
+	/*
+	 * There seems to be no automatic cleanup of the origin, so do it
+	 * here. The insertion into the ReplicationOriginRelationId catalog will
+	 * be rolled back due to the transaction abort - either here or, in the
+	 * PG_RE_THROW() case, higher in the stack.
+	 */
+	if (replorigin_session_origin != InvalidRepOriginId)
+		replorigin_session_origin = InvalidRepOriginId;
+
+	/* Save error info in caller's context */
+	MemoryContextSwitchTo(edata_cxt);
+	*edata_p = CopyErrorData();
+	MemoryContextSwitchTo(old_context);
+
+	FlushErrorState();
+
+	/*
+	 * Abort the transaction as we do not call PG_RETHROW() below in this
+	 * case.
+	 */
+	AbortOutOfAnyTransaction();
+
+	/*
+	 * Special effort is needed to release the replication slot because,
+	 * unlike other resources, AbortTransaction() does not release it. While
+	 * the transaction is aborted if an ERROR is caught in the main loop of
+	 * postgres.c, it would not do if the ERROR was trapped at lower level in
+	 * the stack (typically, in order to log the error and process the next
+	 * table).
+	 */
+	if (MyReplicationSlot != NULL)
+		ReplicationSlotRelease();
+
+	RESUME_INTERRUPTS();
+}

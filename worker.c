@@ -168,6 +168,7 @@ static void init_task_details(TaskDetails *task, int32 task_id,
 							  Name relschema, Name relname, Name cl_index,
 							  Name rel_tbsp, ArrayType *ind_tbsps,
 							  bool last_try, bool skip_analyze);
+static void squeeze_handle_error_app(ErrorData *edata, TaskDetails *td);
 static void release_task(void);
 
 static Size
@@ -911,7 +912,6 @@ process_tasks(MemoryContext task_cxt)
 	Name	relschema, relname;
 	Name	cl_index, rel_tbsp;
 	ArrayType	*ind_tbsps;
-	ErrorData	*edata;
 	MemoryContext	oldcxt;
 	TaskDetails	*tasks = NULL;
 	uint64		ntasks;
@@ -1143,6 +1143,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 		Name	rel_tbsp = NULL;
 		int		j;
 		bool	found;
+		ErrorData	*edata;
 
 		ereport(DEBUG1,
 				(errmsg("task for table %s.%s is ready for processing",
@@ -1151,16 +1152,34 @@ LIMIT %d", TASK_BATCH_SIZE);
 		/* Check if another worker is already processing this table. */
 		StartTransactionCommand();
 		relrv = makeRangeVar(NameStr(td->relschema), NameStr(td->relname), -1);
+		success = true;
+		PG_TRY();
+		{
 #if PG_VERSION_NUM >= 120000
-		rel = table_openrv(relrv, AccessShareLock);
-		relid = RelationGetRelid(rel);
-		table_close(rel, AccessShareLock);
+			rel = table_openrv(relrv, AccessShareLock);
+			relid = RelationGetRelid(rel);
+			table_close(rel, AccessShareLock);
 #else
-		rel = heap_openrv(relrv, AccessShareLock);
-		relid = RelationGetRelid(rel);
-		heap_close(rel, AccessShareLock);
+			rel = heap_openrv(relrv, AccessShareLock);
+			relid = RelationGetRelid(rel);
+			heap_close(rel, AccessShareLock);
 #endif
-		CommitTransactionCommand();
+			CommitTransactionCommand();
+		}
+		PG_CATCH();
+		{
+			squeeze_handle_error_db(&edata, task_cxt);
+			squeeze_handle_error_app(edata, td);
+			success = false;
+		}
+		PG_END_TRY();
+
+		if (!success)
+		{
+			if (MyWorkerTask)
+				release_task();
+			continue;
+		}
 
 		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 		found = false;
@@ -1225,57 +1244,17 @@ LIMIT %d", TASK_BATCH_SIZE);
 		{
 			/*
 			 * The transaction should be aborted by squeeze_table_impl().
-			 *
-			 * Here we are especially interested in errors like incorrect user
-			 * input (e.g. non-existing table specified) or expiration of the
-			 * squeeze_max_xlock_time parameter. If the squeezing succeeded,
-			 * the following operations should succeed too, unless there's a
-			 * bug in the extension - in such a case it's o.k. to let the
-			 * ERROR stop the worker.
 			 */
-			resetStringInfo(&query);
-			appendStringInfo(&query,
-"INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
-VALUES ('%s', '%s', '%s', '%s', '%s')",
-							 NameStr(td->relschema),
-							 NameStr(td->relname),
-							 unpack_sql_state(edata->sqlerrcode),
-							 edata->message,
-							 edata->detail ? edata->detail : "");
-			run_command(query.data, SPI_OK_INSERT);
+			squeeze_handle_error_app(edata, td);
 
 			if (MyWorkerTask == NULL)
 			{
-				/* If the active task failed too many times, cancel it. */
-				resetStringInfo(&query);
-				if (td->last_try)
-				{
-					appendStringInfo(&query,
-									 "SELECT squeeze.cancel_task(%d)",
-									 td->id);
-					run_command(query.data, SPI_OK_SELECT);
-				}
-				else
-				{
-					/* Account for the current attempt. */
-					appendStringInfo(&query,
-									 "UPDATE squeeze.tasks SET tried = tried + 1 WHERE id = %d",
-									 td->id);
-					run_command(query.data, SPI_OK_UPDATE);
-				}
-
-				/* Clear the relid field of this worker's slot. */
-				LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
-				MyWorkerSlot->relid = InvalidOid;
-				reset_progress(&MyWorkerSlot->progress);
-				LWLockRelease(workerData->lock);
-
 				/*
 				 * Some of the next tasks we have in the 'tasks' array could
 				 * have been already processed by other workers. Those should
 				 * have the state set to 'processed' (before the other slot
 				 * could set MyWorkerSlot->relid to InvalidOid), so we just
-				 * need to run the query above again.
+				 * need to run the query at the top of this function again.
 				 */
 				goto restart;
 			}
@@ -1359,6 +1338,59 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 
 		/* See above */
 		goto restart;
+	}
+}
+
+/*
+ * Handle an error from the perspective of pg_squeeze
+ *
+ * Here we are especially interested in errors like incorrect user input
+ * (e.g. non-existing table specified) or expiration of the
+ * squeeze_max_xlock_time parameter. If the squeezing succeeded, the following
+ * operations should succeed too, unless there's a bug in the extension - in
+ * such a case it's o.k. to let the ERROR stop the worker.
+ */
+static void
+squeeze_handle_error_app(ErrorData *edata, TaskDetails *td)
+{
+	StringInfoData	query;
+
+	initStringInfo(&query);
+	appendStringInfo(&query,
+"INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
+VALUES ('%s', '%s', '%s', '%s', '%s')",
+					 NameStr(td->relschema),
+					 NameStr(td->relname),
+					 unpack_sql_state(edata->sqlerrcode),
+					 edata->message,
+					 edata->detail ? edata->detail : "");
+	run_command(query.data, SPI_OK_INSERT);
+
+	if (MyWorkerTask == NULL)
+	{
+		/* If the active task failed too many times, cancel it. */
+		resetStringInfo(&query);
+		if (td->last_try)
+		{
+			appendStringInfo(&query,
+							 "SELECT squeeze.cancel_task(%d)",
+							 td->id);
+			run_command(query.data, SPI_OK_SELECT);
+		}
+		else
+		{
+			/* Account for the current attempt. */
+			appendStringInfo(&query,
+							 "UPDATE squeeze.tasks SET tried = tried + 1 WHERE id = %d",
+							 td->id);
+			run_command(query.data, SPI_OK_UPDATE);
+		}
+
+		/* Clear the relid field of this worker's slot. */
+		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+		MyWorkerSlot->relid = InvalidOid;
+		reset_progress(&MyWorkerSlot->progress);
+		LWLockRelease(workerData->lock);
 	}
 }
 
