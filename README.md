@@ -43,11 +43,6 @@ Restart the cluster, and invoke:
 CREATE EXTENSION pg_squeeze;
 ```
 
-*Note: If you want remove the extension from particular database, make sure the
-database has no "squeeze worker" (see [Enable / disable table
-processing](#enable--disable-table-processing) section) running. Otherwise the
-DROP EXTENSION command will hang until it's cancelled.*
-
 *Note: when upgrading a database cluster with pg_squeeze installed (either using
 `pg_dumpall`/restore or `pg_upgrade`), make sure that the new cluster has
 `pg_squeeze` in `shared_preload_libraries` *before* you upgrade, otherwise
@@ -251,9 +246,10 @@ squeeze.worker_role = postgres
 Next time you start the cluster, two or more workers will be launched for
 `my_database` and the same for `your_database`. If you take this approach,
 note that any worker will either reject to start or will stop without doing
-any work if either is true:
+any work if either:
 
-1. The `pg_squeeze` extension does not exist in the database.
+1. The `pg_squeeze` extension does not exist in the database, or
+
 2. `squeeze.worker_role` parameter specifies role which does not have the
    superuser privileges.
 

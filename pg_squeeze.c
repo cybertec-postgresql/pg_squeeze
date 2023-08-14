@@ -333,6 +333,9 @@ _PG_init(void)
  * SQL interface to squeeze one table interactively.
  *
  * This function should only be used by pg_squeeze versions <= 1.5.
+ *
+ * XXX Should we really care about installations where the binary was upgraded
+ * but the "ALTER EXTENSION pg_squeeze UPDATE" command wasn't run?
  */
 extern Datum squeeze_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table);
@@ -369,7 +372,7 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 /*
  * Introduced in pg_squeeze 1.6, to be called directly as opposed to calling
- * via FMGR.
+ * via the postgres executor.
  *
  * Return true if succeeded. If failed, either copy useful information into
  * *edata_p and return false, or (if edata_p==NULL), raise ERROR.

@@ -896,8 +896,9 @@ squeeze_worker_loop(void)
 /*
  * process_next_task() function used to be implemented in pl/pgsql. However,
  * since it calls the squeeze_table() function and since the commit 240e0dbacd
- * in PG core makes it impossible to call squeeze_table() via FMGR, this
- * function must be implemented in C and call squeeze_table() directly.
+ * in PG core makes it impossible to call squeeze_table() via the postgres
+ * executor, this function must be implemented in C and call squeeze_table()
+ * directly.
  *
  * The name was also changed so it reflects the fact that multiple tasks can
  * be processed by a single call.
