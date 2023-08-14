@@ -25,3 +25,20 @@ CREATE FUNCTION squeeze_table(
 RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_table_new'
 LANGUAGE C;
+
+CREATE FUNCTION get_active_workers()
+RETURNS TABLE (
+	pid		int4,
+	tabschema	name,
+	tabname		name,
+	ins_initial	bigint,
+	ins		bigint,
+	upd		bigint,
+	del		bigint)
+AS 'MODULE_PATHNAME', 'squeeze_get_active_workers'
+LANGUAGE C;
+
+ALTER TABLE log  ADD COLUMN ins_initial bigint;
+ALTER TABLE log  ADD COLUMN ins bigint;
+ALTER TABLE log  ADD COLUMN upd bigint;
+ALTER TABLE log  ADD COLUMN del bigint;

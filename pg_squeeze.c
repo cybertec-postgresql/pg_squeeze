@@ -2487,6 +2487,11 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			heap_insert(rel_dst, tup_out, GetCurrentCommandId(true), 0,
 						bistate);
 
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerProgress->mutex);
+			MyWorkerProgress->ins_initial += 1;
+			SpinLockRelease(&MyWorkerProgress->mutex);
+
 			if (!use_sort)
 				pfree(tup_out);
 		}

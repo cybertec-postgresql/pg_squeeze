@@ -10,6 +10,7 @@
 #include "c.h"
 #include "postgres.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "access/xact.h"
@@ -70,6 +71,7 @@ typedef struct WorkerSlot
 	int		pid;				/* the PID */
 	bool	scheduler;			/* true if scheduler, false if the "squeeze
 								 * worker" */
+	WorkerProgress	progress;	/* progress tracking information */
 	Latch	*latch;				/* use this to wake up the worker */
 } WorkerSlot;
 
@@ -144,6 +146,11 @@ static WorkerSlot *MyWorkerSlot = NULL;
 /* Local pointer to the task in the shared memory. */
 static WorkerTask *MyWorkerTask = NULL;
 
+/* Local pointer to the progress information. */
+WorkerProgress	*MyWorkerProgress = NULL;
+
+static void reset_progress(WorkerProgress *progress);
+
 /* Information retrieved from the "tasks" and "tables" functions. */
 typedef struct TaskDetails
 {
@@ -161,6 +168,7 @@ static void init_task_details(TaskDetails *task, int32 task_id,
 							  Name relschema, Name relname, Name cl_index,
 							  Name rel_tbsp, ArrayType *ind_tbsps,
 							  bool last_try, bool skip_analyze);
+static void release_task(void);
 
 static Size
 worker_shmem_size(void)
@@ -229,6 +237,8 @@ squeeze_worker_shmem_startup(void)
 
 			slot->dbid = InvalidOid;
 			slot->relid = InvalidOid;
+			SpinLockInit(&slot->progress.mutex);
+			reset_progress(&slot->progress);
 			slot->pid = InvalidPid;
 			slot->latch = NULL;
 		}
@@ -248,12 +258,14 @@ worker_shmem_shutdown(int code, Datum arg)
 		Assert(MyWorkerSlot->dbid != InvalidOid);
 		MyWorkerSlot->dbid = InvalidOid;
 		MyWorkerSlot->relid = InvalidOid;
+		reset_progress(&MyWorkerSlot->progress);
 		MyWorkerSlot->pid = InvalidPid;
 		MyWorkerSlot->latch = NULL;
 		LWLockRelease(workerData->lock);
 
 		/* This shouldn't be necessary, but ... */
 		MyWorkerSlot = NULL;
+		MyWorkerProgress = NULL;
 	}
 
 	if (MyWorkerTask)
@@ -272,7 +284,6 @@ static void worker_sigterm(SIGNAL_ARGS);
 static void scheduler_worker_loop(void);
 static void squeeze_worker_loop(void);
 static void process_tasks(MemoryContext task_cxt);
-static void release_task(void);
 
 static void run_command(char *command, int rc);
 
@@ -741,6 +752,9 @@ squeeze_worker_main(Datum main_arg)
 			slot->latch = MyLatch;
 
 			MyWorkerSlot = slot;
+			MyWorkerProgress = &slot->progress;
+			reset_progress(MyWorkerProgress);
+
 			found = true;
 			break;
 		}
@@ -1180,6 +1194,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 		/* Declare that this worker takes care of the relation. */
 		Assert(MyWorkerSlot->dbid == MyDatabaseId);
 		MyWorkerSlot->relid = relid;
+		reset_progress(&MyWorkerSlot->progress);
 		LWLockRelease(workerData->lock);
 		/*
 		 * In theory, the table can be dropped now, created again (with a
@@ -1251,6 +1266,7 @@ VALUES ('%s', '%s', '%s', '%s', '%s')",
 				/* Clear the relid field of this worker's slot. */
 				LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 				MyWorkerSlot->relid = InvalidOid;
+				reset_progress(&MyWorkerSlot->progress);
 				LWLockRelease(workerData->lock);
 
 				/*
@@ -1284,11 +1300,19 @@ VALUES ('%s', '%s', '%s', '%s', '%s')",
 
 			resetStringInfo(&query);
 			appendStringInfo(&query,
-							 "INSERT INTO squeeze.log(tabschema, tabname, started, finished) \
-VALUES ('%s', '%s', '%s', clock_timestamp())",
+"INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
+VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 							 NameStr(td->relschema),
 							 NameStr(td->relname),
-							 start_ts_str);
+							 start_ts_str,
+							 /*
+							  * No one should change the progress fields now,
+							  * so we can access them w/o the spinlock below.
+							  */
+							 MyWorkerProgress->ins_initial,
+							 MyWorkerProgress->ins,
+							 MyWorkerProgress->upd,
+							 MyWorkerProgress->del);
 			run_command(query.data, SPI_OK_INSERT);
 
 			if (MyWorkerTask == NULL)
@@ -1329,6 +1353,7 @@ VALUES ('%s', '%s', '%s', clock_timestamp())",
 		/* Clear the relid field of this worker's slot. */
 		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 		MyWorkerSlot->relid = InvalidOid;
+		reset_progress(&MyWorkerSlot->progress);
 		LWLockRelease(workerData->lock);
 
 		/* See above */
@@ -1350,6 +1375,17 @@ release_task(void)
 	ConditionVariableSignal(&MyWorkerTask->cv);
 
 	MyWorkerTask = NULL;
+}
+
+static void
+reset_progress(WorkerProgress *progress)
+{
+	SpinLockAcquire(&progress->mutex);
+	progress->ins_initial = 0;
+	progress->ins = 0;
+	progress->upd = 0;
+	progress->del = 0;
+	SpinLockRelease(&progress->mutex);
 }
 
 /*
@@ -1394,4 +1430,86 @@ init_task_details(TaskDetails *task, int32 task_id, Name relschema,
 	task->ind_tbsps = ind_tbsps;
 	task->last_try = last_try;
 	task->skip_analyze = skip_analyze;
+}
+
+/* Get information on squeeze workers on the current database. */
+PG_FUNCTION_INFO_V1(squeeze_get_active_workers);
+Datum
+squeeze_get_active_workers(PG_FUNCTION_ARGS)
+{
+	WorkerSlot	*slots, *dst;
+	int		i, nslots = 0;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/*
+	 * Copy the slots information so that we don't have to keep the slot array
+	 * locked for longer time than necessary.
+	 */
+	slots = (WorkerSlot *) palloc(workerData->nslots * sizeof(WorkerSlot));
+	dst = slots;
+	LWLockAcquire(workerData->lock, LW_SHARED);
+	for (i = 0; i < workerData->nslots; i++)
+	{
+		WorkerSlot	*slot = &workerData->slots[i];
+
+		if (!slot->scheduler &&
+			slot->pid != InvalidPid &&
+			slot->dbid == MyDatabaseId)
+		{
+			memcpy(dst, slot, sizeof(WorkerSlot));
+			dst++;
+			nslots++;
+		}
+	}
+	LWLockRelease(workerData->lock);
+
+	for (i = 0; i < nslots; i++)
+	{
+		WorkerSlot	*slot = &slots[i];
+		WorkerProgress	*progress = &slot->progress;
+#define	RES_ATTRS	7
+		Datum	values[RES_ATTRS];
+		bool	isnull[RES_ATTRS];
+		char	*relnspc = NULL;
+		char	*relname = NULL;
+		NameData	tabname, tabschema;
+
+		memset(isnull, false, RES_ATTRS * sizeof(bool));
+		values[0] = Int32GetDatum(slot->pid);
+
+		if (OidIsValid(slot->relid))
+		{
+			Oid		nspid;
+
+			/*
+			 * It's possible that processing of the relation has finished and
+			 * the relation (or even the namespace) was dropped. Therefore,
+			 * stop catalog lookups as soon as any object is missing. XXX
+			 * Furthermore, the relid can already be in used by another
+			 * relation, but that's very unlikely, not worth special effort.
+			 */
+			nspid = get_rel_namespace(slot->relid);
+			if (OidIsValid(nspid))
+				relnspc = get_namespace_name(nspid);
+			if (relnspc)
+				relname = get_rel_name(slot->relid);
+		}
+		if (relnspc == NULL || relname == NULL)
+			continue;
+
+		namestrcpy(&tabschema, relnspc);
+		values[1] = NameGetDatum(&tabschema);
+		namestrcpy(&tabname, relname);
+		values[2] = NameGetDatum(&tabname);
+		values[3] = Int64GetDatum(progress->ins_initial);
+		values[4] = Int64GetDatum(progress->ins);
+		values[5] = Int64GetDatum(progress->upd);
+		values[6] = Int64GetDatum(progress->del);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+	}
+
+	return (Datum) 0;
 }

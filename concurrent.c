@@ -195,7 +195,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	int2vector	*ident_indkey;
 	HeapTuple tup_old = NULL;
 	BulkInsertState bistate = NULL;
-	double	ninserts, nupdates, ndeletes;
 
 	if (dstate->nchanges == 0)
 		return;
@@ -223,9 +222,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	ninserts = 0;
-	nupdates = 0;
-	ndeletes = 0;
 	while (tuplestore_gettupleslot(dstate->tstore, true, false,
 								   dstate->tsslot))
 	{
@@ -320,7 +316,10 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			list_free(recheck);
 			pfree(tup);
 
-			ninserts++;
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerProgress->mutex);
+			MyWorkerProgress->ins += 1;
+			SpinLockRelease(&MyWorkerProgress->mutex);
 		}
 		else if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
 				 change->kind == PG_SQUEEZE_CHANGE_DELETE)
@@ -440,12 +439,19 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 					list_free(recheck);
 				}
 
-				nupdates++;
+				/* Update the progress information. */
+				SpinLockAcquire(&MyWorkerProgress->mutex);
+				MyWorkerProgress->upd += 1;
+				SpinLockRelease(&MyWorkerProgress->mutex);
 			}
 			else
 			{
 				simple_heap_delete(relation, &ctid);
-				ndeletes++;
+
+				/* Update the progress information. */
+				SpinLockAcquire(&MyWorkerProgress->mutex);
+				MyWorkerProgress->del += 1;
+				SpinLockRelease(&MyWorkerProgress->mutex);
 			}
 
 			if (tup_old != NULL)
@@ -472,10 +478,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		pfree(tup_change);
 #endif
 	}
-
-	elog(DEBUG1,
-		 "pg_squeeze: concurrent changes applied: %.0f inserts, %.0f updates, %.0f deletes.",
-		 ninserts, nupdates, ndeletes);
 
 	tuplestore_clear(dstate->tstore);
 	dstate->nchanges = 0;

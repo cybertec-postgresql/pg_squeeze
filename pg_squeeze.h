@@ -255,6 +255,25 @@ typedef struct WorkerConInteractive
 	bool	scheduler;
 } WorkerConInteractive;
 
+/* Progress tracking. */
+typedef struct WorkerProgress
+{
+	slock_t	mutex;
+
+	/* Tuples inserted during the initial load. */
+	int64	ins_initial;
+
+	/*
+	 * Tuples inserted, updated and deleted after the initial load
+	 * (i.e. during the catch-up phase).
+	 */
+	int64	ins;
+	int64	upd;
+	int64	del;
+} WorkerProgress;
+
+extern WorkerProgress	*MyWorkerProgress;
+
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
 											   char *rolename,
 											   bool scheduler);

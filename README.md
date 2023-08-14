@@ -299,9 +299,27 @@ configuration variable `max_worker_processes`.
 
 * `squeeze.log` table contains one entry per successfully squeezed table.
 
+  The columns `tabschema` and `tabname` identify the processed table. The
+  columns `started` and `finished` tell when the processing started and
+  finished. `ins_initial` is the number of tuples inserted into the new table
+  storage during the "initial load stage", i.e. the number of tuples present
+  in the table when the processing started. `ins`, `upd` and `del` are the
+  numbers of tuples inserted, updated and deleted by applications after the
+  initial load. (These "concurrent data changes" must also be incorporated
+  into the squeezed table, otherwise they'd get lost.)
+
 * `squeeze.errors` table contains errors that happened during squeezing. An
   usual problem reported here is that someone changed definition (e.g. added or
   removed column) of the table whose processing was just in progress.
+
+* `squeeze.get_active_workers()` function returns a table of squeeze workers
+  which are just processing tables in the current database.
+
+  The `pid` column contains the system PID of the worker process. The other
+  columns have the same meaning as their counterparts in the `squeeze.log`
+  table. While the `squeeze.log` table only shows information on the completed
+  squeeze operations, the `squeeze.get_active_workers()` function lets you
+  check the progress during the processing.
 
 # Unregister table
 
