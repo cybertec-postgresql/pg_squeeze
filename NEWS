@@ -1,3 +1,29 @@
+Release 1.6.0
+=============
+
+New features
+------------
+
+1. Allow processing of multiple tables at a time, even if the are in the same
+   database.
+
+2. Enhanced monitoring - see the squeeze.get_active_workers() function as well
+   as the new columns of the squeeze.log table.
+
+Bug fixes
+---------
+
+1. Fixed the mechanism that checks the number of workers per database. This
+   also fixes the stop_worker() function so that it does not miss workers
+   anymore.
+
+Note
+----
+
+The behavior of the squeeze_table() function changes in this version, see
+README for more information.
+
+
 Release 1.5.0
 =============
 
