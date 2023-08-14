@@ -209,7 +209,7 @@ Please note that:
 
 # Enable / disable table processing
 
-To enable automated processing, run this statement as superuser:
+To enable processing of bloated tables, run this statement as superuser:
 
 ```
 SELECT squeeze.start_worker();
@@ -217,7 +217,7 @@ SELECT squeeze.start_worker();
 
 The function starts a background worker (`scheduler worker`) that periodically
 checks which of the registered tables should be checked according to its
-schedule, and creates a new task for them. Another worker (`squeeze worker`) is
+schedule, and creates new tasks for them. Another worker (`squeeze worker`) is
 also launched that processes those tasks - note that the processing includes
 check whether the table is bloated enough.
 
@@ -231,9 +231,9 @@ stop them:
 SELECT squeeze.stop_worker();
 ```
 
-**Only the functions mentioned in this section are considered user interface.
-If you want to call any other one, make sure you perfectly understand what
-you're doing.**
+**Only the functions mentioned in this documentation are considered user
+interface.  If you want to call any other one, make sure you perfectly
+understand what you're doing.**
 
 If you want the background workers to start automatically during startup of the
 whole PostgreSQL cluster, add entries like this to `postgresql.conf` file:
@@ -243,10 +243,11 @@ squeeze.worker_autostart = 'my_database your_database'
 squeeze.worker_role = postgres
 ```
 
-Next time you start the cluster, two or more workers will be launched for
-`my_database` and the same for `your_database`. If you take this approach,
-note that any worker will either reject to start or will stop without doing
-any work if either:
+Next time you start the cluster, two or more workers (i.e. one `scheduler
+worker` and one or more `squeeze workers`) will be launched for `my_database`
+and the same for `your_database`. If you take this approach, note that any
+worker will either reject to start or will stop without doing any work if
+either:
 
 1. The `pg_squeeze` extension does not exist in the database, or
 
@@ -299,10 +300,11 @@ configuration variable `max_worker_processes`.
   columns `started` and `finished` tell when the processing started and
   finished. `ins_initial` is the number of tuples inserted into the new table
   storage during the "initial load stage", i.e. the number of tuples present
-  in the table when the processing started. `ins`, `upd` and `del` are the
-  numbers of tuples inserted, updated and deleted by applications after the
-  initial load. (These "concurrent data changes" must also be incorporated
-  into the squeezed table, otherwise they'd get lost.)
+  in the table before the processing started. On the other hand, `ins`, `upd`
+  and `del` are the numbers of tuples inserted, updated and deleted by
+  applications during the table processing. (These "concurrent data changes"
+  must also be incorporated into the squeezed table, otherwise they'd get
+  lost.)
 
 * `squeeze.errors` table contains errors that happened during squeezing. An
   usual problem reported here is that someone changed definition (e.g. added or
