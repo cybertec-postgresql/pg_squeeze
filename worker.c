@@ -677,9 +677,9 @@ void
 squeeze_worker_main(Datum main_arg)
 {
 	Datum	arg;
-	char	*kind;
 	int		i;
 	bool	found;
+	int		nworkers;
 
 	pqsignal(SIGHUP, worker_sighup);
 	pqsignal(SIGTERM, worker_sigterm);
@@ -709,34 +709,46 @@ squeeze_worker_main(Datum main_arg)
 		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid, 0);
 	}
 
-	kind = am_i_scheduler ? "scheduler" : "squeeze";
-
 	/* The worker should do its cleanup when exiting. */
 	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
 
-	/* Make sure that another scheduler is not running on this database. */
-	if (am_i_scheduler)
+	/*
+	 * Make sure that there is no more than one scheduler and no more than
+	 * squeeze_workers_per_database workers running on this database.
+	 */
+	found = false;
+	nworkers = 0;
+	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+	for (i = 0; i < workerData->nslots; i++)
 	{
-		found = false;
-		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
-		for (i = 0; i < workerData->nslots; i++)
-		{
-			WorkerSlot	*slot = &workerData->slots[i];
+		WorkerSlot	*slot = &workerData->slots[i];
 
-			if (slot->dbid == MyDatabaseId && slot->scheduler)
+		if (slot->dbid == MyDatabaseId)
+		{
+			if (am_i_scheduler && slot->scheduler)
 			{
 				elog(WARNING,
-					 "one %s worker is already running on database oid=%u",
-					 kind, MyDatabaseId);
+					 "one scheduler worker already running on database oid=%u",
+					 MyDatabaseId);
 
 				found = true;
 				break;
 			}
+			else if (!am_i_scheduler && !slot->scheduler)
+			{
+				if (++nworkers >= squeeze_workers_per_database)
+				{
+					elog(WARNING,
+						 "%d squeeze worker(s) already running on database oid=%u",
+						 nworkers, MyDatabaseId);
+					break;
+				}
+			}
 		}
-		LWLockRelease(workerData->lock);
-		if (found)
-			goto done;
 	}
+	LWLockRelease(workerData->lock);
+	if (found || (nworkers >= squeeze_workers_per_database))
+		goto done;
 
 	/* Find and initialize a slot for this worker. */
 	Assert(MyWorkerSlot == NULL);
