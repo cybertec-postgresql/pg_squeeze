@@ -395,7 +395,7 @@ wake_up_squeeze_workers(void)
  * Submit a task for a squeeze worker and wait for its completion.
  *
  * This is a replacement for the squeeze_table() function so that pg_squeeze
- * >= 1.6 can still expose the functionality via FMGR.
+ * >= 1.6 can still expose the functionality via the postgres executor.
  */
 extern Datum squeeze_table_new(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(squeeze_table_new);
