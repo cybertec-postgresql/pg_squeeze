@@ -3,7 +3,7 @@
  * pg_squeeze.h
  *     A tool to eliminate table bloat.
  *
- * Copyright (c) 2016-2022, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2023, CYBERTEC PostgreSQL International GmbH
  *
  *-----------------------------------------------------
  */

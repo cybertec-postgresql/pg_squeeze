@@ -3,9 +3,9 @@
  * pgstatapprox.c
  *		  Bloat estimation functions
  *
- * Copyright (c) 2014-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2023, PostgreSQL Global Development Group
  *
- * Copyright (c) 2016-2021, Cybertec Schönig & Schönig GmbH
+ * Copyright (c) 2016-2023, CYBERTEC PostgreSQL International GmbH
  *
  * IDENTIFICATION
  *		  contrib/pgstattuple/pgstatapprox.c
