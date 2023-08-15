@@ -69,13 +69,13 @@ max_squeeze_workers(void)
  */
 typedef struct WorkerSlot
 {
-	Oid		dbid;				/* database the worker is connected to */
-	Oid		relid;				/* relation the worker is working on */
-	int		pid;				/* the PID */
-	bool	scheduler;			/* true if scheduler, false if the "squeeze
+	Oid			dbid;			/* database the worker is connected to */
+	Oid			relid;			/* relation the worker is working on */
+	int			pid;			/* the PID */
+	bool		scheduler;		/* true if scheduler, false if the "squeeze
 								 * worker" */
-	WorkerProgress	progress;	/* progress tracking information */
-	Latch	*latch;				/* use this to wake up the worker */
+	WorkerProgress progress;	/* progress tracking information */
+	Latch	   *latch;			/* use this to wake up the worker */
 } WorkerSlot;
 
 /*
@@ -83,15 +83,16 @@ typedef struct WorkerSlot
  */
 typedef struct WorkerTask
 {
-	int		id;					/* the task id */
+	int			id;				/* the task id */
 
-	Oid		dbid;				/* also indicates whether the task is valid */
-	bool	in_progress;		/* for workers to avoid processing the same
+	Oid			dbid;			/* also indicates whether the task is valid */
+	bool		in_progress;	/* for workers to avoid processing the same
 								 * task */
 	NameData	relschema;
 	NameData	relname;
 	NameData	indname;		/* clustering index */
 	NameData	tbspname;		/* destination tablespace */
+
 	/*
 	 * index destination tablespaces.
 	 *
@@ -102,19 +103,19 @@ typedef struct WorkerTask
 	 * insert a record into the "tasks" table).
 	 */
 #define IND_TABLESPACES_ARRAY_SIZE	1024
-	char	ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
+	char		ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
 
 	/*
 	 * Exclusive lock is needed to change the contents. Note that for the
 	 * worker the change includes the actual work.
 	 */
-	LWLock	*lock;
+	LWLock	   *lock;
 
 	/*
 	 * The worker uses this to notify backends that the next task can be
 	 * assigned.
 	 */
-	ConditionVariable	cv;
+	ConditionVariable cv;
 } WorkerTask;
 
 /*
@@ -129,15 +130,15 @@ typedef struct WorkerData
 	WorkerTask	tasks[NUM_WORKER_TASKS];
 
 	/* The next task for a backend to use is (next_task % NUM_WORKER_TASKS) */
-	pg_atomic_uint32	next_task;
+	pg_atomic_uint32 next_task;
 
 	/*
 	 * A lock to synchronize access to slots. Lock in exclusive mode to add /
 	 * remove workers, in shared mode to find information on them.
 	 */
-	LWLock	*lock;
+	LWLock	   *lock;
 
-	int		nslots;				/* size of the array */
+	int			nslots;			/* size of the array */
 	WorkerSlot	slots[FLEXIBLE_ARRAY_MEMBER];
 } WorkerData;
 
@@ -150,7 +151,7 @@ static WorkerSlot *MyWorkerSlot = NULL;
 static WorkerTask *MyWorkerTask = NULL;
 
 /* Local pointer to the progress information. */
-WorkerProgress	*MyWorkerProgress = NULL;
+WorkerProgress *MyWorkerProgress = NULL;
 
 static void reset_progress(WorkerProgress *progress);
 
@@ -162,7 +163,7 @@ typedef struct TaskDetails
 	NameData	relname;
 	NameData	cl_index;
 	NameData	rel_tbsp;
-	ArrayType	*ind_tbsps;
+	ArrayType  *ind_tbsps;
 	bool		last_try;
 	bool		skip_analyze;
 } TaskDetails;
@@ -192,7 +193,7 @@ squeeze_worker_shmem_request(void)
 #if PG_VERSION_NUM >= 150000
 	if (prev_shmem_request_hook)
 		prev_shmem_request_hook();
-#endif	/* PG_VERSION_NUM >= 150000 */
+#endif							/* PG_VERSION_NUM >= 150000 */
 
 	RequestAddinShmemSpace(worker_shmem_size());
 	RequestNamedLWLockTranche("pg_squeeze", NUM_WORKER_TASKS + 1);
@@ -201,7 +202,7 @@ squeeze_worker_shmem_request(void)
 void
 squeeze_worker_shmem_startup(void)
 {
-	bool	found;
+	bool		found;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -213,14 +214,14 @@ squeeze_worker_shmem_startup(void)
 								 &found);
 	if (!found)
 	{
-		int		i;
-		LWLockPadded	*locks;
+		int			i;
+		LWLockPadded *locks;
 
 		locks = GetNamedLWLockTranche("pg_squeeze");
 
 		for (i = 0; i < NUM_WORKER_TASKS; i++)
 		{
-			WorkerTask	*task;
+			WorkerTask *task;
 
 			task = &workerData->tasks[i];
 			task->id = 0;
@@ -237,7 +238,7 @@ squeeze_worker_shmem_startup(void)
 
 		for (i = 0; i < workerData->nslots; i++)
 		{
-			WorkerSlot	*slot = &workerData->slots[i];
+			WorkerSlot *slot = &workerData->slots[i];
 
 			slot->dbid = InvalidOid;
 			slot->relid = InvalidOid;
@@ -299,7 +300,7 @@ PG_FUNCTION_INFO_V1(squeeze_start_worker);
 Datum
 squeeze_start_worker(PG_FUNCTION_ARGS)
 {
-	int		i;
+	int			i;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -318,7 +319,7 @@ PG_FUNCTION_INFO_V1(squeeze_stop_worker);
 Datum
 squeeze_stop_worker(PG_FUNCTION_ARGS)
 {
-	int		i;
+	int			i;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -328,7 +329,7 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
-		WorkerSlot	*slot = &workerData->slots[i];
+		WorkerSlot *slot = &workerData->slots[i];
 
 		/*
 		 * There should be at least two workers per database: one scheduler
@@ -346,14 +347,14 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 static void
 wake_up_squeeze_workers(void)
 {
-	int		i;
-	bool	found = false;
+	int			i;
+	bool		found = false;
 
 	/* Wake up all squeeze workers connected to this database. */
 	LWLockAcquire(workerData->lock, LW_SHARED);
 	for (i = 0; i < workerData->nslots; i++)
 	{
-		WorkerSlot	*slot = &workerData->slots[i];
+		WorkerSlot *slot = &workerData->slots[i];
 
 		/*
 		 * There should be at least two workers per database: one scheduler
@@ -370,8 +371,8 @@ wake_up_squeeze_workers(void)
 
 	if (!found)
 	{
-		char	*dbname;
-		bool	my_xact = false;
+		char	   *dbname;
+		bool		my_xact = false;
 
 		if (!IsTransactionState())
 		{
@@ -398,17 +399,19 @@ wake_up_squeeze_workers(void)
  * >= 1.6 can still expose the functionality via the postgres executor.
  */
 extern Datum squeeze_table_new(PG_FUNCTION_ARGS);
+
 PG_FUNCTION_INFO_V1(squeeze_table_new);
 Datum
 squeeze_table_new(PG_FUNCTION_ARGS)
 {
-	Name	relschema, relname;
-	Name	indname = NULL;
-	Name	tbspname = NULL;
-	ArrayType	*ind_tbsps = NULL;
-	WorkerTask	*task;
-	uint32	next_task_idx;
-	int		task_id;
+	Name		relschema,
+				relname;
+	Name		indname = NULL;
+	Name		tbspname = NULL;
+	ArrayType  *ind_tbsps = NULL;
+	WorkerTask *task;
+	uint32		next_task_idx;
+	int			task_id;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -445,9 +448,9 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 		LWLockAcquire(task->lock, LW_EXCLUSIVE);
 		if (task->dbid == InvalidOid)
 			break;
+
 		/*
-		 * Another task is being processed (or still waiting for the
-		 * worker).
+		 * Another task is being processed (or still waiting for the worker).
 		 */
 		LWLockRelease(task->lock);
 
@@ -487,9 +490,10 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	ConditionVariablePrepareToSleep(&task->cv);
 	while (true)
 	{
-		bool	done = false;
+		bool		done = false;
 
 		LWLockAcquire(task->lock, LW_SHARED);
+
 		/*
 		 * Done if the task area is ready for (or being already used by)
 		 * another task (submitted by another backend).
@@ -525,12 +529,12 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 static void
 start_worker_internal(bool scheduler)
 {
-	WorkerConInteractive	con;
+	WorkerConInteractive con;
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
 	pid_t		pid;
-	char	*kind = scheduler ? "scheduler" : "squeeze";
+	char	   *kind = scheduler ? "scheduler" : "squeeze";
 
 	con.dbid = MyDatabaseId;
 	con.roleid = GetUserId();
@@ -542,7 +546,7 @@ start_worker_internal(bool scheduler)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("could not register background process"),
-			   errhint("More details may be available in the server log.")));
+				 errhint("More details may be available in the server log.")));
 
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
 
@@ -550,11 +554,11 @@ start_worker_internal(bool scheduler)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("could not start background process"),
-			   errhint("More details may be available in the server log.")));
+				 errhint("More details may be available in the server log.")));
 	if (status == BGWH_POSTMASTER_DIED)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-			  errmsg("cannot start background processes without postmaster"),
+				 errmsg("cannot start background processes without postmaster"),
 				 errhint("Kill all remaining database processes and restart the database.")));
 	Assert(status == BGWH_STARTED);
 
@@ -572,7 +576,7 @@ start_worker_internal(bool scheduler)
 WorkerConInit *
 allocate_worker_con_info(char *dbname, char *rolename, bool scheduler)
 {
-	WorkerConInit	*result;
+	WorkerConInit *result;
 
 	result = (WorkerConInit *) MemoryContextAllocZero(TopMemoryContext,
 													  sizeof(WorkerConInit));
@@ -589,9 +593,9 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 							WorkerConInteractive *con_interactive,
 							pid_t notify_pid)
 {
-	char	*dbname;
-	bool	scheduler;
-	char	*kind;
+	char	   *dbname;
+	bool		scheduler;
+	char	   *kind;
 
 	worker->bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -611,7 +615,7 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 		worker->bgw_main_arg = (Datum) 0;
 
 		StaticAssertStmt(sizeof(WorkerConInteractive) <= BGW_EXTRALEN,
-						 "WorkerConInteractive is too big" );
+						 "WorkerConInteractive is too big");
 		memcpy(worker->bgw_extra, con_interactive,
 			   sizeof(WorkerConInteractive));
 
@@ -649,7 +653,7 @@ static volatile sig_atomic_t got_sigterm = false;
  * So far there seems to be no reason to have separate variables for the
  * scheduler and the squeeze worker.
  */
-static int worker_naptime = 20;
+static int	worker_naptime = 20;
 
 /*
  * There are 2 kinds of worker: 1) scheduler, which creates new tasks, 2) the
@@ -676,10 +680,10 @@ static bool am_i_scheduler = false;
 void
 squeeze_worker_main(Datum main_arg)
 {
-	Datum	arg;
-	int		i;
-	bool	found;
-	int		nworkers;
+	Datum		arg;
+	int			i;
+	bool		found;
+	int			nworkers;
 
 	pqsignal(SIGHUP, worker_sighup);
 	pqsignal(SIGTERM, worker_sigterm);
@@ -691,16 +695,16 @@ squeeze_worker_main(Datum main_arg)
 
 	if (MyBgworkerEntry->bgw_main_arg != (Datum) 0)
 	{
-		WorkerConInit	*con;
+		WorkerConInit *con;
 
 		con = (WorkerConInit *) DatumGetPointer(arg);
 		am_i_scheduler = con->scheduler;
-		BackgroundWorkerInitializeConnection(con->dbname, con->rolename, 0 /* flags */
+		BackgroundWorkerInitializeConnection(con->dbname, con->rolename, 0	/* flags */
 			);
 	}
 	else
 	{
-		WorkerConInteractive	con;
+		WorkerConInteractive con;
 
 		/* Ensure aligned access. */
 		memcpy(&con, MyBgworkerEntry->bgw_extra,
@@ -721,7 +725,7 @@ squeeze_worker_main(Datum main_arg)
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
-		WorkerSlot	*slot = &workerData->slots[i];
+		WorkerSlot *slot = &workerData->slots[i];
 
 		if (slot->dbid == MyDatabaseId)
 		{
@@ -756,7 +760,7 @@ squeeze_worker_main(Datum main_arg)
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
-		WorkerSlot	*slot = &workerData->slots[i];
+		WorkerSlot *slot = &workerData->slots[i];
 
 		if (slot->dbid == InvalidOid)
 		{
@@ -780,10 +784,10 @@ squeeze_worker_main(Datum main_arg)
 	{
 		/*
 		 * This should never happen (i.e. we should always have
-		 * max_worker_processes slots), but check, in case the slots
-		 * leak. Furthermore, for PG < 15 the maximum number of workers is a
-		 * compile time constant, so this is where we check the length of the
-		 * slot array.
+		 * max_worker_processes slots), but check, in case the slots leak.
+		 * Furthermore, for PG < 15 the maximum number of workers is a compile
+		 * time constant, so this is where we check the length of the slot
+		 * array.
 		 */
 		elog(WARNING,
 			 "no unused slot found for pg_squeeze worker process");
@@ -825,11 +829,11 @@ worker_sigterm(SIGNAL_ARGS)
 static void
 scheduler_worker_loop(void)
 {
-	long	delay = 0L;
+	long		delay = 0L;
 
 	while (!got_sigterm)
 	{
-		int	rc;
+		int			rc;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -857,7 +861,7 @@ scheduler_worker_loop(void)
 static void
 squeeze_worker_loop(void)
 {
-	long	delay = 0L;
+	long		delay = 0L;
 	MemoryContext task_cxt;
 
 	/* Memory context for auxiliary per-task allocations. */
@@ -867,7 +871,7 @@ squeeze_worker_loop(void)
 
 	while (!got_sigterm)
 	{
-		int	rc;
+		int			rc;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -922,21 +926,23 @@ squeeze_worker_loop(void)
 static void
 process_tasks(MemoryContext task_cxt)
 {
-	StringInfoData	query;
-	int		ret;
-	Name	relschema, relname;
-	Name	cl_index, rel_tbsp;
-	ArrayType	*ind_tbsps;
-	MemoryContext	oldcxt;
-	TaskDetails	*tasks = NULL;
+	StringInfoData query;
+	int			ret;
+	Name		relschema,
+				relname;
+	Name		cl_index,
+				rel_tbsp;
+	ArrayType  *ind_tbsps;
+	MemoryContext oldcxt;
+	TaskDetails *tasks = NULL;
 	uint64		ntasks;
-	int		i;
+	int			i;
 	static int	next_task = 0;
-	WorkerTask	*task;
+	WorkerTask *task;
 
 	initStringInfo(&query);
 
- restart:
+restart:
 	cl_index = NULL;
 	rel_tbsp = NULL;
 	ind_tbsps = NULL;
@@ -944,7 +950,7 @@ process_tasks(MemoryContext task_cxt)
 	{
 		for (i = 0; i < ntasks; i++)
 		{
-			TaskDetails	*this = &tasks[i];
+			TaskDetails *this = &tasks[i];
 
 			if (this->ind_tbsps)
 				pfree(this->ind_tbsps);
@@ -972,7 +978,7 @@ process_tasks(MemoryContext task_cxt)
 		LWLockAcquire(task->lock, LW_SHARED);
 		if (task->dbid == MyDatabaseId && !task->in_progress)
 		{
-			uint32	arr_size;
+			uint32		arr_size;
 
 			relschema = &task->relschema;
 			relname = &task->relname;
@@ -1019,7 +1025,7 @@ process_tasks(MemoryContext task_cxt)
 	if (MyWorkerTask == NULL)
 	{
 		TupleDesc	tupdesc;
-		TupleTableSlot	*slot;
+		TupleTableSlot *slot;
 
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
@@ -1029,7 +1035,7 @@ process_tasks(MemoryContext task_cxt)
 #define TASK_BATCH_SIZE		4
 
 		appendStringInfo(&query,
-"SELECT tb.tabschema, tb.tabname, tb.clustering_index,\
+						 "SELECT tb.tabschema, tb.tabname, tb.clustering_index,\
 tb.rel_tablespace, tb.ind_tablespaces, t.id, \
 t.tried >= tb.max_retry, tb.skip_analyze \
 FROM squeeze.tasks t, squeeze.tables tb \
@@ -1079,10 +1085,11 @@ LIMIT %d", TASK_BATCH_SIZE);
 		for (i = 0; i < ntasks; i++)
 		{
 			HeapTuple	tup;
-			Datum	datum;
-			bool	isnull;
-			int32	task_id;
-			bool	last_try, skip_analyze;
+			Datum		datum;
+			bool		isnull;
+			int32		task_id;
+			bool		last_try,
+						skip_analyze;
 
 			cl_index = NULL;
 			rel_tbsp = NULL;
@@ -1148,17 +1155,17 @@ LIMIT %d", TASK_BATCH_SIZE);
 	/* Now process the tasks. */
 	for (i = 0; i < ntasks; i++)
 	{
-		TimestampTz		start_ts;
-		bool	success;
-		TaskDetails		*td = &tasks[i];
-		RangeVar	*relrv;
+		TimestampTz start_ts;
+		bool		success;
+		TaskDetails *td = &tasks[i];
+		RangeVar   *relrv;
 		Relation	rel;
-		Oid		relid;
-		Name	cl_index = NULL;
-		Name	rel_tbsp = NULL;
-		int		j;
-		bool	found;
-		ErrorData	*edata;
+		Oid			relid;
+		Name		cl_index = NULL;
+		Name		rel_tbsp = NULL;
+		int			j;
+		bool		found;
+		ErrorData  *edata;
 
 		ereport(DEBUG1,
 				(errmsg("task for table %s.%s is ready for processing",
@@ -1200,7 +1207,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 		found = false;
 		for (j = 0; j < workerData->nslots; j++)
 		{
-			WorkerSlot	*slot = &workerData->slots[j];
+			WorkerSlot *slot = &workerData->slots[j];
 
 			if (slot->dbid == MyDatabaseId &&
 				slot->relid == relid)
@@ -1231,6 +1238,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 		MyWorkerSlot->relid = relid;
 		reset_progress(&MyWorkerSlot->progress);
 		LWLockRelease(workerData->lock);
+
 		/*
 		 * In theory, the table can be dropped now, created again (with a
 		 * different OID), scheduled for processing and picked by another
@@ -1278,10 +1286,10 @@ LIMIT %d", TASK_BATCH_SIZE);
 		/* Insert an entry into the "squeeze.log" table. */
 		if (success)
 		{
-			Oid		outfunc;
-			bool	isvarlena;
+			Oid			outfunc;
+			bool		isvarlena;
 			FmgrInfo	fmgrinfo;
-			char	*start_ts_str;
+			char	   *start_ts_str;
 
 			StartTransactionCommand();
 			getTypeOutputInfo(TIMESTAMPTZOID, &outfunc, &isvarlena);
@@ -1294,16 +1302,16 @@ LIMIT %d", TASK_BATCH_SIZE);
 			CommitTransactionCommand();
 
 			resetStringInfo(&query);
+			/*
+			 * No one should change the progress fields now, so we can access
+			 * them w/o the spinlock below.
+			 */
 			appendStringInfo(&query,
-"INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
+							 "INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
 VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 							 NameStr(td->relschema),
 							 NameStr(td->relname),
 							 start_ts_str,
-							 /*
-							  * No one should change the progress fields now,
-							  * so we can access them w/o the spinlock below.
-							  */
 							 MyWorkerProgress->ins_initial,
 							 MyWorkerProgress->ins,
 							 MyWorkerProgress->upd,
@@ -1319,19 +1327,20 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 
 				if (!td->skip_analyze)
 				{
-					/* Analyze the new table, unless user rejects it
+					/*
+					 * Analyze the new table, unless user rejects it
 					 * explicitly.
 					 *
 					 * XXX Besides updating planner statistics in general,
 					 * this sets pg_class(relallvisible) to 0, so that planner
 					 * is not too optimistic about this figure. The
 					 * preferrable solution would be to run (lazy) VACUUM
-					 * (with the ANALYZE option) to initialize visibility
-					 * map. However, to make the effort worthwile, we
-					 * shouldn't do it until all transactions can see all the
-					 * changes done by squeeze_table() function. What's the
-					 * most suitable way to wait?  Asynchronous execution of
-					 * the VACUUM is probably needed in any case.
+					 * (with the ANALYZE option) to initialize visibility map.
+					 * However, to make the effort worthwile, we shouldn't do
+					 * it until all transactions can see all the changes done
+					 * by squeeze_table() function. What's the most suitable
+					 * way to wait?  Asynchronous execution of the VACUUM is
+					 * probably needed in any case.
 					 */
 					resetStringInfo(&query);
 					appendStringInfo(&query, "ANALYZE %s.%s",
@@ -1368,11 +1377,11 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 static void
 squeeze_handle_error_app(ErrorData *edata, TaskDetails *td)
 {
-	StringInfoData	query;
+	StringInfoData query;
 
 	initStringInfo(&query);
 	appendStringInfo(&query,
-"INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
+					 "INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
 VALUES ('%s', '%s', '%s', '%s', '%s')",
 					 NameStr(td->relschema),
 					 NameStr(td->relname),
@@ -1442,7 +1451,7 @@ reset_progress(WorkerProgress *progress)
 static void
 run_command(char *command, int rc)
 {
-	int	ret;
+	int			ret;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -1487,16 +1496,19 @@ PG_FUNCTION_INFO_V1(squeeze_get_active_workers);
 Datum
 squeeze_get_active_workers(PG_FUNCTION_ARGS)
 {
-	WorkerSlot	*slots, *dst;
-	int		i, nslots = 0;
+	WorkerSlot *slots,
+			   *dst;
+	int			i,
+				nslots = 0;
 #if PG_VERSION_NUM >= 150000
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	InitMaterializedSRF(fcinfo, 0);
 #else
-	FuncCallContext		*funcctx;
-	int					 call_cntr, max_calls;
-	HeapTuple		*tuples;
+	FuncCallContext *funcctx;
+	int			call_cntr,
+				max_calls;
+	HeapTuple  *tuples;
 #endif
 
 	/*
@@ -1508,7 +1520,7 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 	LWLockAcquire(workerData->lock, LW_SHARED);
 	for (i = 0; i < workerData->nslots; i++)
 	{
-		WorkerSlot	*slot = &workerData->slots[i];
+		WorkerSlot *slot = &workerData->slots[i];
 
 		if (!slot->scheduler &&
 			slot->pid != InvalidPid &&
@@ -1524,20 +1536,21 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 150000
 	for (i = 0; i < nslots; i++)
 	{
-		WorkerSlot	*slot = &slots[i];
-		WorkerProgress	*progress = &slot->progress;
-		Datum	values[ACTIVE_WORKERS_RES_ATTRS];
-		bool	isnull[ACTIVE_WORKERS_RES_ATTRS];
-		char	*relnspc = NULL;
-		char	*relname = NULL;
-		NameData	tabname, tabschema;
+		WorkerSlot *slot = &slots[i];
+		WorkerProgress *progress = &slot->progress;
+		Datum		values[ACTIVE_WORKERS_RES_ATTRS];
+		bool		isnull[ACTIVE_WORKERS_RES_ATTRS];
+		char	   *relnspc = NULL;
+		char	   *relname = NULL;
+		NameData	tabname,
+					tabschema;
 
 		memset(isnull, false, ACTIVE_WORKERS_RES_ATTRS * sizeof(bool));
 		values[0] = Int32GetDatum(slot->pid);
 
 		if (OidIsValid(slot->relid))
 		{
-			Oid		nspid;
+			Oid			nspid;
 
 			/*
 			 * It's possible that processing of the relation has finished and
@@ -1572,9 +1585,9 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 	/* Less trivial implementation, to be removed when PG 14 is EOL. */
 	if (SRF_IS_FIRSTCALL())
 	{
-		MemoryContext	oldcontext;
-		TupleDesc			 tupdesc;
-		int		ntuples = 0;
+		MemoryContext oldcontext;
+		TupleDesc	tupdesc;
+		int			ntuples = 0;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -1591,20 +1604,21 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 		tuples = (HeapTuple *) palloc0(nslots * sizeof(HeapTuple));
 		for (i = 0; i < nslots; i++)
 		{
-			WorkerSlot	*slot = &slots[i];
-			WorkerProgress	*progress = &slot->progress;
-			char	*relnspc = NULL;
-			char	*relname = NULL;
-			NameData	tabname, tabschema;
-			Datum	*values;
-			bool	*isnull;
+			WorkerSlot *slot = &slots[i];
+			WorkerProgress *progress = &slot->progress;
+			char	   *relnspc = NULL;
+			char	   *relname = NULL;
+			NameData	tabname,
+						tabschema;
+			Datum	   *values;
+			bool	   *isnull;
 
 			values = (Datum *) palloc(ACTIVE_WORKERS_RES_ATTRS * sizeof(Datum));
 			isnull = (bool *) palloc0(ACTIVE_WORKERS_RES_ATTRS * sizeof(bool));
 
 			if (OidIsValid(slot->relid))
 			{
-				Oid		nspid;
+				Oid			nspid;
 
 				/* See the PG 15 implementation above. */
 				nspid = get_rel_namespace(slot->relid);
@@ -1642,8 +1656,8 @@ squeeze_get_active_workers(PG_FUNCTION_ARGS)
 
 	if (call_cntr < max_calls)
 	{
-		HeapTuple	 tuple = tuples[call_cntr];
-		Datum		 result;
+		HeapTuple	tuple = tuples[call_cntr];
+		Datum		result;
 
 		result = HeapTupleGetDatum(tuple);
 		SRF_RETURN_NEXT(funcctx, result);

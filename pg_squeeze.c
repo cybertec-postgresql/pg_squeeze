@@ -79,22 +79,22 @@ PG_MODULE_MAGIC;
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 static void squeeze_table_internal(Name relschema, Name relname, Name indname,
-								   Name tbspname, ArrayType	*ind_tbsp);
-static int index_cat_info_compare(const void *arg1, const void *arg2);
+								   Name tbspname, ArrayType *ind_tbsp);
+static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* Index-to-tablespace mapping. */
 typedef struct IndexTablespace
 {
-	Oid	index;
-	Oid	tablespace;
+	Oid			index;
+	Oid			tablespace;
 } IndexTablespace;
 
 /* Where should the new table and its indexes be located? */
 typedef struct TablespaceInfo
 {
-	Oid	table;
+	Oid			table;
 
-	int	nindexes;
+	int			nindexes;
 	IndexTablespace *indexes;
 } TablespaceInfo;
 
@@ -129,8 +129,8 @@ static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst,
 								 LogicalDecodingContext *ctx);
-static Oid create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
-								  Oid tablespace, Oid relowner);
+static Oid	create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
+								   Oid tablespace, Oid relowner);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									Oid *indexes_src, int nindexes,
 									TablespaceInfo *tbsp_info,
@@ -147,7 +147,7 @@ static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
-static Oid get_toast_index(Oid toastrelid);
+static Oid	get_toast_index(Oid toastrelid);
 
 /*
  * The maximum time to hold AccessExclusiveLock during the final
@@ -156,7 +156,7 @@ static Oid get_toast_index(Oid toastrelid);
  * swap_toast_names() shouldn't get blocked and it'd be wrong to consider them
  * a reason to abort otherwise completed processing.
  */
-int squeeze_max_xlock_time = 0;
+int			squeeze_max_xlock_time = 0;
 
 /*
  * List of database names for which the background worker should start started
@@ -164,16 +164,16 @@ int squeeze_max_xlock_time = 0;
  * way to pass list of database name w/o adding restrictions on character set
  * characters.)
  */
-char *squeeze_worker_autostart = NULL;
+char	   *squeeze_worker_autostart = NULL;
 
 /*
  * Role on behalf of which automatically-started worker connects to
  * database(s).
  */
-char *squeeze_worker_role = NULL;
+char	   *squeeze_worker_role = NULL;
 
 /* The number of squeeze workers per database. */
-int squeeze_workers_per_database = 1;
+int			squeeze_workers_per_database = 1;
 
 #if PG_VERSION_NUM >= 150000
 shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -198,52 +198,54 @@ _PG_init(void)
 	shmem_startup_hook = squeeze_worker_shmem_startup;
 
 	DefineCustomStringVariable(
-		"squeeze.worker_autostart",
-		"Names of databases for which background workers start automatically.",
-		"Comma-separated list for of databases which squeeze worker starts as soon as "
-		"the cluster startup has completed.",
-		&squeeze_worker_autostart,
-		NULL,
-		PGC_POSTMASTER,
-		0,
-		NULL, NULL, NULL);
+							   "squeeze.worker_autostart",
+							   "Names of databases for which background workers start automatically.",
+							   "Comma-separated list for of databases which squeeze worker starts as soon as "
+							   "the cluster startup has completed.",
+							   &squeeze_worker_autostart,
+							   NULL,
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
-		"squeeze.worker_role",
-		"Role that background workers use to connect to database.",
-		"If background worker was launched automatically on cluster startup, "
-		"it uses this role to initiate database connection(s).",
-		&squeeze_worker_role,
-		NULL,
-		PGC_POSTMASTER,
-		0,
-		NULL, NULL, NULL);
+							   "squeeze.worker_role",
+							   "Role that background workers use to connect to database.",
+							   "If background worker was launched automatically on cluster startup, "
+							   "it uses this role to initiate database connection(s).",
+							   &squeeze_worker_role,
+							   NULL,
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"squeeze.workers_per_database",
-		"Maximum number of squeeze worker processes launched for each database.",
-		NULL,
-		&squeeze_workers_per_database,
-		1, 1, max_worker_processes,
-		PGC_POSTMASTER,
-		0,
-		/*
-		 * Assume that the in-core GUC max_worker_processes should already be
-		 * assigned and checked before the loading of the modules
-		 * starts. Since the context of both this GUC and the
-		 * max_worker_processes is PGC_POSTMASTER, no future check should be
-		 * needed. (Some in-core GUCs that reference other ones have the hooks
-		 * despite being PGC_POSTMASTER, but the reason seems to be that those
-		 * cannot assume anything about the order of checking.)
-		 */
-		NULL, NULL, NULL);
+							"squeeze.workers_per_database",
+							"Maximum number of squeeze worker processes launched for each database.",
+							NULL,
+							&squeeze_workers_per_database,
+							1, 1, max_worker_processes,
+							PGC_POSTMASTER,
+							0,
+
+	/*
+	 * Assume that the in-core GUC max_worker_processes should already be
+	 * assigned and checked before the loading of the modules starts. Since
+	 * the context of both this GUC and the max_worker_processes is
+	 * PGC_POSTMASTER, no future check should be needed. (Some in-core GUCs
+	 * that reference other ones have the hooks despite being PGC_POSTMASTER,
+	 * but the reason seems to be that those cannot assume anything about the
+	 * order of checking.)
+	 */
+							NULL, NULL, NULL);
 
 	if (squeeze_worker_autostart)
 	{
-		List	*dbnames = NIL;
-		char	*dbname, *c;
-		int	len;
-		ListCell	*lc;
+		List	   *dbnames = NIL;
+		char	   *dbname,
+				   *c;
+		int			len;
+		ListCell   *lc;
 
 		if (squeeze_worker_role == NULL)
 			ereport(ERROR,
@@ -255,7 +257,7 @@ _PG_init(void)
 		dbname = NULL;
 		while (true)
 		{
-			bool done;
+			bool		done;
 
 			done = *c == '\0';
 			if (done || isspace(*c))
@@ -296,9 +298,9 @@ _PG_init(void)
 
 		foreach(lc, dbnames)
 		{
-			WorkerConInit	*con;
+			WorkerConInit *con;
 			BackgroundWorker worker;
-			int		i;
+			int			i;
 
 			dbname = lfirst(lc);
 
@@ -315,16 +317,16 @@ _PG_init(void)
 	}
 
 	DefineCustomIntVariable(
-		"squeeze.max_xlock_time",
-		"The maximum time the processed table may be locked exclusively.",
-		"The source table is locked exclusively during the final stage of "
-		"processing. If the lock time should exceed this value, the lock is "
-		"released and the final stage is retried a few more times.",
-		&squeeze_max_xlock_time,
-		0, 0, INT_MAX,
-		PGC_USERSET,
-		GUC_UNIT_MS,
-		NULL, NULL, NULL);
+							"squeeze.max_xlock_time",
+							"The maximum time the processed table may be locked exclusively.",
+							"The source table is locked exclusively during the final stage of "
+							"processing. If the lock time should exceed this value, the lock is "
+							"released and the final stage is retried a few more times.",
+							&squeeze_max_xlock_time,
+							0, 0, INT_MAX,
+							PGC_USERSET,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
 }
 
 #define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u"
@@ -338,10 +340,10 @@ _PG_init(void)
  */
 bool
 squeeze_table_impl(Name relschema, Name relname, Name indname,
-				   Name tbspname, ArrayType	*ind_tbsp, ErrorData **edata_p,
+				   Name tbspname, ArrayType *ind_tbsp, ErrorData **edata_p,
 				   MemoryContext edata_cxt)
 {
-	bool	result;
+	bool		result;
 
 	PG_TRY();
 	{
@@ -361,33 +363,39 @@ squeeze_table_impl(Name relschema, Name relname, Name indname,
 
 static void
 squeeze_table_internal(Name relschema, Name relname, Name indname,
-					   Name tbspname, ArrayType	*ind_tbsp)
+					   Name tbspname, ArrayType *ind_tbsp)
 {
 	RangeVar   *relrv_src;
-	RangeVar	*relrv_cl_idx = NULL;
-	Relation	rel_src, rel_dst;
-	Oid	rel_src_owner;
-	Oid	ident_idx_src, ident_idx_dst;
-	Oid	relid_src, relid_dst;
-	Oid	toastrelid_src, toastrelid_dst;
-	char	replident;
-	ScanKey	ident_key;
-	int	i, ident_key_nentries;
-	IndexInsertState	*iistate;
-	LogicalDecodingContext	*ctx;
+	RangeVar   *relrv_cl_idx = NULL;
+	Relation	rel_src,
+				rel_dst;
+	Oid			rel_src_owner;
+	Oid			ident_idx_src,
+				ident_idx_dst;
+	Oid			relid_src,
+				relid_dst;
+	Oid			toastrelid_src,
+				toastrelid_dst;
+	char		replident;
+	ScanKey		ident_key;
+	int			i,
+				ident_key_nentries;
+	IndexInsertState *iistate;
+	LogicalDecodingContext *ctx;
 	ReplicationSlot *slot;
 	Snapshot	snap_hist;
 	TupleDesc	tup_desc;
-	CatalogState		*cat_state;
+	CatalogState *cat_state;
 	XLogRecPtr	end_of_wal;
 	XLogRecPtr	xlog_insert_ptr;
-	int	nindexes;
-	Oid	*indexes_src = NULL, *indexes_dst = NULL;
-	bool	invalid_index = false;
-	IndexCatInfo	*ind_info;
-	TablespaceInfo	*tbsp_info;
-	ObjectAddress	object;
-	bool	source_finalized;
+	int			nindexes;
+	Oid		   *indexes_src = NULL,
+			   *indexes_dst = NULL;
+	bool		invalid_index = false;
+	IndexCatInfo *ind_info;
+	TablespaceInfo *tbsp_info;
+	ObjectAddress object;
+	bool		source_finalized;
 
 	relrv_src = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
 #if PG_VERSION_NUM >= 120000
@@ -464,9 +472,9 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	 * decoded. However it seems inconsistent.
 	 *
 	 * XXX Although ERRCODE_UNIQUE_VIOLATION is no actual "unique violation",
-	 * this error code seems to be the best
-	 * match. (ERRCODE_TRIGGERED_ACTION_EXCEPTION might be worth consideration
-	 * as well.)
+	 * this error code seems to be the best match.
+	 * (ERRCODE_TRIGGERED_ACTION_EXCEPTION might be worth consideration as
+	 * well.)
 	 */
 	if (replident == REPLICA_IDENTITY_NOTHING ||
 		(replident == REPLICA_IDENTITY_DEFAULT && !OidIsValid(ident_idx_src)))
@@ -492,9 +500,9 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	 *
 	 * Do not lock the index so far, e.g. just to retrieve OID and to keep it
 	 * valid. Neither the relation can be locked continuously, so by keeping
-	 * the index locked alone we'd introduce incorrect order of
-	 * locking. Although we use only share locks in most cases (so I'm not
-	 * aware of particular deadlock scenario), it doesn't seem wise. The worst
+	 * the index locked alone we'd introduce incorrect order of locking.
+	 * Although we use only share locks in most cases (so I'm not aware of
+	 * particular deadlock scenario), it doesn't seem wise. The worst
 	 * consequence of not locking is that perform_initial_load() will error
 	 * out.
 	 */
@@ -547,7 +555,7 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	snap_hist = build_historic_snapshot(ctx->snapshot_builder);
 
 	relid_dst = create_transient_table(cat_state, tup_desc, tbsp_info->table,
-		rel_src_owner);
+									   rel_src_owner);
 
 	/* The source relation will be needed for the initial load. */
 #if PG_VERSION_NUM >= 120000
@@ -583,8 +591,7 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	PushActiveSnapshot(snap_hist);
 
 	/*
-	 * The historic snapshot is used to retrieve data w/o concurrent
-	 * changes.
+	 * The historic snapshot is used to retrieve data w/o concurrent changes.
 	 */
 	perform_initial_load(rel_src, relrv_cl_idx, snap_hist, rel_dst, ctx);
 
@@ -633,9 +640,8 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	CommandCounterIncrement();
 
 	/*
-	 * Create indexes on the temporary table - that might take a
-	 * while. (Unlike the concurrent changes, which we insert into existing
-	 * indexes.)
+	 * Create indexes on the temporary table - that might take a while.
+	 * (Unlike the concurrent changes, which we insert into existing indexes.)
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 	indexes_dst = build_transient_indexes(rel_dst, rel_src, indexes_src,
@@ -694,6 +700,7 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 		}
 	}
 	if (!OidIsValid(ident_idx_dst))
+
 		/*
 		 * Should not happen, concurrent DDLs should have been noticed short
 		 * ago.
@@ -708,7 +715,7 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	 * incomplete page, see GetInsertRecPtr), to minimize the amount of data
 	 * we need to flush while holding exclusive lock on the source table.
 	 */
- 	xlog_insert_ptr = GetInsertRecPtr();
+	xlog_insert_ptr = GetInsertRecPtr();
 	XLogFlush(xlog_insert_ptr);
 
 	/*
@@ -796,8 +803,10 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	free_index_insert_state(iistate);
 
 	/* The destination table is no longer necessary, so close it. */
-	/* XXX (Should have been closed right after
-	 * process_concurrent_changes()?) */
+
+	/*
+	 * XXX (Should have been closed right after process_concurrent_changes()?)
+	 */
 #if PG_VERSION_NUM >= 120000
 	table_close(rel_dst, AccessExclusiveLock);
 #else
@@ -864,7 +873,7 @@ index_cat_info_compare(const void *arg1, const void *arg2)
 static void
 check_prerequisites(Relation rel)
 {
-	Form_pg_class	form = RelationGetForm(rel);
+	Form_pg_class form = RelationGetForm(rel);
 
 	/* Check the relation first. */
 	if (form->relkind == RELKIND_PARTITIONED_TABLE)
@@ -939,10 +948,10 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 {
 	StringInfo	buf;
 	LogicalDecodingContext *ctx;
-	DecodingOutputState	*dstate;
+	DecodingOutputState *dstate;
 	MemoryContext oldcontext;
 
-	/* check_permissions() "inlined", as logicalfuncs.c does not export it.*/
+	/* check_permissions() "inlined", as logicalfuncs.c does not export it. */
 	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -1029,8 +1038,8 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change);
 #endif
 
-	dstate->resowner = 	ResourceOwnerCreate(CurrentResourceOwner,
-											"logical decoding");
+	dstate->resowner = ResourceOwnerCreate(CurrentResourceOwner,
+										   "logical decoding");
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -1041,7 +1050,7 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 static void
 decoding_cleanup(LogicalDecodingContext *ctx)
 {
-	DecodingOutputState	*dstate;
+	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
@@ -1061,7 +1070,7 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 static CatalogState *
 get_catalog_state(Oid relid)
 {
-	CatalogState	*result;
+	CatalogState *result;
 
 	result = (CatalogState *) palloc0(sizeof(CatalogState));
 	result->rel.relid = relid;
@@ -1105,7 +1114,7 @@ get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
 				  TupleDesc *desc_p)
 {
 	HeapTuple	tuple;
-	Form_pg_class	form_class;
+	Form_pg_class form_class;
 	Relation	rel;
 	SysScanDesc scan;
 	ScanKeyData key[1];
@@ -1185,8 +1194,8 @@ get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tuple;
-	TransactionId	*result;
-	int	n = 0;
+	TransactionId *result;
+	int			n = 0;
 
 #if PG_VERSION_NUM >= 120000
 	rel = table_open(AttributeRelationId, AccessShareLock);
@@ -1207,8 +1216,8 @@ get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
 	result = (TransactionId *) palloc(relnatts * sizeof(TransactionId));
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
-		Form_pg_attribute	form;
-		int	i;
+		Form_pg_attribute form;
+		int			i;
 
 		Assert(HeapTupleIsValid(tuple));
 		form = (Form_pg_attribute) GETSTRUCT(tuple);
@@ -1253,9 +1262,9 @@ get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
 static void
 cache_composite_type_info(CatalogState *cat_state, Oid typid)
 {
-	int	i;
-	bool	found = false;
-	TypeCatInfo	*tinfo;
+	int			i;
+	bool		found = false;
+	TypeCatInfo *tinfo;
 
 	/* Check if we already have this type. */
 	for (i = 0; i < cat_state->ncomptypes; i++)
@@ -1309,8 +1318,8 @@ get_composite_type_info(TypeCatInfo *tinfo)
 	ScanKeyData key[1];
 	SysScanDesc scan;
 	HeapTuple	tuple;
-	Form_pg_type	form_type;
-	Form_pg_class	form_class;
+	Form_pg_type form_type;
+	Form_pg_class form_class;
 
 	Assert(tinfo->oid != InvalidOid);
 
@@ -1386,18 +1395,20 @@ static IndexCatInfo *
 get_index_info(Oid relid, int *relninds, bool *found_invalid,
 			   bool invalid_check_only, bool *found_pk)
 {
-	Relation	rel, rel_idx;
+	Relation	rel,
+				rel_idx;
 	ScanKeyData key[1];
 	SysScanDesc scan;
 	HeapTuple	tuple;
-	IndexCatInfo		*result;
-	int	i, n = 0;
-	int	relninds_max = 4;
-	Datum		*oids_d;
+	IndexCatInfo *result;
+	int			i,
+				n = 0;
+	int			relninds_max = 4;
+	Datum	   *oids_d;
 	int16		oidlen;
 	bool		oidbyval;
 	char		oidalign;
-	ArrayType	*oids_a;
+	ArrayType  *oids_a;
 	bool		mismatch;
 
 	*found_invalid = false;
@@ -1428,8 +1439,8 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	result = (IndexCatInfo *) palloc(relninds_max * sizeof(IndexCatInfo));
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
-		Form_pg_index	form;
-		IndexCatInfo	*res_entry;
+		Form_pg_index form;
+		IndexCatInfo *res_entry;
 
 		form = (Form_pg_index) GETSTRUCT(tuple);
 
@@ -1534,9 +1545,9 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	mismatch = false;
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
-		IndexCatInfo	*res_item;
-		Form_pg_class	form_class;
-		char	*namestr;
+		IndexCatInfo *res_item;
+		Form_pg_class form_class;
+		char	   *namestr;
 
 		if (i == n)
 		{
@@ -1645,7 +1656,7 @@ check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
 static void
 check_pg_class_changes(CatalogState *cat_state)
 {
-	TransactionId	xmin_current;
+	TransactionId xmin_current;
 
 	get_pg_class_info(cat_state->rel.relid, &xmin_current, NULL, NULL);
 
@@ -1672,8 +1683,8 @@ check_pg_class_changes(CatalogState *cat_state)
 static void
 check_attribute_changes(CatalogState *cat_state)
 {
-	TransactionId	*attrs_new;
-	int i;
+	TransactionId *attrs_new;
+	int			i;
 
 	/*
 	 * Since pg_class should have been checked by now, relnatts can only be
@@ -1709,11 +1720,11 @@ check_attribute_changes(CatalogState *cat_state)
 static void
 check_index_changes(CatalogState *cat_state)
 {
-	IndexCatInfo	*inds_new;
-	int	relninds_new;
-	bool	failed = false;
-	bool	invalid_index;
-	bool	have_pk_index;
+	IndexCatInfo *inds_new;
+	int			relninds_new;
+	bool		failed = false;
+	bool		invalid_index;
+	bool		have_pk_index;
 
 	if (cat_state->relninds == 0)
 	{
@@ -1743,11 +1754,12 @@ check_index_changes(CatalogState *cat_state)
 
 	if (!failed)
 	{
-		int i;
+		int			i;
 
 		for (i = 0; i < cat_state->relninds; i++)
 		{
-			IndexCatInfo	*ind, *ind_new;
+			IndexCatInfo *ind,
+					   *ind_new;
 
 			ind = &cat_state->indexes[i];
 			ind_new = &inds_new[i];
@@ -1771,14 +1783,14 @@ check_index_changes(CatalogState *cat_state)
 static void
 check_composite_type_changes(CatalogState *cat_state)
 {
-	int	i;
-	TypeCatInfo	*changed = NULL;
+	int			i;
+	TypeCatInfo *changed = NULL;
 
 	for (i = 0; i < cat_state->ncomptypes; i++)
 	{
-		TypeCatInfo	*tinfo = &cat_state->comptypes[i];
+		TypeCatInfo *tinfo = &cat_state->comptypes[i];
 		TypeCatInfo tinfo_new;
-		int	j;
+		int			j;
 
 		tinfo_new.oid = tinfo->oid;
 		get_composite_type_info(&tinfo_new);
@@ -1844,7 +1856,7 @@ free_catalog_state(CatalogState *state)
 
 	if (state->comptypes)
 	{
-		int	i;
+		int			i;
 
 		for (i = 0; i < state->ncomptypes; i++)
 		{
@@ -1862,14 +1874,17 @@ static void
 resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
 						 ArrayType *ind_tbsp_a)
 {
-	int	*dims, *lb;
-	int	i, ndim;
-	int16 elmlen;
-	bool elmbyval;
-	char elmalign;
-	Datum	*elements;
-	bool	*nulls;
-	int	nelems, nentries;
+	int		   *dims,
+			   *lb;
+	int			i,
+				ndim;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elements;
+	bool	   *nulls;
+	int			nelems,
+				nentries;
 
 	/* The CREATE FUNCTION statement should ensure this. */
 	Assert(ARR_ELEMTYPE(ind_tbsp_a) == NAMEOID);
@@ -1911,17 +1926,19 @@ resolve_index_tablepaces(TablespaceInfo *tbsp_info, CatalogState *cat_state,
 
 	for (i = 0; i < nentries; i++)
 	{
-		char	*indname, *tbspname;
-		int	j;
-		Oid	ind_oid, tbsp_oid;
-		IndexTablespace	*ind_ts;
+		char	   *indname,
+				   *tbspname;
+		int			j;
+		Oid			ind_oid,
+					tbsp_oid;
+		IndexTablespace *ind_ts;
 
 		/* Find OID of the index. */
 		indname = NameStr(*DatumGetName(elements[2 * i]));
 		ind_oid = InvalidOid;
 		for (j = 0; j < cat_state->relninds; j++)
 		{
-			IndexCatInfo	*ind_cat;
+			IndexCatInfo *ind_cat;
 
 			ind_cat = &cat_state->indexes[j];
 			if (strcmp(NameStr(ind_cat->relname), indname) == 0)
@@ -1977,9 +1994,9 @@ static Snapshot
 build_historic_snapshot(SnapBuild *builder)
 {
 	Snapshot	result;
-	bool	FirstSnapshotSet_save;
-	int		XactIsoLevel_save;
-	TransactionId	xmin_save;
+	bool		FirstSnapshotSet_save;
+	int			XactIsoLevel_save;
+	TransactionId xmin_save;
 
 	/*
 	 * Fake both FirstSnapshotSet and XactIsoLevel so that the assertions in
@@ -2045,26 +2062,29 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 					 Snapshot snap_hist, Relation rel_dst,
 					 LogicalDecodingContext *ctx)
 {
-	bool	use_sort;
-	int	batch_size, batch_max_size;
-	Size	tuple_array_size;
-	bool	tuple_array_can_expand = true;
+	bool		use_sort;
+	int			batch_size,
+				batch_max_size;
+	Size		tuple_array_size;
+	bool		tuple_array_can_expand = true;
 	Tuplesortstate *tuplesort = NULL;
 	Relation	cluster_idx = NULL;
 #if PG_VERSION_NUM >= 120000
-	TableScanDesc	heap_scan = NULL;
-	TupleTableSlot	*slot;
+	TableScanDesc heap_scan = NULL;
+	TupleTableSlot *slot;
 #else
-	HeapScanDesc	heap_scan = NULL;
+	HeapScanDesc heap_scan = NULL;
 #endif
-	IndexScanDesc	index_scan = NULL;
-	HeapTuple	*tuples = NULL;
-	ResourceOwner	res_owner_old, res_owner_plan;
+	IndexScanDesc index_scan = NULL;
+	HeapTuple  *tuples = NULL;
+	ResourceOwner res_owner_old,
+				res_owner_plan;
 	BulkInsertState bistate;
-	MemoryContext	load_cxt, old_cxt;
+	MemoryContext load_cxt,
+				old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
-	DecodingOutputState	*dstate;
-	char	replorigin_name[255];
+	DecodingOutputState *dstate;
+	char		replorigin_name[255];
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
@@ -2111,9 +2131,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		use_sort = plan_cluster_use_sort(rel_src->rd_id, cluster_idx->rd_id);
 
 		/*
-		 * Now use the special resource owner to release those planner
-		 * locks. In fact this owner should contain any other resources, that
-		 * the planner might have allocated. Release them all, to avoid leak.
+		 * Now use the special resource owner to release those planner locks.
+		 * In fact this owner should contain any other resources, that the
+		 * planner might have allocated. Release them all, to avoid leak.
 		 */
 		ResourceOwnerRelease(CurrentResourceOwner,
 							 RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
@@ -2181,14 +2201,14 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	while (true)
 	{
 		HeapTuple	tup_in = NULL;
-		int	i;
-		Size	data_size = 0;
+		int			i;
+		Size		data_size = 0;
 		XLogRecPtr	end_of_wal;
 
 		/* Sorting cannot be split into batches. */
 		for (i = 0;; i++)
 		{
-			bool	flattened = false;
+			bool		flattened = false;
 
 			/*
 			 * While tuplesort is responsible for not exceeding
@@ -2226,7 +2246,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			MemoryContextSwitchTo(old_cxt);
 #if PG_VERSION_NUM >= 120000
 			{
-				bool	res;
+				bool		res;
 
 				if (use_sort || cluster_idx == NULL)
 					res = table_scan_getnextslot(heap_scan,
@@ -2239,7 +2259,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 				if (res)
 				{
-					bool	shouldFree;
+					bool		shouldFree;
 
 					tup_in = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
 					/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
@@ -2288,8 +2308,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				 */
 				if (i == (batch_max_size - 1) && tuple_array_can_expand)
 				{
-					int batch_max_size_new;
-					Size	tuple_array_size_new;
+					int			batch_max_size_new;
+					Size		tuple_array_size_new;
 
 					batch_max_size_new = 2 * batch_max_size;
 					tuple_array_size_new = batch_max_size_new *
@@ -2330,8 +2350,8 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				data_size += HEAPTUPLESIZE + tup_in->t_len;
 
 				/*
-				 * If the tuple array could not be expanded, stop reading
-				 * for the current batch.
+				 * If the tuple array could not be expanded, stop reading for
+				 * the current batch.
 				 */
 				if (i == (batch_max_size - 1))
 				{
@@ -2447,6 +2467,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		}
 		end_of_wal_prev = end_of_wal;
 	}
+
 	/*
 	 * At whichever stage the loop broke, the historic snapshot should no
 	 * longer be active.
@@ -2509,12 +2530,12 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 					   Oid tablespace, Oid relowner)
 {
 	StringInfo	relname;
-	Form_pg_class	form_class;
+	Form_pg_class form_class;
 	HeapTuple	tuple;
-	Datum	reloptions;
-	bool	isnull;
-	Oid	toastrelid;
-	Oid	result;
+	Datum		reloptions;
+	bool		isnull;
+	Oid			toastrelid;
+	Oid			result;
 
 	/* As elsewhere in PG core. */
 	if (OidIsValid(tablespace) && tablespace != MyDatabaseTableSpace)
@@ -2594,7 +2615,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 									  false,
 									  false,
 									  false,
-									  InvalidOid, /* relrewrite */
+									  InvalidOid,	/* relrewrite */
 									  NULL);
 
 	Assert(OidIsValid(result));
@@ -2670,8 +2691,8 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 						LogicalDecodingContext *ctx)
 {
 	StringInfo	ind_name;
-	int	i;
-	Oid	*result;
+	int			i;
+	Oid		   *result;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
 
 	Assert(nindexes > 0);
@@ -2681,26 +2702,30 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 	for (i = 0; i < nindexes; i++)
 	{
-		Oid	ind_oid, ind_oid_new, tbsp_oid;
+		Oid			ind_oid,
+					ind_oid_new,
+					tbsp_oid;
 		Relation	ind;
-		IndexInfo	*ind_info;
-		int	j, heap_col_id;
+		IndexInfo  *ind_info;
+		int			j,
+					heap_col_id;
 #if PG_VERSION_NUM < 120000
 		StringInfo	col_name_buf = NULL;
 #endif
-		List	*colnames;
-		int16	indnatts;
-		Oid	*collations, *opclasses;
+		List	   *colnames;
+		int16		indnatts;
+		Oid		   *collations,
+				   *opclasses;
 		HeapTuple	tup;
-		bool	isnull;
-		Datum	d;
-		oidvector *oidvec;
+		bool		isnull;
+		Datum		d;
+		oidvector  *oidvec;
 		int2vector *int2vec;
-		size_t	oid_arr_size;
-		size_t	int2_arr_size;
-		int16	*indoptions;
-		text	*reloptions = NULL;
-		bits16	flags;
+		size_t		oid_arr_size;
+		size_t		int2_arr_size;
+		int16	   *indoptions;
+		text	   *reloptions = NULL;
+		bits16		flags;
 		XLogRecPtr	end_of_wal;
 
 		ind_oid = indexes_src[i];
@@ -2714,7 +2739,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		tbsp_oid = InvalidOid;
 		for (j = 0; j < tbsp_info->nindexes; j++)
 		{
-			IndexTablespace	*ind_tbsp;
+			IndexTablespace *ind_tbsp;
 
 			ind_tbsp = &tbsp_info->indexes[j];
 			if (ind_tbsp->index == ind_oid)
@@ -2731,11 +2756,11 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 		if (!OidIsValid(tbsp_oid))
 		{
-			bool found = false;
+			bool		found = false;
 
 			for (j = 0; j < cat_state->relninds; j++)
 			{
-				IndexCatInfo	*ind_cat;
+				IndexCatInfo *ind_cat;
 
 				ind_cat = &cat_state->indexes[j];
 				if (ind_cat->oid == ind_oid)
@@ -2775,12 +2800,12 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		collations = (Oid *) palloc(oid_arr_size);
 		for (j = 0; j < indnatts; j++)
 		{
-			char	*colname;
+			char	   *colname;
 
 			heap_col_id = ind->rd_index->indkey.values[j];
 			if (heap_col_id > 0)
 			{
-				Form_pg_attribute	att;
+				Form_pg_attribute att;
 
 				/* Normal attribute. */
 				att = TupleDescAttr(rel_src->rd_att, heap_col_id - 1);
@@ -2790,7 +2815,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 			else if (heap_col_id == 0)
 			{
 				HeapTuple	tuple;
-				Form_pg_attribute	att;
+				Form_pg_attribute att;
 
 				/*
 				 * Expression column is not present in relcache. What we need
@@ -2834,6 +2859,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 			colnames = lappend(colnames, colname);
 		}
+
 		/*
 		 * Special effort needed for variable length attributes of
 		 * Form_pg_index.
@@ -2877,8 +2903,8 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		ind_oid_new = index_create(rel_dst,
 								   ind_name->data,
 								   InvalidOid,
-								   InvalidOid, /* parentIndexRelid */
-								   InvalidOid, /* parentConstraintId */
+								   InvalidOid,	/* parentIndexRelid */
+								   InvalidOid,	/* parentConstraintId */
 								   InvalidOid,
 								   ind_info,
 								   colnames,
@@ -2888,12 +2914,12 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   opclasses,
 								   indoptions,
 								   PointerGetDatum(reloptions),
-								   flags, /* flags */
-								   0,	  /* constr_flags */
-								   false, /* allow_system_table_mods */
-								   false, /* is_internal */
-								   NULL	  /* constraintId */
-);
+								   flags,	/* flags */
+								   0,	/* constr_flags */
+								   false,	/* allow_system_table_mods */
+								   false,	/* is_internal */
+								   NULL /* constraintId */
+			);
 		result[i] = ind_oid_new;
 
 		debug_query_string = NULL;
@@ -2934,9 +2960,10 @@ static ScanKey
 build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 {
 	Relation	ident_idx_rel;
-	Form_pg_index	ident_idx;
-	int	n, i;
-	ScanKey	result;
+	Form_pg_index ident_idx;
+	int			n,
+				i;
+	ScanKey		result;
 
 	Assert(OidIsValid(ident_idx_oid));
 	ident_idx_rel = index_open(ident_idx_oid, AccessShareLock);
@@ -2945,10 +2972,13 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 	result = (ScanKey) palloc(sizeof(ScanKeyData) * n);
 	for (i = 0; i < n; i++)
 	{
-		ScanKey	entry;
-		int16	relattno;
-		Form_pg_attribute	att;
-		Oid	opfamily, opcintype, opno, opcode;
+		ScanKey		entry;
+		int16		relattno;
+		Form_pg_attribute att;
+		Oid			opfamily,
+					opcintype,
+					opno,
+					opcode;
 
 		entry = &result[i];
 		relattno = ident_idx->indkey.values[i];
@@ -3005,12 +3035,13 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 					CatalogState *cat_state,
 					LogicalDecodingContext *ctx)
 {
-	bool	success;
-	XLogRecPtr	xlog_insert_ptr, end_of_wal;
-	int	i;
+	bool		success;
+	XLogRecPtr	xlog_insert_ptr,
+				end_of_wal;
+	int			i;
 	struct timeval t_end;
 	struct timeval *t_end_ptr = NULL;
-	char    dummy_rec_data = '\0';
+	char		dummy_rec_data = '\0';
 
 	/*
 	 * Lock the source table exclusively last time, to finalize the work.
@@ -3049,7 +3080,7 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 
 	if (squeeze_max_xlock_time > 0)
 	{
-		int64 usec;
+		int64		usec;
 		struct timeval t_start;
 
 		gettimeofday(&t_start, NULL);
@@ -3146,11 +3177,11 @@ swap_relation_files(Oid r1, Oid r2)
 {
 	Relation	relRelation;
 	HeapTuple	reltup1,
-		reltup2;
+				reltup2;
 	Form_pg_class relform1,
-		relform2;
+				relform2;
 	Oid			relfilenode1,
-		relfilenode2;
+				relfilenode2;
 	Oid			swaptemp;
 	CatalogIndexState indstate;
 
@@ -3246,7 +3277,7 @@ swap_relation_files(Oid r1, Oid r2)
 	if (relform1->reltoastrelid || relform2->reltoastrelid)
 	{
 		ObjectAddress baseobject,
-			toastobject;
+					toastobject;
 		long		count;
 
 		if (IsSystemClass(r1, relform1))
@@ -3319,8 +3350,8 @@ swap_relation_files(Oid r1, Oid r2)
 static void
 swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 {
-	char	name[NAMEDATALEN];
-	Oid toastidxid;
+	char		name[NAMEDATALEN];
+	Oid			toastidxid;
 
 	/*
 	 * As we haven't changed tuple descriptor, both relation do or both do not
@@ -3357,6 +3388,7 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	 */
 	toastidxid = get_toast_index(toastrelid2);
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
+
 	/*
 	 * Pass is_index=false so that even the index is locked in
 	 * AccessExclusiveLock mode. ShareUpdateExclusiveLock mode (allowing
@@ -3397,8 +3429,8 @@ static Oid
 get_toast_index(Oid toastrelid)
 {
 	Relation	toastrel;
-	List	*toastidxs;
-	Oid	result;
+	List	   *toastidxs;
+	Oid			result;
 
 #if PG_VERSION_NUM >= 120000
 	toastrel = table_open(toastrelid, NoLock);
@@ -3425,15 +3457,17 @@ get_toast_index(Oid toastrelid)
  * have to parse pg_class(reloptions) value at SQL level.
  */
 extern Datum get_heap_fillfactor(PG_FUNCTION_ARGS);
+
 PG_FUNCTION_INFO_V1(get_heap_fillfactor);
 Datum
 get_heap_fillfactor(PG_FUNCTION_ARGS)
 {
-	Oid	relid;
+	Oid			relid;
 	Relation	rel;
-	int	fillfactor;
+	int			fillfactor;
 
 	relid = PG_GETARG_OID(0);
+
 	/*
 	 * XXX Not sure we need stronger lock - there are still occasions for
 	 * others to change the fillfactor (or even drop the relation) after this
@@ -3457,16 +3491,19 @@ get_heap_fillfactor(PG_FUNCTION_ARGS)
  * Return fraction of free space in a relation, as indicated by FSM.
  */
 extern Datum get_heap_freespace(PG_FUNCTION_ARGS);
+
 PG_FUNCTION_INFO_V1(get_heap_freespace);
 Datum
 get_heap_freespace(PG_FUNCTION_ARGS)
 {
-	Oid	relid;
+	Oid			relid;
 	Relation	rel;
-	BlockNumber	blkno, nblocks;
-	Size	free, total;
-	float8	result;
-	bool fsm_exists = true;
+	BlockNumber blkno,
+				nblocks;
+	Size		free,
+				total;
+	float8		result;
+	bool		fsm_exists = true;
 
 	relid = PG_GETARG_OID(0);
 #if PG_VERSION_NUM >= 120000
@@ -3535,9 +3572,9 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	HOLD_INTERRUPTS();
 
 	/*
-	 * There seems to be no automatic cleanup of the origin, so do it
-	 * here. The insertion into the ReplicationOriginRelationId catalog will
-	 * be rolled back due to the transaction abort - either here or, in the
+	 * There seems to be no automatic cleanup of the origin, so do it here.
+	 * The insertion into the ReplicationOriginRelationId catalog will be
+	 * rolled back due to the transaction abort - either here or, in the
 	 * PG_RE_THROW() case, higher in the stack.
 	 */
 	if (replorigin_session_origin != InvalidRepOriginId)

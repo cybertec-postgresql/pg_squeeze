@@ -51,17 +51,17 @@ static bool plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id);
 bool
 process_concurrent_changes(LogicalDecodingContext *ctx,
 						   XLogRecPtr end_of_wal,
-						   CatalogState	*cat_state,
+						   CatalogState *cat_state,
 						   Relation rel_dst, ScanKey ident_key,
 						   int ident_key_nentries, IndexInsertState *iistate,
 						   LOCKMODE lock_held, struct timeval *must_complete)
 {
-	DecodingOutputState	*dstate;
-	bool	done;
+	DecodingOutputState *dstate;
+	bool		done;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 	done = false;
-	while(!done)
+	while (!done)
 	{
 		CHECK_FOR_INTERRUPTS();
 
@@ -100,8 +100,8 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 						  XLogRecPtr end_of_wal,
 						  struct timeval *must_complete)
 {
-	DecodingOutputState	*dstate;
-	ResourceOwner	resowner_old;
+	DecodingOutputState *dstate;
+	ResourceOwner resowner_old;
 
 	/*
 	 * Invalidate the "present" cache before moving to "(recent) history".
@@ -187,13 +187,13 @@ static void
 apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						 ScanKey key, int nkeys, IndexInsertState *iistate)
 {
-	TupleTableSlot	*slot;
+	TupleTableSlot *slot;
 #if PG_VERSION_NUM >= 120000
-	TupleTableSlot	*ind_slot;
+	TupleTableSlot *ind_slot;
 #endif
 	Form_pg_index ident_form;
-	int2vector	*ident_indkey;
-	HeapTuple tup_old = NULL;
+	int2vector *ident_indkey;
+	HeapTuple	tup_old = NULL;
 	BulkInsertState bistate = NULL;
 
 	if (dstate->nchanges == 0)
@@ -226,13 +226,15 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 								   dstate->tsslot))
 	{
 #if PG_VERSION_NUM >= 120000
-		bool	shouldFree;
+		bool		shouldFree;
 #endif
-		HeapTuple tup_change, tup, tup_exist;
-		char	*change_raw;
-		ConcurrentChange	*change;
-		bool	isnull[1];
-		Datum	values[1];
+		HeapTuple	tup_change,
+					tup,
+					tup_exist;
+		char	   *change_raw;
+		ConcurrentChange *change;
+		bool		isnull[1];
+		Datum		values[1];
 
 		/* Get the change from the single-column tuple. */
 #if PG_VERSION_NUM >= 120000
@@ -267,7 +269,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		}
 		else if (change->kind == PG_SQUEEZE_CHANGE_INSERT)
 		{
-			List	*recheck;
+			List	   *recheck;
 
 			Assert(tup_old == NULL);
 
@@ -296,14 +298,14 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #endif
 											iistate->estate,
 #if PG_VERSION_NUM >= 140000
-											false, /* update */
+											false,	/* update */
 #endif
-											false, /* noDupErr */
-											NULL,  /* specConflict */
-											NIL	   /* arbiterIndexes */
+											false,	/* noDupErr */
+											NULL,	/* specConflict */
+											NIL /* arbiterIndexes */
 #if PG_VERSION_NUM >= 160000
 											,
-											false/* onlySummarizing */
+											false	/* onlySummarizing */
 #endif
 				);
 
@@ -325,9 +327,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 				 change->kind == PG_SQUEEZE_CHANGE_DELETE)
 		{
 			HeapTuple	tup_key;
-			IndexScanDesc	scan;
-			int i;
-			ItemPointerData	ctid;
+			IndexScanDesc scan;
+			int			i;
+			ItemPointerData ctid;
 
 			if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW)
 			{
@@ -356,9 +358,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			/* Use the incoming tuple to finalize the scan key. */
 			for (i = 0; i < scan->numberOfKeys; i++)
 			{
-				ScanKey	entry;
-				bool	isnull;
-				int16	attno_heap;
+				ScanKey		entry;
+				bool		isnull;
+				int16		attno_heap;
 
 				entry = &scan->keyData[i];
 				attno_heap = ident_indkey->values[i];
@@ -371,7 +373,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #if PG_VERSION_NUM >= 120000
 			if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
 			{
-				bool	shouldFreeInd;
+				bool		shouldFreeInd;
 
 				tup_exist = ExecFetchSlotHeapTuple(ind_slot, false,
 												   &shouldFreeInd);
@@ -399,10 +401,10 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 								   ,
 								   &update_indexes
 #endif
-);
+					);
 				if (!HeapTupleIsHeapOnly(tup))
 				{
-					List	*recheck;
+					List	   *recheck;
 
 #if PG_VERSION_NUM >= 120000
 					ExecStoreHeapTuple(tup, slot, false);
@@ -425,14 +427,14 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #endif
 													iistate->estate,
 #if PG_VERSION_NUM >= 140000
-													false, /* update */
+													false,	/* update */
 #endif
-													false, /* noDupErr */
-													NULL,  /* specConflict */
-													NIL	   /* arbiterIndexes */
+													false,	/* noDupErr */
+													NULL,	/* specConflict */
+													NIL /* arbiterIndexes */
 #if PG_VERSION_NUM >= 160000
 													,
-													/* onlySummarizing */
+					/* onlySummarizing */
 													(update_indexes == TU_Summarizing)
 #endif
 						);
@@ -496,7 +498,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 static bool
 processing_time_elapsed(struct timeval *utmost)
 {
-	struct timeval	now;
+	struct timeval now;
 
 	if (utmost == NULL)
 		return false;
@@ -513,18 +515,18 @@ processing_time_elapsed(struct timeval *utmost)
 }
 
 IndexInsertState *
-get_index_insert_state(Relation	relation, Oid ident_index_id)
+get_index_insert_state(Relation relation, Oid ident_index_id)
 {
-	EState	*estate;
-	int	i;
-	IndexInsertState	*result;
+	EState	   *estate;
+	int			i;
+	IndexInsertState *result;
 
 	result = (IndexInsertState *) palloc0(sizeof(IndexInsertState));
 	estate = CreateExecutorState();
 	result->econtext = GetPerTupleExprContext(estate);
 
 	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
-	InitResultRelInfo(result->rri, relation,  0, 0, 0);
+	InitResultRelInfo(result->rri, relation, 0, 0, 0);
 	ExecOpenIndices(result->rri, false);
 
 	/*
@@ -616,7 +618,7 @@ plugin_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 /* COMMIT callback */
 static void
 plugin_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-					 XLogRecPtr commit_lsn)
+				  XLogRecPtr commit_lsn)
 {
 }
 
@@ -625,9 +627,9 @@ plugin_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
  */
 static void
 plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-				 Relation relation, ReorderBufferChange *change)
+			  Relation relation, ReorderBufferChange *change)
 {
-	DecodingOutputState	*dstate;
+	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
@@ -657,7 +659,8 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			{
-				HeapTuple oldtuple, newtuple;
+				HeapTuple	oldtuple,
+							newtuple;
 
 				oldtuple = change->data.tp.oldtuple != NULL ?
 					&change->data.tp.oldtuple->tuple : NULL;
@@ -675,7 +678,7 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			{
-				HeapTuple oldtuple;
+				HeapTuple	oldtuple;
 
 				oldtuple = change->data.tp.oldtuple ?
 					&change->data.tp.oldtuple->tuple : NULL;
@@ -698,15 +701,15 @@ static void
 store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 			 HeapTuple tuple)
 {
-	DecodingOutputState	*dstate;
-	char	*change_raw;
-	ConcurrentChange	*change;
-	MemoryContext	oldcontext;
-	bool	flattened = false;
-	Size	size;
-	Datum	values[1];
-	bool	isnull[1];
-	char	*dst;
+	DecodingOutputState *dstate;
+	char	   *change_raw;
+	ConcurrentChange *change;
+	MemoryContext oldcontext;
+	bool		flattened = false;
+	Size		size;
+	Datum		values[1];
+	bool		isnull[1];
+	char	   *dst;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
@@ -774,9 +777,9 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 static HeapTuple
 get_changed_tuple(ConcurrentChange *change)
 {
-	HeapTupleData	tup_data;
+	HeapTupleData tup_data;
 	HeapTuple	result;
-	char	*src;
+	char	   *src;
 
 	/*
 	 * Ensure alignment before accessing the fields. (This is why we can't use
@@ -799,7 +802,7 @@ get_changed_tuple(ConcurrentChange *change)
 static bool
 plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id)
 {
-	DecodingOutputState	*dstate;
+	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 

@@ -44,7 +44,7 @@ typedef enum
 typedef struct ConcurrentChange
 {
 	/* See the enum above. */
-	ConcurrentChangeKind	kind;
+	ConcurrentChangeKind kind;
 
 	/*
 	 * The actual tuple.
@@ -53,13 +53,13 @@ typedef struct ConcurrentChange
 	 * sure the tuple is correctly aligned (ConcurrentChange can be stored as
 	 * bytea) and that tuple->t_data is fixed.
 	 */
-	HeapTupleData	tup_data;
+	HeapTupleData tup_data;
 } ConcurrentChange;
 
 typedef struct DecodingOutputState
 {
 	/* The relation whose changes we're decoding. */
-	Oid	relid;
+	Oid			relid;
 
 	/*
 	 * Decoded changes are stored here. Although we try to avoid excessive
@@ -69,15 +69,15 @@ typedef struct DecodingOutputState
 	Tuplestorestate *tstore;
 
 	/* The current number of changes in tstore. */
-	double	nchanges;
+	double		nchanges;
 
 	/*
-	 * Descriptor to store the ConcurrentChange structure serialized
-	 * (bytea). We can't store the tuple directly because tuplestore only
-	 * supports minimum tuple and we may need to transfer OID system column
-	 * from the output plugin. Also we need to transfer the change kind, so
-	 * it's better to put everything in the structure than to use 2
-	 * tuplestores "in parallel".
+	 * Descriptor to store the ConcurrentChange structure serialized (bytea).
+	 * We can't store the tuple directly because tuplestore only supports
+	 * minimum tuple and we may need to transfer OID system column from the
+	 * output plugin. Also we need to transfer the change kind, so it's better
+	 * to put everything in the structure than to use 2 tuplestores "in
+	 * parallel".
 	 */
 	TupleDesc	tupdesc_change;
 
@@ -85,28 +85,28 @@ typedef struct DecodingOutputState
 	TupleDesc	tupdesc;
 
 	/* Slot to retrieve data from tstore. */
-	TupleTableSlot	*tsslot;
+	TupleTableSlot *tsslot;
 
 	/*
 	 * WAL records having this origin have been created by the initial load
 	 * and should not be decoded.
 	 */
-	RepOriginId		rorigin;
+	RepOriginId rorigin;
 
-	ResourceOwner	resowner;
+	ResourceOwner resowner;
 } DecodingOutputState;
 
 /* The WAL segment being decoded. */
-extern	XLogSegNo	squeeze_current_segment;
+extern XLogSegNo squeeze_current_segment;
 
-extern void	_PG_init(void);
+extern void _PG_init(void);
 
 /* Everything we need to call ExecInsertIndexTuples(). */
 typedef struct IndexInsertState
 {
-	ResultRelInfo	*rri;
-	EState	*estate;
-	ExprContext	*econtext;
+	ResultRelInfo *rri;
+	EState	   *estate;
+	ExprContext *econtext;
 
 	Relation	ident_index;
 } IndexInsertState;
@@ -119,15 +119,15 @@ typedef struct IndexInsertState
 typedef struct PgClassCatInfo
 {
 	/* pg_class(oid) */
-	Oid	relid;
+	Oid			relid;
 
 	/*
 	 * pg_class(xmin)
 	 */
-	TransactionId	xmin;
+	TransactionId xmin;
 
 	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
-	TransactionId	*attr_xmins;
+	TransactionId *attr_xmins;
 	int16		relnatts;
 } PgClassCatInfo;
 
@@ -139,12 +139,12 @@ typedef struct PgClassCatInfo
  */
 typedef struct IndexCatInfo
 {
-	Oid	oid;					/* pg_index(indexrelid) */
+	Oid			oid;			/* pg_index(indexrelid) */
 	NameData	relname;		/* pg_class(relname) */
-	Oid	reltablespace;			/* pg_class(reltablespace) */
-	TransactionId		xmin;	/* pg_index(xmin) */
-	TransactionId		pg_class_xmin; /* pg_class(xmin) of the index (not the
-										* parent relation) */
+	Oid			reltablespace;	/* pg_class(reltablespace) */
+	TransactionId xmin;			/* pg_index(xmin) */
+	TransactionId pg_class_xmin;	/* pg_class(xmin) of the index (not the
+									 * parent relation) */
 } IndexCatInfo;
 
 /*
@@ -153,13 +153,13 @@ typedef struct IndexCatInfo
  */
 typedef struct TypeCatInfo
 {
-	Oid	oid;					/* pg_type(oid) */
-	TransactionId	xmin;		/* pg_type(xmin) */
+	Oid			oid;			/* pg_type(oid) */
+	TransactionId xmin;			/* pg_type(xmin) */
 
 	/*
 	 * The pg_class entry whose oid == pg_type(typrelid) of this type.
 	 */
-	PgClassCatInfo	rel;
+	PgClassCatInfo rel;
 } TypeCatInfo;
 
 /*
@@ -170,33 +170,33 @@ typedef struct TypeCatInfo
 typedef struct CatalogState
 {
 	/* The relation whose changes we'll check for. */
-	PgClassCatInfo	rel;
+	PgClassCatInfo rel;
 
 	/* Copy of pg_class tuple of the source relation. */
-	Form_pg_class	form_class;
+	Form_pg_class form_class;
 
 	/* Copy of pg_class tuple descriptor of the source relation. */
 	TupleDesc	desc_class;
 
 	/* Per-index info. */
-	int		relninds;
-	IndexCatInfo	*indexes;
+	int			relninds;
+	IndexCatInfo *indexes;
 
 	/* Composite types used by the source rel attributes. */
-	TypeCatInfo		*comptypes;
+	TypeCatInfo *comptypes;
 	/* Size of the array. */
-	int		ncomptypes_max;
+	int			ncomptypes_max;
 	/* Used elements of the array. */
-	int		ncomptypes;
+	int			ncomptypes;
 
 	/*
 	 * Does at least one index have wrong value of indisvalid, indisready or
 	 * indislive?
 	 */
-	bool	invalid_index;
+	bool		invalid_index;
 
 	/* Does the table have primary key index? */
-	bool	have_pk_index;
+	bool		have_pk_index;
 } CatalogState;
 
 extern void check_catalog_changes(CatalogState *state, LOCKMODE lock_held);
@@ -206,7 +206,7 @@ extern IndexInsertState *get_index_insert_state(Relation relation,
 extern void free_index_insert_state(IndexInsertState *iistate);
 extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 									   XLogRecPtr end_of_wal,
-									   CatalogState	*cat_state,
+									   CatalogState *cat_state,
 									   Relation rel_dst, ScanKey ident_key,
 									   int ident_key_nentries,
 									   IndexInsertState *iistate,
@@ -215,14 +215,14 @@ extern bool process_concurrent_changes(LogicalDecodingContext *ctx,
 extern bool decode_concurrent_changes(LogicalDecodingContext *ctx,
 									  XLogRecPtr end_of_wal,
 									  struct timeval *must_complete);
-extern void	_PG_output_plugin_init(OutputPluginCallbacks *cb);
+extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
 
 #if PG_VERSION_NUM >= 150000
 extern shmem_request_hook_type prev_shmem_request_hook;
 #endif
 extern shmem_startup_hook_type prev_shmem_startup_hook;
 
-extern int squeeze_workers_per_database;
+extern int	squeeze_workers_per_database;
 
 /*
  * Connection information the squeeze worker needs to connect to database if
@@ -236,9 +236,9 @@ extern int squeeze_workers_per_database;
  */
 typedef struct WorkerConInit
 {
-	char	*dbname;
-	char	*rolename;
-	bool	scheduler;
+	char	   *dbname;
+	char	   *rolename;
+	bool		scheduler;
 } WorkerConInit;
 
 /*
@@ -250,29 +250,29 @@ typedef struct WorkerConInit
  */
 typedef struct WorkerConInteractive
 {
-	Oid	dbid;
-	Oid	roleid;
-	bool	scheduler;
+	Oid			dbid;
+	Oid			roleid;
+	bool		scheduler;
 } WorkerConInteractive;
 
 /* Progress tracking. */
 typedef struct WorkerProgress
 {
-	slock_t	mutex;
+	slock_t		mutex;
 
 	/* Tuples inserted during the initial load. */
-	int64	ins_initial;
+	int64		ins_initial;
 
 	/*
-	 * Tuples inserted, updated and deleted after the initial load
-	 * (i.e. during the catch-up phase).
+	 * Tuples inserted, updated and deleted after the initial load (i.e.
+	 * during the catch-up phase).
 	 */
-	int64	ins;
-	int64	upd;
-	int64	del;
+	int64		ins;
+	int64		upd;
+	int64		del;
 } WorkerProgress;
 
-extern WorkerProgress	*MyWorkerProgress;
+extern WorkerProgress *MyWorkerProgress;
 
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
 											   char *rolename,
@@ -288,7 +288,7 @@ extern void squeeze_worker_shmem_startup(void);
 extern PGDLLEXPORT void squeeze_worker_main(Datum main_arg);
 
 extern bool squeeze_table_impl(Name relschema, Name relname, Name indname,
-							   Name tbspname, ArrayType	*ind_tbsp,
+							   Name tbspname, ArrayType *ind_tbsp,
 							   ErrorData **edata_p, MemoryContext edata_cxt);
 extern void squeeze_handle_error_db(ErrorData **edata_p,
 									MemoryContext edata_cxt);
