@@ -1,0 +1,12 @@
+pg-squeeze (1.6.0-1) UNRELEASED; urgency=medium
+
+  * 
+
+ -- Christoph Berg <myon@debian.org>  Wed, 16 Aug 2023 15:37:36 +0200
+
+pg-squeeze (1.5.2-1) unstable; urgency=medium
+
+  [ Ivan Kovmir ]
+  * Initial release.
+
+ -- Christoph Berg <myon@debian.org>  Wed, 16 Aug 2023 12:32:36 +0000
