@@ -1,5 +1,6 @@
 pg-squeeze (1.5.2-1) unstable; urgency=medium
 
+  [ Ivan Kovmir ]
   * Initial release.
 
- -- Ivan Kovmir <ivan.kovrmir@cybertec.at>  Mon, 03 Jul 2023 05:44:52 +0200
+ -- Christoph Berg <myon@debian.org>  Wed, 16 Aug 2023 12:32:36 +0000

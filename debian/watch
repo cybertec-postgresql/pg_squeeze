@@ -1,2 +1,3 @@
 version=4
-https://www.cybertec-postgresql.com/en//tags .*/(.*).tar.gz
+opts=uversionmangle=s/_/./g \
+https://github.com/cybertec-postgresql/pg_squeeze/tags .*/(?:REL)?(.*).tar.gz

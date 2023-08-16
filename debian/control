@@ -1,7 +1,7 @@
 Source: pg-squeeze
 Section: database
 Priority: optional
-Maintainer: CYBERTEC PostgreSQL <office@cybertec.at>
+Maintainer: Debian PostgreSQL Maintainers <team+postgresql@tracker.debian.org>
 Uploaders:
  Christoph Berg <myon@debian.org>,
 Build-Depends:
@@ -9,7 +9,7 @@ Build-Depends:
  postgresql-all (>= 217~),
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
-Homepage: https://www.cybertec-postgresql.com/en/
+Homepage: https://www.cybertec-postgresql.com/products/pg_squeeze/
 Vcs-Browser: https://github.com/cybertec-postgresql/pg_squeeze
 Vcs-Git: https://github.com/cybertec-postgresql/pg_squeeze.git
 
@@ -19,7 +19,7 @@ Depends:
  ${misc:Depends},
  ${postgresql:Depends},
  ${shlibs:Depends},
-Description: Remove unused space from a table and sorts tuples
- PostgreSQL extension that removes unused space from a table and optionally
- sorts tuples according to particular index (as if CLUSTER command was executed
- concurrently with regular reads / writes).
+Description: PostgreSQL extension for automatic bloat cleanup
+ The pg_squeeze PostgreSQL extension removes unused space from a table and
+ optionally sorts tuples according to particular index, as if the CLUSTER
+ command was executed concurrently with regular reads/writes.

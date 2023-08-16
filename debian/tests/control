@@ -3,3 +3,10 @@ Depends:
  @,
 Tests: installcheck
 Restrictions: allow-stderr
+
+Depends:
+ python3-psycopg,
+ @,
+Tests: concurrency
+Restrictions: allow-stderr, skip-not-installable
+# python3-psycopg not available before bookworm/lunar
