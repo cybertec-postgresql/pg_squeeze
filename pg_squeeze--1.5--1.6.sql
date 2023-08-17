@@ -20,7 +20,7 @@ AS 'MODULE_PATHNAME', 'squeeze_stop_worker'
 LANGUAGE C;
 
 CREATE FUNCTION squeeze_table(
-       tabchema		name,
+       tabschema	name,
        tabname		name,
        clustering_index name,
        rel_tablespace 	name,
