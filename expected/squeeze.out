@@ -2,7 +2,7 @@ CREATE EXTENSION pg_squeeze;
 SELECT squeeze.start_worker();
  start_worker 
 --------------
-            0
+ 
 (1 row)
 
 CREATE TABLE a(i int PRIMARY KEY, j int);
