@@ -332,6 +332,22 @@ _PG_init(void)
 #define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u"
 
 /*
+ * The original implementation would certainly fail on PG 16 and higher, due
+ * to the commit 240e0dbacd (in the master branch). It's not worth supporting
+ * lower versions of pg_squeeze on lower versions of PG server.
+ */
+extern Datum squeeze_table(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(squeeze_table);
+Datum
+squeeze_table(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errmsg("the old implementation of the function is no longer supported"),
+					errhint("please run \"ALTER EXTENSION pg_squeeze UPDATE\"")));
+
+	PG_RETURN_VOID();
+}
+
+/*
  * Introduced in pg_squeeze 1.6, to be called directly as opposed to calling
  * via the postgres executor.
  *

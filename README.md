@@ -340,7 +340,7 @@ make install
 pg_ctl -D /path/to/cluster start # Start the cluster.
 ```
 
-Connect to each database containing `pg_squeeze` 1.2.x and run this command:
+Connect to each database containing `pg_squeeze` and run this command:
 
 ```
 ALTER EXTENSION pg_squeeze UPDATE;
