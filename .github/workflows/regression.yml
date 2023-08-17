@@ -13,9 +13,12 @@ jobs:
     strategy:
       matrix:
         pgversion:
+          - 16
           - 15
           - 14
           - 13
+          - 12
+          - 11
 
     env:
       PGVERSION: ${{ matrix.pgversion }}
@@ -38,7 +41,6 @@ jobs:
       run: |
         sudo pg_conftool set shared_preload_libraries pg_squeeze
         sudo pg_conftool set wal_level logical
-        sudo pg_conftool set max_replication_slots 1
         sudo pg_ctlcluster $PGVERSION main restart
         make installcheck
 

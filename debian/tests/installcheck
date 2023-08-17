@@ -1,0 +1,6 @@
+#!/bin/sh
+
+pg_buildext \
+	-o 'shared_preload_libraries=pg_squeeze' \
+	-o 'wal_level=logical' \
+	installcheck
