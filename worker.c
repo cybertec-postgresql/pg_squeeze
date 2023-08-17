@@ -1161,8 +1161,6 @@ LIMIT %d", TASK_BATCH_SIZE);
 		RangeVar   *relrv;
 		Relation	rel;
 		Oid			relid;
-		Name		cl_index = NULL;
-		Name		rel_tbsp = NULL;
 		int			j;
 		bool		found;
 		ErrorData  *edata;
@@ -1170,6 +1168,9 @@ LIMIT %d", TASK_BATCH_SIZE);
 		ereport(DEBUG1,
 				(errmsg("task for table %s.%s is ready for processing",
 						NameStr(td->relschema), NameStr(td->relname))));
+
+		cl_index = NULL;
+		rel_tbsp = NULL;
 
 		/* Check if another worker is already processing this table. */
 		StartTransactionCommand();
