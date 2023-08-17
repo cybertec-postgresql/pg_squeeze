@@ -22,9 +22,9 @@ LANGUAGE C;
 CREATE FUNCTION squeeze_table(
        tabschema	name,
        tabname		name,
-       clustering_index name,
-       rel_tablespace 	name,
-       ind_tablespaces	name[][])
+       clustering_index name		DEFAULT NULL,
+       rel_tablespace 	name		DEFAULT NULL,
+       ind_tablespaces	name[][]	DEFAULT NULL)
 RETURNS void
 AS 'MODULE_PATHNAME', 'squeeze_table_new'
 LANGUAGE C;

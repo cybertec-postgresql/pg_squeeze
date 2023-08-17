@@ -136,7 +136,7 @@ class SqueezeThread(Thread):
             ind = "'%s'" % params.index if params.index else "NULL"
             self.cur.execute("SET maintenance_work_mem='1MB'")
             self.cur.execute(
-                "SELECT squeeze.squeeze_table('public', '%s', %s, null, null)" %
+                "SELECT squeeze.squeeze_table('public', '%s', %s)" %
                 (params.table, ind,))
             self.cur.execute("SELECT count(*) FROM squeeze.errors")
             row = self.cur.fetchone()

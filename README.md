@@ -194,7 +194,7 @@ squeeze.squeeze_table(
 Sample execution:
 
 ```
-SELECT squeeze.squeeze_table('public', 'pgbench_accounts', null, null, null);
+SELECT squeeze.squeeze_table('public', 'pgbench_accounts');
 ```
 
 Please note that:
