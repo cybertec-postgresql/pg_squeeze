@@ -290,7 +290,7 @@ static void scheduler_worker_loop(void);
 static void squeeze_worker_loop(void);
 static void process_tasks(MemoryContext task_cxt);
 
-static void run_command(char *command, int rc);
+static uint64 run_command(char *command, int rc);
 
 /*
  * The function name is ..._worker instead of ..._workers for historic reasons
@@ -843,6 +843,7 @@ scheduler_worker_loop(void)
 	while (!got_sigterm)
 	{
 		int			rc;
+		uint64		found;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -856,11 +857,20 @@ scheduler_worker_loop(void)
 
 		run_command("SELECT squeeze.check_schedule()", SPI_OK_SELECT);
 
+		found = run_command("SELECT * FROM squeeze.tasks WHERE state <> 'processed' LIMIT 1",
+							SPI_OK_SELECT);
+
 		/*
-		 * If worker is idle, there's no reason to let it wait until its
-		 * naptime is over.
+		 * If there is work to do and the worker is idle, there's no reason to
+		 * let it wait until its naptime is over.
 		 */
-		wake_up_squeeze_workers();
+		if (found > 0)
+		{
+			ereport(DEBUG1, (errmsg("scheduler worker: at least one task found")));
+			wake_up_squeeze_workers();
+		}
+		else
+			ereport(DEBUG1, (errmsg("scheduler worker: no task found")));
 
 		/* Check later if any table meets the schedule. */
 		delay = worker_naptime * 1000L;
@@ -1457,11 +1467,16 @@ reset_progress(WorkerProgress *progress)
 
 /*
  * Run an SQL command that does not return any value.
+ *
+ * 'rc' is the expected return code.
+ *
+ * The return value tells how many tuples are returned by the query.
  */
-static void
+static uint64
 run_command(char *command, int rc)
 {
 	int			ret;
+	uint64		ntup = 0;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -1473,12 +1488,23 @@ run_command(char *command, int rc)
 	if (ret != rc)
 		elog(ERROR, "command failed: %s", command);
 
+	if (rc == SPI_OK_SELECT || rc == SPI_OK_INSERT_RETURNING ||
+		rc == SPI_OK_DELETE_RETURNING || rc == SPI_OK_UPDATE_RETURNING)
+	{
+#if PG_VERSION_NUM >= 130000
+		ntup = SPI_tuptable->numvals;
+#else
+		ntup = SPI_processed;
+#endif
+	}
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	pgstat_report_stat(false);
 	pgstat_report_activity(STATE_IDLE, NULL);
+
+	return ntup;
 }
 
 static void
