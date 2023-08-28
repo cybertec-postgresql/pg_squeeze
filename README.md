@@ -197,15 +197,9 @@ Sample execution:
 SELECT squeeze.squeeze_table('public', 'pgbench_accounts');
 ```
 
-Please note that:
-
-1. The function does not throw errors. It just inserts a record either into
-   `squeeze.log` or `squeeze.errors`, depending on whether it succeeded or
-   failed.
-
-3. The function hangs if no squeeze worker is running on the current database
-   or if no worker is available for the table being passed to the function.
-
+Please note that the function does not throw errors. It just inserts a record
+either into `squeeze.log` or `squeeze.errors`, depending on whether it
+succeeded or failed.
 
 # Enable / disable table processing
 

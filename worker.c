@@ -344,7 +344,12 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-static void
+/*
+ * Wake up all the squeeze workers for given database.
+ *
+ * The return value tells whether at least one worker was sent the signal.
+ */
+static bool
 wake_up_squeeze_workers(void)
 {
 	int			i;
@@ -390,6 +395,7 @@ wake_up_squeeze_workers(void)
 			CommitTransactionCommand();
 	}
 
+	return found;
 }
 
 /*
@@ -412,6 +418,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	WorkerTask *task;
 	uint32		next_task_idx;
 	int			task_id;
+	bool		found;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -480,7 +487,9 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	task_id = task->id;
 	LWLockRelease(task->lock);
 
-	wake_up_squeeze_workers();
+	found = wake_up_squeeze_workers();
+	if (!found)
+		start_worker_internal(false);
 
 	/*
 	 * Wait for the task to complete (again, no busy loop like above.)
