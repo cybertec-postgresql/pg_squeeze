@@ -4,10 +4,12 @@ Release 1.6.0
 New features
 ------------
 
-1. Allow processing of multiple tables at a time, even if the are in the same
+1. Make the code compatible with PostgreSQL server version 16.
+
+2. Allow processing of multiple tables at a time, even if the are in the same
    database.
 
-2. Enhanced monitoring - see the squeeze.get_active_workers() function as well
+3. Enhanced monitoring - see the squeeze.get_active_workers() function as well
    as the new columns of the squeeze.log table.
 
 Bug fixes
