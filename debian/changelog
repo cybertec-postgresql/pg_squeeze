@@ -1,6 +1,6 @@
 pg-squeeze (1.6.0-1) UNRELEASED; urgency=medium
 
-  * 
+  * debian/tests/concurrency: Use correct port.
 
  -- Christoph Berg <myon@debian.org>  Wed, 16 Aug 2023 15:37:36 +0200
 

@@ -10,5 +10,5 @@ pg_buildext \
 	virtualenv << EOF
 		set -eux
 		psql -c 'create extension pg_squeeze'
-		test/concurrency --user $USER
+		test/concurrency --user $USER --host \$PGHOST --port \$PGPORT
 EOF
