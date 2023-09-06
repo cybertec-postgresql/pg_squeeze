@@ -694,6 +694,9 @@ squeeze_worker_main(Datum main_arg)
 	bool		found;
 	int			nworkers;
 
+	/* The worker should do its cleanup when exiting. */
+	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
+
 	pqsignal(SIGHUP, worker_sighup);
 	pqsignal(SIGTERM, worker_sigterm);
 	BackgroundWorkerUnblockSignals();
@@ -721,9 +724,6 @@ squeeze_worker_main(Datum main_arg)
 		am_i_scheduler = con.scheduler;
 		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid, 0);
 	}
-
-	/* The worker should do its cleanup when exiting. */
-	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
 
 	/*
 	 * Make sure that there is no more than one scheduler and no more than
