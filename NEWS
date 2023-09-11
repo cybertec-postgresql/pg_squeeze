@@ -1,3 +1,15 @@
+Release 1.6.1
+=============
+
+Bug fixes
+---------
+
+1. Pass function argument as Datum rather than the "raw" timestamp.
+
+The bug can cause crash on platforms where timestamp is passed by reference
+(which usually means the 32-bit systems).
+
+
 Release 1.6.0
 =============
 
