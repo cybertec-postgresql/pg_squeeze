@@ -1314,7 +1314,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 			StartTransactionCommand();
 			getTypeOutputInfo(TIMESTAMPTZOID, &outfunc, &isvarlena);
 			fmgr_info(outfunc, &fmgrinfo);
-			start_ts_str = OutputFunctionCall(&fmgrinfo, start_ts);
+			start_ts_str = OutputFunctionCall(&fmgrinfo, TimestampTzGetDatum(start_ts));
 			/* Make sure the string survives TopTransactionContext. */
 			MemoryContextSwitchTo(task_cxt);
 			start_ts_str = pstrdup(start_ts_str);
