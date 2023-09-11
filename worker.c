@@ -1277,7 +1277,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 		/* Perform the actual work. */
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
-		start_ts = GetCurrentTimestamp();
+		start_ts = GetCurrentStatementStartTimestamp();
 		success = squeeze_table_impl(&td->relschema, &td->relname, cl_index,
 									 rel_tbsp, td->ind_tbsps, &edata, task_cxt);
 
