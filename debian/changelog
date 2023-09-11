@@ -1,9 +1,9 @@
-pg-squeeze (1.6.0-1) unstable; urgency=medium
+pg-squeeze (1.6.1-1) unstable; urgency=medium
 
   * New upstream version with PG16 support.
   * debian/tests/concurrency: Use correct port.
 
- -- Christoph Berg <myon@debian.org>  Mon, 11 Sep 2023 14:52:02 +0200
+ -- Christoph Berg <myon@debian.org>  Mon, 11 Sep 2023 16:29:53 +0200
 
 pg-squeeze (1.5.2-1) unstable; urgency=medium
 
