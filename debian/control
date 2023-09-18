@@ -13,7 +13,7 @@ Homepage: https://www.cybertec-postgresql.com/products/pg_squeeze/
 Vcs-Browser: https://github.com/cybertec-postgresql/pg_squeeze
 Vcs-Git: https://github.com/cybertec-postgresql/pg_squeeze.git
 
-Package: postgresql-15-squeeze
+Package: postgresql-16-squeeze
 Architecture: any
 Depends:
  ${misc:Depends},
