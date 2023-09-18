@@ -1,7 +1,5 @@
 CREATE EXTENSION pg_squeeze;
 
-SELECT squeeze.start_worker();
-
 CREATE TABLE a(i int PRIMARY KEY, j int);
 
 INSERT INTO a(i, j)
@@ -34,4 +32,9 @@ SELECT b.t = b_copy.t
 FROM   b, b_copy
 WHERE  b.i = b_copy.i;
 
+-- Although squeeze_table() makes sure that the worker is started, it should
+-- stop it because that would break the automatic processing of scheduled
+-- tables. However we should stop the worker during tests, otherwise a
+-- repeated test won't be able to drop the "contrib_regression" database, and
+-- thus will fail.
 SELECT squeeze.stop_worker();
