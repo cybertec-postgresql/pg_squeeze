@@ -1,3 +1,9 @@
+pg-squeeze (1.6.2-1) unstable; urgency=medium
+
+  * New upstream version.
+
+ -- Christoph Berg <myon@debian.org>  Mon, 18 Sep 2023 21:55:01 +0200
+
 pg-squeeze (1.6.1-2) unstable; urgency=medium
 
   * Upload for PostgreSQL 16.
