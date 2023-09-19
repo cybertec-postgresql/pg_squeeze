@@ -253,6 +253,8 @@ typedef struct WorkerConInteractive
 	Oid			dbid;
 	Oid			roleid;
 	bool		scheduler;
+
+	int			task_id;
 } WorkerConInteractive;
 
 /* Progress tracking. */
@@ -272,6 +274,58 @@ typedef struct WorkerProgress
 	int64		del;
 } WorkerProgress;
 
+/*
+ * Shared memory structures to keep track of the status of squeeze workers.
+ */
+typedef struct WorkerSlot
+{
+	Oid			dbid;			/* database the worker is connected to */
+	Oid			relid;			/* relation the worker is working on */
+	int			pid;			/* the PID */
+	bool		scheduler;		/* true if scheduler, false if the "squeeze
+								 * worker" */
+	WorkerProgress progress;	/* progress tracking information */
+	Latch	   *latch;			/* use this to wake up the worker */
+} WorkerSlot;
+
+/*
+ * This structure represents a task assigned to the worker via shared memory.
+ */
+typedef struct WorkerTask
+{
+	/* Backend that assigned the task both sets and clears this field. */
+	bool		assigned;
+	/* See the comments of exit_if_requested(). */
+	bool	exit_requested;
+	/* Worker that performs the task both sets and clears this field. */
+	WorkerSlot	*slot;
+
+	/*
+	 * Use this when setting / clearing the fields above. Once "assigned" is
+	 * set, the task belongs to the backend that set it, so the other fields
+	 * may be assigned w/o the lock.
+	 */
+	slock_t		mutex;
+
+	NameData	relschema;
+	NameData	relname;
+	NameData	indname;		/* clustering index */
+	NameData	tbspname;		/* destination tablespace */
+
+	/*
+	 * index destination tablespaces.
+	 *
+	 * text[][] array is stored here. The space should only be used by the
+	 * interactive squeeze_table() function, which is only there for testing
+	 * and troubleshooting purposes. If the array doesn't fit here, the user
+	 * needs to use the regular UI (ie register the table for squeezing and
+	 * insert a record into the "tasks" table).
+	 */
+#define IND_TABLESPACES_ARRAY_SIZE	1024
+	char		ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
+} WorkerTask;
+
+extern WorkerTask *MyWorkerTask;
 extern WorkerProgress *MyWorkerProgress;
 
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
@@ -287,6 +341,7 @@ extern void squeeze_worker_shmem_startup(void);
 
 extern PGDLLEXPORT void squeeze_worker_main(Datum main_arg);
 
+extern void exit_if_requested(void);
 extern bool squeeze_table_impl(Name relschema, Name relname, Name indname,
 							   Name tbspname, ArrayType *ind_tbsp,
 							   ErrorData **edata_p, MemoryContext edata_cxt);

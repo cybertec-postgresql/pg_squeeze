@@ -210,16 +210,15 @@ SELECT squeeze.start_worker();
 ```
 
 The function starts a background worker (`scheduler worker`) that periodically
-checks which of the registered tables should be checked according to its
-schedule, and creates new tasks for them. Another worker (`squeeze worker`) is
-also launched that processes those tasks - note that the processing includes
-check whether the table is bloated enough.
+checks which of the registered tables should be checked for bloat, and creates
+a task for each. Another worker (`squeeze worker`) is launched whenever a task
+exists for particular database.
 
-If the workers are already running for the current database, the function does
-not report any error but the new workers will exit immediately.
+If the scheduler worker is already running for the current database, the
+function does not report any error but the new worker will exit immediately.
 
-If the background workers are running, you can use the following statement to
-stop them:
+If the workers are running for the current database, you can use the following
+statement to stop them:
 
 ```
 SELECT squeeze.stop_worker();

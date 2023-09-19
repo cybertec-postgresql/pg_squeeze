@@ -22,6 +22,8 @@
  */
 #include "postgres.h"
 
+#include "pg_squeeze.h"
+
 #if PG_VERSION_NUM >= 120000
 #include "access/heapam.h"
 #endif
@@ -100,7 +102,7 @@ statapprox_heap(Relation rel, output_type *stat)
 					maxoff;
 		Size		freespace;
 
-		CHECK_FOR_INTERRUPTS();
+		exit_if_requested();
 
 		/*
 		 * If the page has only visible tuples, then we can find out the free

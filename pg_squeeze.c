@@ -300,18 +300,12 @@ _PG_init(void)
 		{
 			WorkerConInit *con;
 			BackgroundWorker worker;
-			int			i;
 
 			dbname = lfirst(lc);
 
 			con = allocate_worker_con_info(dbname, squeeze_worker_role, true);
 			squeeze_initialize_bgworker(&worker, con, NULL, 0);
 			RegisterBackgroundWorker(&worker);
-
-			con = allocate_worker_con_info(dbname, squeeze_worker_role, false);
-			squeeze_initialize_bgworker(&worker, con, NULL, 0);
-			for (i = 0; i < squeeze_workers_per_database; i++)
-				RegisterBackgroundWorker(&worker);
 		}
 		list_free_deep(dbnames);
 	}
@@ -346,6 +340,54 @@ squeeze_table(PG_FUNCTION_ARGS)
 
 	PG_RETURN_VOID();
 }
+
+/*
+ * A substitute for CHECK_FOR_INTERRUPRS.
+ *
+ * procsignal_sigusr1_handler does not support signaling from a backend to a
+ * non-parallel worker (see the values of ProcSignalReason), and an extension
+ * has no other way to set the flags checked by ProcessInterrupts(), so the
+ * worker cannot use CHECK_FOR_INTERRUPTS. Let's use shared memory to tell the
+ * worker that it should exit.  (SIGTERM would terminate the worker easily,
+ * but due to race conditions we could terminate another backend / worker
+ * which already managed to reuse this worker's PID.)
+ */
+void
+exit_if_requested(void)
+{
+	bool	exit_requested;
+
+	/*
+	 * This function only terminates workers launched by the squeeze_table()
+	 * function. Those launched by the scheduler worker need SIGTERM.
+	 */
+	if (MyWorkerTask == NULL)
+		return;
+
+	SpinLockAcquire(&MyWorkerTask->mutex);
+	exit_requested = MyWorkerTask->exit_requested;
+	SpinLockRelease(&MyWorkerTask->mutex);
+
+	if (!exit_requested)
+		return;
+
+	/*
+	 * There seems to be no automatic cleanup of the origin, so do it here.
+	 * The insertion into the ReplicationOriginRelationId catalog will be
+	 * rolled back due to the transaction abort.
+	 */
+	if (replorigin_session_origin != InvalidRepOriginId)
+		replorigin_session_origin = InvalidRepOriginId;
+
+	/*
+	 * Message similar to that in ProcessInterrupts(), but ERROR is
+	 * sufficient here. rewrite_worker_main() should catch it.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_ADMIN_SHUTDOWN),
+			 errmsg("terminating pg_squeeze background worker due to administrator command")));
+}
+
 
 /*
  * Introduced in pg_squeeze 1.6, to be called directly as opposed to calling
@@ -2314,7 +2356,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			}
 			else
 			{
-				CHECK_FOR_INTERRUPTS();
+				exit_if_requested();
 
 				/*
 				 * Check for a free slot early enough so that the current
@@ -2414,7 +2456,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		{
 			HeapTuple	tup_out;
 
-			CHECK_FOR_INTERRUPTS();
+			exit_if_requested();
 
 			if (use_sort)
 				tup_out = tuplesort_getheaptuple(tuplesort, true);

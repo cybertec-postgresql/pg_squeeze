@@ -63,7 +63,7 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 	done = false;
 	while (!done)
 	{
-		CHECK_FOR_INTERRUPTS();
+		exit_if_requested();
 
 		done = decode_concurrent_changes(ctx, end_of_wal, must_complete);
 
@@ -157,7 +157,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 				squeeze_current_segment = segno_new;
 			}
 
-			CHECK_FOR_INTERRUPTS();
+			exit_if_requested();
 		}
 		InvalidateSystemCaches();
 		CurrentResourceOwner = resowner_old;
