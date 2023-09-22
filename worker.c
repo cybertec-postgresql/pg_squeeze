@@ -814,7 +814,7 @@ scheduler_worker_loop(void)
 FROM squeeze.tasks tsk, squeeze.tables tbl \
 LEFT JOIN squeeze.get_active_workers() AS w \
 ON (tbl.tabschema, tbl.tabname) = (w.tabschema, w.tabname) \
-WHERE w.tabname ISNULL AND tsk.state <> 'processed' AND tsk.table_id = tbl.id \
+WHERE w.tabname ISNULL AND tsk.state = 'ready' AND tsk.table_id = tbl.id \
 LIMIT 1",
 							SPI_OK_SELECT);
 
