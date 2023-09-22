@@ -323,7 +323,7 @@ _PG_init(void)
 							NULL, NULL, NULL);
 }
 
-#define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u"
+#define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u_%u"
 
 /*
  * The original implementation would certainly fail on PG 16 and higher, due
@@ -2142,16 +2142,6 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
 	DecodingOutputState *dstate;
-	char		replorigin_name[255];
-
-	/*
-	 * The session origin will be used to mark WAL records produced by the
-	 * load itself so that they are not decoded.
-	 */
-	Assert(replorigin_session_origin == InvalidRepOriginId);
-	snprintf(replorigin_name, sizeof(replorigin_name),
-			 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
-	replorigin_session_origin = replorigin_create(replorigin_name);
 
 	/*
 	 * Also remember that the WAL records created during the load should not
@@ -2552,14 +2542,6 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 #if PG_VERSION_NUM >= 120000
 	ExecDropSingleTupleTableSlot(slot);
 #endif
-
-	/* Drop the replication origin. */
-#if PG_VERSION_NUM >= 140000
-	replorigin_drop_by_name(replorigin_name, false, true);
-#else
-	replorigin_drop(replorigin_session_origin, false);
-#endif
-	replorigin_session_origin = InvalidRepOriginId;
 
 	/*
 	 * Unlock the index, but not the relation yet - caller will do so when
@@ -3629,15 +3611,6 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 
 	HOLD_INTERRUPTS();
 
-	/*
-	 * There seems to be no automatic cleanup of the origin, so do it here.
-	 * The insertion into the ReplicationOriginRelationId catalog will be
-	 * rolled back due to the transaction abort - either here or, in the
-	 * PG_RE_THROW() case, higher in the stack.
-	 */
-	if (replorigin_session_origin != InvalidRepOriginId)
-		replorigin_session_origin = InvalidRepOriginId;
-
 	/* Save error info in caller's context */
 	MemoryContextSwitchTo(edata_cxt);
 	*edata_p = CopyErrorData();
@@ -3646,21 +3619,84 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	FlushErrorState();
 
 	/*
+	 * Clear the session origin if there's one, else RecordTransactionAbort()
+	 * will try to advance session_replication_state which we haven't
+	 * initialized.
+	 */
+	if (replorigin_session_origin != InvalidRepOriginId)
+		replorigin_session_origin = InvalidRepOriginId;
+
+	/*
 	 * Abort the transaction as we do not call PG_RETHROW() below in this
 	 * case.
 	 */
 	AbortOutOfAnyTransaction();
 
 	/*
+	 * Now that the transaction is aborted, we can run a new one to drop the
+	 * origin.
+	 */
+	if (replorigin_session_origin != InvalidRepOriginId)
+		manage_session_origin(InvalidOid);
+
+	/*
 	 * Special effort is needed to release the replication slot because,
-	 * unlike other resources, AbortTransaction() does not release it. While
-	 * the transaction is aborted if an ERROR is caught in the main loop of
-	 * postgres.c, it would not do if the ERROR was trapped at lower level in
-	 * the stack (typically, in order to log the error and process the next
-	 * table).
+	 * unlike other resources, AbortTransaction() does not release it.
 	 */
 	if (MyReplicationSlot != NULL)
 		ReplicationSlotRelease();
 
 	RESUME_INTERRUPTS();
+}
+
+/*
+ * If 'relid' is valid, create replication origin and set the
+ * replorigin_session_origin variable. If 'relid' is InvalidOid, drop the
+ * origin created earlier and clear replorigin_session_origin.
+ *
+ * (The origin is used here to mark WAL records produced by the extension,
+ * rather than for real replication.)
+ */
+void
+manage_session_origin(Oid relid)
+{
+	static Oid my_relid = InvalidOid;
+	char	origin_name[NAMEDATALEN];
+	Oid             origin;
+
+	snprintf(origin_name, sizeof(origin_name),
+			 REPLORIGIN_NAME_PATTERN, MyDatabaseId,
+			 OidIsValid(relid) ? relid : my_relid);
+
+	if (OidIsValid(relid))
+	{
+		origin = replorigin_create(origin_name);
+		/*
+		 * As long as we set replorigin_session_origin below, we should setup
+		 * the session state because both RecordTransactionCommit() and
+		 * RecordTransactionAbort() do expect that.
+		 */
+		replorigin_session_setup(origin, 0);
+
+		Assert(replorigin_session_origin == InvalidRepOriginId);
+		replorigin_session_origin = origin;
+
+		Assert(!OidIsValid(my_relid));
+		my_relid = relid;
+	}
+	else
+	{
+		replorigin_session_reset();
+		replorigin_session_origin = InvalidRepOriginId;
+
+#if PG_VERSION_NUM >= 140000
+		replorigin_drop_by_name(origin_name, false, true);
+#else
+		replorigin_drop(replorigin_session_origin, false);
+#endif
+
+		Assert(OidIsValid(my_relid));
+		my_relid = InvalidOid;
+	}
+	CommitTransactionCommand();
 }

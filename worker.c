@@ -1232,6 +1232,25 @@ LIMIT %d", TASK_BATCH_SIZE);
 		if (strlen(NameStr(td->rel_tbsp)) > 0)
 			rel_tbsp = &td->rel_tbsp;
 
+		/*
+		 * The session origin will be used to mark WAL records produced by the
+		 * pg_squeeze extension itself so that they can be skipped easily
+		 * during decoded. (We avoid the decoding for performance
+		 * reasons. Even if those changes were decoded, our output plugin
+		 * should not apply them because squeeze_table_impl() exits before its
+		 * transaction commits.)
+		 *
+		 * The origin needs to be created in a separate transaction because
+		 * other workers, waiting for an unique origin id, need to wait for
+		 * this transaction to complete. If we called both replorigin_create()
+		 * and squeeze_table_impl() in the same transaction, the calls of
+		 * squeeze_table_impl() would effectively get serialized.
+		 *
+		 * Errors are not catched here. If an operation as trivial as this
+		 * fails, worker's exit is just the appropriate action.
+		 */
+		manage_session_origin(relid);
+
 		/* Perform the actual work. */
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
@@ -1240,7 +1259,17 @@ LIMIT %d", TASK_BATCH_SIZE);
 									 rel_tbsp, td->ind_tbsps, &edata, task_cxt);
 
 		if (success)
+		{
 			CommitTransactionCommand();
+
+			/*
+			 * Now that the transaction is committed, we can run a new one to
+			 * drop the origin.
+			 */
+			Assert(replorigin_session_origin != InvalidRepOriginId);
+
+			manage_session_origin(InvalidOid);
+		}
 		else
 		{
 			/*

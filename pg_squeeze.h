@@ -347,3 +347,4 @@ extern bool squeeze_table_impl(Name relschema, Name relname, Name indname,
 							   ErrorData **edata_p, MemoryContext edata_cxt);
 extern void squeeze_handle_error_db(ErrorData **edata_p,
 									MemoryContext edata_cxt);
+extern void manage_session_origin(Oid relid);
