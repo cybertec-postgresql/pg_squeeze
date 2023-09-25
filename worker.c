@@ -64,11 +64,14 @@ max_squeeze_workers(void)
 }
 
 /*
- * The maximum number of tasks submitted by the squeeze_table() user function
- * that can be in progress at a time (as long as there's enough workers). Note
- * that this is cluster-wide constant.
+ * The maximum number of tasks submitted by the scheduler worker or by the
+ * squeeze_table() user function that can be in progress at a time (as long as
+ * there's enough workers). Note that this is cluster-wide constant.
+ *
+ * XXX Should be based on MAX_SQUEEZE_WORKERS? Not sure how to incorporate
+ * scheduler workers in the computation.
  */
-#define	NUM_WORKER_TASKS	8
+#define	NUM_WORKER_TASKS	16
 
 typedef struct WorkerData
 {
@@ -95,28 +98,23 @@ WorkerTask *MyWorkerTask = NULL;
 /* Local pointer to the progress information. */
 WorkerProgress *MyWorkerProgress = NULL;
 
+/*
+ * The "squeeze worker" (i.e. one that performs the actual squeezing, as
+ * opposed to the "scheduler worker"). The scheduler worker uses this
+ * structure to keep track of squeeze workers it launched.
+ */
+typedef struct SqueezeWorker
+{
+	BackgroundWorkerHandle	*handle;
+	WorkerTask	*task;
+} SqueezeWorker;
+
+static SqueezeWorker	*SqueezeWorkers = NULL;
+
 static void interrupt_worker(WorkerTask *task);
 static void release_task(WorkerTask *task, bool worker);
 static void reset_progress(WorkerProgress *progress);
-
-/* Information retrieved from the "tasks" and "tables" functions. */
-typedef struct TaskDetails
-{
-	uint32		id;
-	NameData	relschema;
-	NameData	relname;
-	NameData	cl_index;
-	NameData	rel_tbsp;
-	ArrayType  *ind_tbsps;
-	bool		last_try;
-	bool		skip_analyze;
-} TaskDetails;
-
-static void init_task_details(TaskDetails *task, int32 task_id,
-							  Name relschema, Name relname, Name cl_index,
-							  Name rel_tbsp, ArrayType *ind_tbsps,
-							  bool last_try, bool skip_analyze);
-static void squeeze_handle_error_app(ErrorData *edata, TaskDetails *td);
+static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
 
 static Size
 worker_shmem_size(void)
@@ -215,13 +213,41 @@ worker_shmem_shutdown(int code, Datum arg)
 
 	if (MyWorkerTask)
 		release_task(MyWorkerTask, true);
+
+	/*
+	 * The scheduler worker needs to clean up the task it launched, so they do
+	 * not leak Besides that, it should terminate all the squeeze workers it
+	 * launched, otherwise it'd be hard to keep track of the number of running
+	 * workers if it's started again before the existing workers finish.
+	 */
+	if (SqueezeWorkers)
+	{
+		int		i;
+
+		for (i = 0; i < squeeze_workers_per_database; i++)
+		{
+			SqueezeWorker	*worker = &SqueezeWorkers[i];
+
+			if (worker->task)
+			{
+				interrupt_worker(worker->task);
+				release_task(worker->task, false);
+			}
+		}
+	}
 }
 
 #if PG_VERSION_NUM >= 150000
 extern Datum create_squeeze_worker_task(PG_FUNCTION_ARGS);
 #endif
 
-static void start_worker_internal(bool scheduler, int task_id,
+static int get_unused_task_slot_id(int task_id);
+static int count_workers(void);
+static void fill_worker_task(WorkerTask *task, int id, Name relschema,
+							 Name relname, Name indname, Name tbspname,
+							 ArrayType *ind_tbsps, bool last_try,
+							 bool skip_analyze);
+static bool start_worker_internal(bool scheduler, int task_id,
 								  BackgroundWorkerHandle **handle);
 
 static void worker_sighup(SIGNAL_ARGS);
@@ -229,7 +255,7 @@ static void worker_sigterm(SIGNAL_ARGS);
 
 static void scheduler_worker_loop(void);
 static void squeeze_worker_loop(int task_id);
-static void process_tasks(MemoryContext task_cxt, int task_id);
+static void process_task(int task_id, MemoryContext task_cxt);
 
 static uint64 run_command(char *command, int rc);
 
@@ -296,9 +322,8 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	Name		indname = NULL;
 	Name		tbspname = NULL;
 	ArrayType  *ind_tbsps = NULL;
+	int		task_id;
 	WorkerTask *task = NULL;
-	int			i;
-	bool		found;
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
 
@@ -322,50 +347,21 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	}
 
 	/* Find free task structure. */
-	found = false;
-	for (i = 0; i < NUM_WORKER_TASKS; i++)
-	{
-		task = &workerData->tasks[i];
-		SpinLockAcquire(&task->mutex);
-		/*
-		 * If slot is valid, the worker is still working on an earlier task,
-		 * although the backend that assigned the task already exited.
-		 */
-		if (!task->assigned && task->slot == NULL)
-		{
-			/* Make sure that no other backend can use the task. */
-			task->assigned = true;
-			found = true;
-		}
-		SpinLockRelease(&task->mutex);
-
-		if (found)
-			break;
-	}
-	if (!found)
+	task_id = get_unused_task_slot_id(-1);
+	if (task_id < 0)
 		ereport(ERROR, (errmsg("too many concurrent tasks in progress")));
 
-
 	/* Fill-in the remaining task information. */
-	namestrcpy(&task->relschema, NameStr(*relschema));
-	namestrcpy(&task->relname, NameStr(*relname));
-	if (indname)
-		namestrcpy(&task->indname, NameStr(*indname));
-	else
-		NameStr(task->indname)[0] = '\0';
-	if (tbspname)
-		namestrcpy(&task->tbspname, NameStr(*tbspname));
-	else
-		NameStr(task->tbspname)[0] = '\0';
-	if (ind_tbsps)
-		memcpy(task->ind_tbsps, ind_tbsps, VARSIZE(ind_tbsps));
-	else
-		SET_VARSIZE(task->ind_tbsps, 0);
+	task = &workerData->tasks[task_id];
+	fill_worker_task(task, -1, relschema, relname, indname, tbspname,
+					 ind_tbsps, false, true);
 
 	/* Start the worker to handle the task. */
 	PG_TRY();
 	{
-		start_worker_internal(false, i, &handle);
+		if (!start_worker_internal(false, task_id, &handle))
+			ereport(ERROR,
+					(errmsg("a new worker could not start due to squeeze.workers_per_database")));
 	}
 	PG_CATCH();
 	{
@@ -418,6 +414,66 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Returns a zero-based index of an unused task slot in the shared memory, or
+ * -1 if there's no unused slot.
+ *
+ * If task_id is >= 0, avoid fetching tasks whose task_id equals to this
+ * argument.
+ */
+static int
+get_unused_task_slot_id(int task_id)
+{
+	int		i;
+	WorkerTask	*task;
+	int		res = -1;
+
+	for (i = 0; i < NUM_WORKER_TASKS; i++)
+	{
+		int		this_task_id;
+
+		task = &workerData->tasks[i];
+		SpinLockAcquire(&task->mutex);
+		/*
+		 * If slot is valid, the worker is still working on an earlier task,
+		 * although the backend that assigned the task already exited.
+		 */
+		if (!task->assigned && task->slot == NULL)
+		{
+			/* Make sure that no other backend can use the task. */
+			task->assigned = true;
+			res = i;
+		}
+		this_task_id = task->task_id;
+		SpinLockRelease(&task->mutex);
+
+		/*
+		 * If task_id is valid, we check below if another task has the same
+		 * task_id.
+		 */
+		if (res >= 0 && task_id < 0)
+			break;
+
+		if (task_id > 0 && task_id == this_task_id)
+		{
+			/* Undo the assignment if made one above. */
+			if (res >= 0)
+			{
+				task = &workerData->tasks[res];
+				SpinLockAcquire(&task->mutex);
+				task->assigned = false;
+				SpinLockRelease(&task->mutex);
+				res = -1;
+			}
+
+			/* No point in searching further. */
+			break;
+		}
+	}
+
+	return res;
+}
+
+/*
  * Count active workers running in the current database.
  */
 static int
@@ -440,6 +496,39 @@ count_workers(void)
 }
 
 /*
+ * Fill-in "user data" of WorkerTask.
+ */
+static void
+fill_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
+				 Name indname, Name tbspname, ArrayType *ind_tbsps,
+				 bool last_try, bool skip_analyze)
+{
+	task->task_id = id;
+	namestrcpy(&task->relschema, NameStr(*relschema));
+	namestrcpy(&task->relname, NameStr(*relname));
+	if (indname)
+		namestrcpy(&task->indname, NameStr(*indname));
+	else
+		NameStr(task->indname)[0] = '\0';
+	if (tbspname)
+		namestrcpy(&task->tbspname, NameStr(*tbspname));
+	else
+		NameStr(task->tbspname)[0] = '\0';
+	if (ind_tbsps)
+	{
+		if (VARSIZE(ind_tbsps) > IND_TABLESPACES_ARRAY_SIZE)
+			ereport(ERROR, (errmsg("the array of index tablespaces is too big")));
+		memcpy(task->ind_tbsps, ind_tbsps, VARSIZE(ind_tbsps));
+	}
+	else
+		SET_VARSIZE(task->ind_tbsps, 0);
+
+	task->last_try = last_try;
+	task->skip_analyze = skip_analyze;
+
+}
+
+/*
  * Register either scheduler or squeeze worker, according to the argument.
  *
  * The number of scheduler workers per database is limited by the
@@ -447,8 +536,11 @@ count_workers(void)
  *
  * If task_id is >=0, then it's an index into the array of WorkerTask's in the
  * shared memory. In such a case, wait for the worker to start.
+ *
+ * Returns false if the worker could not be started due to
+ * squeeze_workers_per_database, true in other cases.
  */
-static void
+static bool
 start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **handle)
 {
 	WorkerConInteractive con;
@@ -469,7 +561,7 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 			ereport(DEBUG1,
 					(errmsg("cannot start a new squeeze worker, %d workers already running for database %u",
 							squeeze_workers_per_database, MyDatabaseId)));
-			return;
+			return false;
 		}
 	}
 
@@ -489,10 +581,10 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 				 errhint("More details may be available in the server log.")));
 
 	if (task_id < 0)
-		return;
+		return true;
 
 	if (handle == NULL)
-		return;
+		return true;
 
 	status = WaitForBackgroundWorkerStartup(*handle, &pid);
 	if (status == BGWH_STOPPED)
@@ -513,6 +605,8 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 
 	ereport(DEBUG1,
 			(errmsg("pg_squeeze %s worker started, pid=%d", kind, pid)));
+
+	return true;
 }
 
 /*
@@ -782,11 +876,35 @@ static void
 scheduler_worker_loop(void)
 {
 	long		delay = 0L;
+	int		i;
+	SqueezeWorker	*worker;
+	MemoryContext	sched_cxt, old_cxt;
+
+	/* Initialize the array to track the workers we start. */
+	SqueezeWorkers = (SqueezeWorker *) palloc(squeeze_workers_per_database *
+											  sizeof(SqueezeWorker));
+	for (i = 0; i < squeeze_workers_per_database; i++)
+	{
+		worker = &SqueezeWorkers[i];
+		worker->handle = NULL;
+		worker->task = NULL;
+	}
+
+	/* Context for allocations which cannot be freed too early. */
+	sched_cxt = AllocSetContextCreate(TopMemoryContext,
+									  "pg_squeeze scheduler context",
+									  ALLOCSET_DEFAULT_SIZES);
 
 	while (!got_sigterm)
 	{
+		int		navail = 0;
+		StringInfoData	query;
 		int			rc;
 		uint64		ntask;
+		TupleDesc	tupdesc;
+		TupleTableSlot *slot;
+		List	*ids = NIL;
+		ListCell	*lc;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -802,65 +920,258 @@ scheduler_worker_loop(void)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		ereport(DEBUG1, (errmsg("scheduler worker: checking the schedule")));
+		/*
+		 * Check the status of the workers we have started in the previous
+		 * loops, and see how many workers we can launch in this loop.
+		 */
+		for (i = 0; i < squeeze_workers_per_database; i++)
+		{
+			worker = &SqueezeWorkers[i];
+
+			if (worker->handle)
+			{
+				pid_t		pid;
+				BgwHandleStatus	status;
+
+				status = GetBackgroundWorkerPid(worker->handle, &pid);
+
+				if (status == BGWH_STOPPED)
+				{
+					worker->handle = NULL;
+					release_task(worker->task, false);
+					worker->task = NULL;
+				}
+				else if (status == BGWH_POSTMASTER_DIED)
+				{
+					ereport(ERROR,
+							(errmsg("the postmaster died before the squeeze worker could finish"),
+							 errhint("More details may be available in the server log.")));
+				}
+
+			}
+			if (worker->handle == NULL)
+				navail++;
+		}
+
+		/*
+		 * If we cannot start a new worker, wait on the latch until we're
+		 * notified about a status change of a worker we launched earlier.
+		 */
+		if (navail == 0)
+			continue;
+
+		ereport(DEBUG1, (errmsg("scheduler worker: %d workers available",
+								navail)));
 
 		run_command("SELECT squeeze.check_schedule()", SPI_OK_SELECT);
 
 		/*
-		 * Is there at least one task with no worker assigned?
+		 * Turn new tasks into ready (or processed if the tables should not
+		 * really be squeezed).
 		 */
-		ntask = run_command(
-			"SELECT tbl.tabschema, tbl.tabname \
-FROM squeeze.tasks tsk, squeeze.tables tbl \
-LEFT JOIN squeeze.get_active_workers() AS w \
-ON (tbl.tabschema, tbl.tabname) = (w.tabschema, w.tabname) \
-WHERE w.tabname ISNULL AND tsk.state = 'ready' AND tsk.table_id = tbl.id \
-LIMIT 1",
-							SPI_OK_SELECT);
+		run_command("SELECT squeeze.dispatch_new_tasks()", SPI_OK_SELECT);
+
+		/*
+		 * Are there some tasks with no worker assigned?
+		 */
+		initStringInfo(&query);
+		appendStringInfo(
+			&query,
+			"SELECT t.id, tb.tabschema, tb.tabname, tb.clustering_index, "
+			"tb.rel_tablespace, tb.ind_tablespaces, t.tried >= tb.max_retry, "
+			"tb.skip_analyze "
+			"FROM squeeze.tasks t, squeeze.tables tb "
+			"LEFT JOIN squeeze.get_active_workers() AS w "
+			"ON (tb.tabschema, tb.tabname) = (w.tabschema, w.tabname) "
+			"WHERE w.tabname ISNULL AND t.state = 'ready' AND t.table_id = tb.id "
+			"ORDER BY t.id "
+			"LIMIT %d", navail);
+
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			ereport(ERROR, (errmsg("could not connect to SPI manager")));
+		pgstat_report_activity(STATE_RUNNING, query.data);
+		rc = SPI_execute(query.data, true, 0);
+		pgstat_report_activity(STATE_IDLE, NULL);
+		if (rc != SPI_OK_SELECT)
+			ereport(ERROR, (errmsg("SELECT command failed: %s", query.data)));
+
+#if PG_VERSION_NUM >= 130000
+		ntask = SPI_tuptable->numvals;
+#else
+		ntask = SPI_processed;
+#endif
 
 		if (ntask > 0)
 		{
-			int		nactive;
+			tupdesc = CreateTupleDescCopy(SPI_tuptable->tupdesc);
+#if PG_VERSION_NUM >= 120000
+			slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+#else
+			slot = MakeSingleTupleTableSlot(tupdesc);
+#endif
+		}
 
-			ereport(DEBUG1, (errmsg("scheduler worker: at least one task found")));
+		/* Initialize the task slots. */
+		ids = NIL;
+		for (i = 0; i < ntask; i++)
+		{
+			int		id, task_id;
+			WorkerTask	*task;
+			HeapTuple	tup;
+			Datum		datum;
+			bool		isnull;
+			Name	relschema, relname, cl_index, rel_tbsp;
+			ArrayType *ind_tbsps;
+			bool		last_try;
+			bool		skip_analyze;
 
-			nactive = count_workers();
+			cl_index = NULL;
+			rel_tbsp = NULL;
+			ind_tbsps = NULL;
+
+			/* Retrieve the tuple attributes and use them to fill the task. */
+			tup = heap_copytuple(SPI_tuptable->vals[i]);
+			ExecClearTuple(slot);
+#if PG_VERSION_NUM >= 120000
+			ExecStoreHeapTuple(tup, slot, true);
+#else
+			ExecStoreTuple(tup, slot, InvalidBuffer, true);
+#endif
+
+			datum = slot_getattr(slot, 1, &isnull);
+			Assert(!isnull);
+			task_id = DatumGetInt32(datum);
 
 			/*
-			 * If there is work to do and we can launch more workers, do that.
-			 *
-			 * Note that, when we get here too often, it's possible (though
-			 * pretty unlikely) that the worker we tried to launch last time
-			 * hasn't appeared in the output of get_active_workers() yet, so
-			 * we'll end up with two workers for a single table. In such a
-			 * case, one of those workers should fail early, because
-			 * setup_decoding() cannot create two replication slots of the
-			 * same name.
+			 * No point in fetching the remaining columns if all the tasks are
+			 * already used.
 			 */
-			if (nactive < squeeze_workers_per_database)
-			{
-				int	nnew, i;
+			id = get_unused_task_slot_id(task_id);
+			if (id < 0)
+				break;
+			task = &workerData->tasks[id];
 
-				nnew = squeeze_workers_per_database - nactive;
+			datum = slot_getattr(slot, 2, &isnull);
+			Assert(!isnull);
+			relschema = DatumGetName(datum);
 
-				/* start_worker_internal() does access the system catalog.. */
-				SetCurrentStatementStartTimestamp();
-				StartTransactionCommand();
+			datum = slot_getattr(slot, 3, &isnull);
+			Assert(!isnull);
+			relname = DatumGetName(datum);
 
-				for (i = 0; i < nnew; i++)
-					start_worker_internal(false, -1, NULL);
+			datum = slot_getattr(slot, 4, &isnull);
+			if (!isnull)
+				cl_index = DatumGetName(datum);
 
-				CommitTransactionCommand();
-			}
+			datum = slot_getattr(slot, 5, &isnull);
+			if (!isnull)
+				rel_tbsp = DatumGetName(datum);
+
+			datum = slot_getattr(slot, 6, &isnull);
+			if (!isnull)
+				ind_tbsps = DatumGetArrayTypePCopy(datum);
+
+			datum = slot_getattr(slot, 7, &isnull);
+			Assert(!isnull);
+			last_try = DatumGetBool(datum);
+
+			datum = slot_getattr(slot, 8, &isnull);
+			Assert(!isnull);
+			skip_analyze = DatumGetBool(datum);
+
+			/* Fill the task. */
+			fill_worker_task(task, task_id, relschema, relname, cl_index,
+							 rel_tbsp, ind_tbsps, last_try, skip_analyze);
+
+
+			/* The list must survive SPI_finish(). */
+			old_cxt = MemoryContextSwitchTo(sched_cxt);
+			ids = lappend_int(ids, id);
+			MemoryContextSwitchTo(old_cxt);
 		}
-		else
-			ereport(DEBUG1, (errmsg("scheduler worker: no task found")));
+
+		if (ntask > 0)
+		{
+			ExecDropSingleTupleTableSlot(slot);
+			FreeTupleDesc(tupdesc);
+		}
+
+		/* Finish the data retrieval. */
+		if (SPI_finish() != SPI_OK_FINISH)
+			ereport(ERROR, (errmsg("SPI_finish failed")));
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		/*
+		 * Now that the transaction has committed, we can start the
+		 * workers. (start_worker_internal() needs to run in a transaction
+		 * because it does access the system catalog.)
+		 */
+		foreach(lc, ids)
+		{
+			SqueezeWorker	*worker = NULL;
+			bool	found = false;
+			int	task_id;
+			bool	too_many;
+
+			/* Find the array element for the next worker. */
+			for (i = 0; i < squeeze_workers_per_database; i++)
+			{
+				worker = &SqueezeWorkers[i];
+				if (worker->handle == NULL)
+				{
+					Assert(worker->task == NULL);
+
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				/* Should not happen, given we check of navail above ... */
+				ereport(ERROR,
+						(errmsg("cannot launch more squeeze workers")));
+
+			task_id = lfirst_int(lc);
+			worker->task = &workerData->tasks[task_id];
+
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+
+			/*
+			 * The handle (and possibly other allocations) must survive
+			 * the current transaction.
+			 */
+			old_cxt = MemoryContextSwitchTo(sched_cxt);
+			too_many = !start_worker_internal(false, task_id,
+											  &worker->handle);
+			MemoryContextSwitchTo(old_cxt);
+
+			/*
+			 * workers_per_database can be exceeded if we are using all the
+			 * workers allowed by this limit and the squeeze_table() function
+			 * manages to use some of them at the same time. If we release the
+			 * task, the query should fetch it again.
+			 */
+			if (too_many)
+			{
+				release_task(worker->task, false);
+				worker->task = NULL;
+				worker->handle = NULL;
+			}
+			CommitTransactionCommand();
+		}
 
 		/* Check later if any table meets the schedule. */
 		delay = worker_naptime * 1000L;
 	}
+
+	MemoryContextDelete(sched_cxt);
 }
 
+/* TODO No longer a loop - rename? Or get rid of the function altogether? */
 static void
 squeeze_worker_loop(int task_id)
 {
@@ -868,32 +1179,18 @@ squeeze_worker_loop(int task_id)
 
 	/*
 	 * Memory context for auxiliary per-task allocations.
-	 *
-	 * It used to be more useful when process_tasks() was called in a loop,
-	 * but there's no strong reason to remove the argument from that function.
 	 */
 	task_cxt = AllocSetContextCreate(TopMemoryContext,
 									 "pg_squeeze task context",
 									 ALLOCSET_DEFAULT_SIZES);
 
-	/*
-	 * Turn new tasks into ready (or processed if the tables should not really
-	 * be squeezed). The scheduler worker should not do this because the
-	 * checks can take some time.
-	 */
-	run_command("SELECT squeeze.dispatch_new_tasks()", SPI_OK_SELECT);
-
-	/* Process the pending task(s). */
-	MemoryContextReset(task_cxt);
-	process_tasks(task_cxt, task_id);
+	/* Process the assigned task. */
+	process_task(task_id, task_cxt);
 
 	/*
-	 * Release the replication slot explicitly, ERROR does not ensure
-	 * that. (PostgresMain does that for regular backend in the main loop, but
-	 * we don't let the error propagate there because we need to log it.)
+	 * Regarding the replication slot, ReplicationSlotInitialize() callback
+	 * should be setup via before_shmem_exit() during bgworker startup.
 	 */
-	if (MyReplicationSlot != NULL)
-		ReplicationSlotRelease();
 
 	MemoryContextDelete(task_cxt);
 }
@@ -905,477 +1202,258 @@ squeeze_worker_loop(int task_id)
  * executor, this function must be implemented in C and call squeeze_table()
  * directly.
  *
- * The name was also changed so it reflects the fact that multiple tasks can
- * be processed by a single call.
- *
- * If task_id is >= 0, it's an index into the shared memory array of task. In
- * such a case, only this one task should be processed.
+ * task_id is an index into the shared memory array of tasks
  */
 static void
-process_tasks(MemoryContext task_cxt, int task_id)
+process_task(int task_id, MemoryContext task_cxt)
 {
-	StringInfoData query;
-	int			ret;
-	Name		relschema,
-				relname;
-	Name		cl_index,
-				rel_tbsp;
-	ArrayType  *ind_tbsps;
-	MemoryContext oldcxt;
-	TaskDetails *tasks = NULL;
-	uint64		ntasks;
 	int			i;
+	Name		relschema,
+		relname;
+	Name		cl_index = NULL;
+	Name		rel_tbsp = NULL;
+	ArrayType  *ind_tbsps = NULL;
+	MemoryContext oldcxt;
 	WorkerTask *task;
-
-	initStringInfo(&query);
-
-restart:
-	cl_index = NULL;
-	rel_tbsp = NULL;
-	ind_tbsps = NULL;
-	if (tasks)
-	{
-		for (i = 0; i < ntasks; i++)
-		{
-			TaskDetails *this = &tasks[i];
-
-			if (this->ind_tbsps)
-				pfree(this->ind_tbsps);
-		}
-		pfree(tasks);
-	}
-	tasks = NULL;
-	ntasks = 0;
-	resetStringInfo(&query);
+	uint32		arr_size;
+	TimestampTz start_ts;
+	bool		success;
+	RangeVar   *relrv;
+	Relation	rel;
+	Oid			relid;
+	bool		found;
+	ErrorData  *edata;
 
 	Assert(MyWorkerTask == NULL);
 
 	/* First, check for a task in the shared memory. */
-	if (task_id >= 0)
+	Assert(task_id < NUM_WORKER_TASKS);
+	task = MyWorkerTask = &workerData->tasks[task_id];
+
+	/*
+	 * Once the backend sets "assigned" and the worker is launched, only the
+	 * worker is expected to change the task, so access it w/o locking.
+	 */
+	Assert(task->assigned && task->slot == NULL);
+	task->slot = MyWorkerSlot;
+
+	relschema = &task->relschema;
+	relname = &task->relname;
+	if (strlen(NameStr(task->indname)) > 0)
+		cl_index = &task->indname;
+	if (strlen(NameStr(task->tbspname)) > 0)
+		rel_tbsp = &task->tbspname;
+
+	/*
+	 * Now that we're in the suitable memory context, we can copy the
+	 * tablespace mapping array, if one is passed.
+	 */
+	arr_size = VARSIZE(task->ind_tbsps);
+	if (arr_size > 0)
 	{
-		uint32		arr_size;
-
-		Assert(task_id < NUM_WORKER_TASKS);
-
-		task = MyWorkerTask = &workerData->tasks[task_id];
-
-		/*
-		 * Once the backend sets "assigned", no one else is expected to
-		 * change the task, so access it w/o locking.
-		 */
-		Assert(task->assigned && task->slot == NULL);
-
-		task->slot = MyWorkerSlot;
-
-		relschema = &task->relschema;
-		relname = &task->relname;
-		if (strlen(NameStr(task->indname)) > 0)
-			cl_index = &task->indname;
-		if (strlen(NameStr(task->tbspname)) > 0)
-			rel_tbsp = &task->tbspname;
-
-		/*
-		 * Create a single-element array of tasks for further processing.
-		 */
-		ntasks = 1;
-		oldcxt = CurrentMemoryContext;
-		MemoryContextSwitchTo(task_cxt);
-		tasks = (TaskDetails *) palloc(sizeof(TaskDetails));
-
-		/*
-		 * Now that we're in the suitable memory context, we can copy the
-		 * tablespace mapping array, if one is passed.
-		 */
-		arr_size = VARSIZE(task->ind_tbsps);
-		if (arr_size > 0)
-		{
-			Assert(arr_size <= IND_TABLESPACES_ARRAY_SIZE);
-			ind_tbsps = palloc(arr_size);
-			memcpy(ind_tbsps, task->ind_tbsps, arr_size);
-		}
-
-		init_task_details(tasks, 0, relschema, relname, cl_index, rel_tbsp,
-						  ind_tbsps, false, false);
-		MemoryContextSwitchTo(oldcxt);
+		Assert(arr_size <= IND_TABLESPACES_ARRAY_SIZE);
+		ind_tbsps = palloc(arr_size);
+		memcpy(ind_tbsps, task->ind_tbsps, arr_size);
 	}
 
-	if (MyWorkerTask == NULL)
+	/* Now process the task. */
+	ereport(DEBUG1,
+			(errmsg("task for table %s.%s is ready for processing",
+					NameStr(*relschema), NameStr(*relname))));
+
+	cl_index = NULL;
+	rel_tbsp = NULL;
+
+	/* Retrieve relid of the table. */
+	StartTransactionCommand();
+	relrv = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
+	success = true;
+	PG_TRY();
 	{
-		TupleDesc	tupdesc;
-		TupleTableSlot *slot;
-
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-
-		/* Fetch this many tasks per query execution. */
-#define TASK_BATCH_SIZE		4
-
-		appendStringInfo(&query,
-						 "SELECT tb.tabschema, tb.tabname, tb.clustering_index,\
-tb.rel_tablespace, tb.ind_tablespaces, t.id, \
-t.tried >= tb.max_retry, tb.skip_analyze \
-FROM squeeze.tasks t, squeeze.tables tb \
-WHERE t.table_id = tb.id AND t.state = 'ready' \
-ORDER BY t.created \
-LIMIT %d", TASK_BATCH_SIZE);
-
-		if (SPI_connect() != SPI_OK_CONNECT)
-			ereport(ERROR, (errmsg("could not connect to SPI manager")));
-		pgstat_report_activity(STATE_RUNNING, query.data);
-		ret = SPI_execute(query.data, true, 0);
-		pgstat_report_activity(STATE_IDLE, NULL);
-
-		if (ret != SPI_OK_SELECT)
-			ereport(ERROR, (errmsg("SELECT command failed: %s", query.data)));
-
-#if PG_VERSION_NUM >= 130000
-		ntasks = SPI_tuptable->numvals;
-#else
-		ntasks = SPI_processed;
-#endif
-		if (ntasks == 0)
-		{
-			if (SPI_finish() != SPI_OK_FINISH)
-				ereport(ERROR, (errmsg("SPI_finish failed")));
-
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-			return;
-		}
-
-		Assert(ntasks <= TASK_BATCH_SIZE);
-
-		/*
-		 * Create the tuple descriptor, slot and the task details in a
-		 * separate memory context, so that it survives the SPI session.
-		 */
-		oldcxt = CurrentMemoryContext;
-		MemoryContextSwitchTo(task_cxt);
-		tupdesc = CreateTupleDescCopy(SPI_tuptable->tupdesc);
 #if PG_VERSION_NUM >= 120000
-		slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+		rel = table_openrv(relrv, AccessShareLock);
+		relid = RelationGetRelid(rel);
+		table_close(rel, AccessShareLock);
 #else
-		slot = MakeSingleTupleTableSlot(tupdesc);
+		rel = heap_openrv(relrv, AccessShareLock);
+		relid = RelationGetRelid(rel);
+		heap_close(rel, AccessShareLock);
 #endif
-		tasks = (TaskDetails *) palloc(ntasks * sizeof(TaskDetails));
-		for (i = 0; i < ntasks; i++)
-		{
-			HeapTuple	tup;
-			Datum		datum;
-			bool		isnull;
-			int32		task_id;
-			bool		last_try,
-						skip_analyze;
-
-			cl_index = NULL;
-			rel_tbsp = NULL;
-			ind_tbsps = NULL;
-
-			/* Retrieve the tuple attributes. */
-			tup = heap_copytuple(SPI_tuptable->vals[i]);
-			ExecClearTuple(slot);
-#if PG_VERSION_NUM >= 120000
-			ExecStoreHeapTuple(tup, slot, true);
-#else
-			ExecStoreTuple(tup, slot, InvalidBuffer, true);
-#endif
-
-			datum = slot_getattr(slot, 1, &isnull);
-			Assert(!isnull);
-			relschema = DatumGetName(datum);
-
-			datum = slot_getattr(slot, 2, &isnull);
-			Assert(!isnull);
-			relname = DatumGetName(datum);
-
-			datum = slot_getattr(slot, 3, &isnull);
-			if (!isnull)
-				cl_index = DatumGetName(datum);
-
-			datum = slot_getattr(slot, 4, &isnull);
-			if (!isnull)
-				rel_tbsp = DatumGetName(datum);
-
-			datum = slot_getattr(slot, 5, &isnull);
-			if (!isnull)
-				ind_tbsps = DatumGetArrayTypePCopy(datum);
-
-			datum = slot_getattr(slot, 6, &isnull);
-			Assert(!isnull);
-			task_id = DatumGetInt32(datum);
-
-			datum = slot_getattr(slot, 7, &isnull);
-			Assert(!isnull);
-			last_try = DatumGetBool(datum);
-
-			datum = slot_getattr(slot, 8, &isnull);
-			Assert(!isnull);
-			skip_analyze = DatumGetBool(datum);
-
-			init_task_details(&tasks[i], task_id, relschema, relname,
-							  cl_index, rel_tbsp, ind_tbsps, last_try,
-							  skip_analyze);
-
-		}
-		MemoryContextSwitchTo(oldcxt);
-		ExecDropSingleTupleTableSlot(slot);
-		FreeTupleDesc(tupdesc);
-
-		/* Finish the data retrieval. */
-		if (SPI_finish() != SPI_OK_FINISH)
-			ereport(ERROR, (errmsg("SPI_finish failed")));
-		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
-
-	/* Now process the tasks. */
-	for (i = 0; i < ntasks; i++)
+	PG_CATCH();
 	{
-		TimestampTz start_ts;
-		bool		success;
-		TaskDetails *td = &tasks[i];
-		RangeVar   *relrv;
-		Relation	rel;
-		Oid			relid;
-		int			j;
-		bool		found;
-		ErrorData  *edata;
+		squeeze_handle_error_db(&edata, task_cxt);
+		squeeze_handle_error_app(edata, task);
+		success = false;
+	}
+	PG_END_TRY();
 
-		ereport(DEBUG1,
-				(errmsg("task for table %s.%s is ready for processing",
-						NameStr(td->relschema), NameStr(td->relname))));
+	if (!success)
+	{
+		release_task(MyWorkerTask, true);
+		return;
+	}
 
-		cl_index = NULL;
-		rel_tbsp = NULL;
+	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+	found = false;
+	for (i = 0; i < workerData->nslots; i++)
+	{
+		WorkerSlot *slot = &workerData->slots[i];
 
-		/* Check if another worker is already processing this table. */
-		StartTransactionCommand();
-		relrv = makeRangeVar(NameStr(td->relschema), NameStr(td->relname), -1);
-		success = true;
-		PG_TRY();
+		if (slot->dbid == MyDatabaseId &&
+			slot->relid == relid)
 		{
-#if PG_VERSION_NUM >= 120000
-			rel = table_openrv(relrv, AccessShareLock);
-			relid = RelationGetRelid(rel);
-			table_close(rel, AccessShareLock);
-#else
-			rel = heap_openrv(relrv, AccessShareLock);
-			relid = RelationGetRelid(rel);
-			heap_close(rel, AccessShareLock);
-#endif
-			CommitTransactionCommand();
-		}
-		PG_CATCH();
-		{
-			squeeze_handle_error_db(&edata, task_cxt);
-			squeeze_handle_error_app(edata, td);
-			success = false;
-		}
-		PG_END_TRY();
-
-		if (!success)
-		{
-			if (MyWorkerTask)
-				release_task(MyWorkerTask, true);
-			continue;
-		}
-
-		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
-		found = false;
-		for (j = 0; j < workerData->nslots; j++)
-		{
-			WorkerSlot *slot = &workerData->slots[j];
-
-			if (slot->dbid == MyDatabaseId &&
-				slot->relid == relid)
-			{
-				found = true;
-				break;
-			}
-		}
-		if (found)
-		{
-			/* XXX Print out the PID of the other worker? */
-			ereport(DEBUG1,
-					(errmsg("task for table %s.%s is being processed by another worker",
-							NameStr(td->relschema), NameStr(td->relname))));
-			LWLockRelease(workerData->lock);
-
-			if (MyWorkerTask)
-			{
-				Assert(ntasks == 1);
-
-				release_task(MyWorkerTask, true);
-			}
-
-			continue;
-		}
-		/* Declare that this worker takes care of the relation. */
-		Assert(MyWorkerSlot->dbid == MyDatabaseId);
-		MyWorkerSlot->relid = relid;
-		reset_progress(&MyWorkerSlot->progress);
-		LWLockRelease(workerData->lock);
-
-		/*
-		 * In theory, the table can be dropped now, created again (with a
-		 * different OID), scheduled for processing and picked by another
-		 * worker. Concurrent processing of the same table should make
-		 * squeeze_table() fail because both (all) the backends will try to
-		 * create a replication slot of the same name. It doesn't make sense
-		 * to spend more effort on protection against such a rare conditions
-		 * here.
-		 */
-
-		if (strlen(NameStr(td->cl_index)) > 0)
-			cl_index = &td->cl_index;
-		if (strlen(NameStr(td->rel_tbsp)) > 0)
-			rel_tbsp = &td->rel_tbsp;
-
-		/*
-		 * The session origin will be used to mark WAL records produced by the
-		 * pg_squeeze extension itself so that they can be skipped easily
-		 * during decoded. (We avoid the decoding for performance
-		 * reasons. Even if those changes were decoded, our output plugin
-		 * should not apply them because squeeze_table_impl() exits before its
-		 * transaction commits.)
-		 *
-		 * The origin needs to be created in a separate transaction because
-		 * other workers, waiting for an unique origin id, need to wait for
-		 * this transaction to complete. If we called both replorigin_create()
-		 * and squeeze_table_impl() in the same transaction, the calls of
-		 * squeeze_table_impl() would effectively get serialized.
-		 *
-		 * Errors are not catched here. If an operation as trivial as this
-		 * fails, worker's exit is just the appropriate action.
-		 */
-		manage_session_origin(relid);
-
-		/* Perform the actual work. */
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		start_ts = GetCurrentStatementStartTimestamp();
-		success = squeeze_table_impl(&td->relschema, &td->relname, cl_index,
-									 rel_tbsp, td->ind_tbsps, &edata, task_cxt);
-
-		if (success)
-		{
-			CommitTransactionCommand();
-
-			/*
-			 * Now that the transaction is committed, we can run a new one to
-			 * drop the origin.
-			 */
-			Assert(replorigin_session_origin != InvalidRepOriginId);
-
-			manage_session_origin(InvalidOid);
-		}
-		else
-		{
-			/*
-			 * The transaction should be aborted by squeeze_table_impl().
-			 */
-			squeeze_handle_error_app(edata, td);
-
-			if (MyWorkerTask == NULL)
-			{
-				/*
-				 * Some of the next tasks we have in the 'tasks' array could
-				 * have been already processed by other workers. Those should
-				 * have the state set to 'processed' (before the other slot
-				 * could set MyWorkerSlot->relid to InvalidOid), so we just
-				 * need to run the query at the top of this function again.
-				 */
-				goto restart;
-			}
-		}
-
-		/* Insert an entry into the "squeeze.log" table. */
-		if (success)
-		{
-			Oid			outfunc;
-			bool		isvarlena;
-			FmgrInfo	fmgrinfo;
-			char	   *start_ts_str;
-
-			StartTransactionCommand();
-			getTypeOutputInfo(TIMESTAMPTZOID, &outfunc, &isvarlena);
-			fmgr_info(outfunc, &fmgrinfo);
-			start_ts_str = OutputFunctionCall(&fmgrinfo, TimestampTzGetDatum(start_ts));
-			/* Make sure the string survives TopTransactionContext. */
-			MemoryContextSwitchTo(task_cxt);
-			start_ts_str = pstrdup(start_ts_str);
-			MemoryContextSwitchTo(oldcxt);
-			CommitTransactionCommand();
-
-			resetStringInfo(&query);
-			/*
-			 * No one should change the progress fields now, so we can access
-			 * them w/o the spinlock below.
-			 */
-			appendStringInfo(&query,
-							 "INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
-VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
-							 NameStr(td->relschema),
-							 NameStr(td->relname),
-							 start_ts_str,
-							 MyWorkerProgress->ins_initial,
-							 MyWorkerProgress->ins,
-							 MyWorkerProgress->upd,
-							 MyWorkerProgress->del);
-			run_command(query.data, SPI_OK_INSERT);
-
-			if (MyWorkerTask == NULL)
-			{
-				/* Finalize the task. */
-				resetStringInfo(&query);
-				appendStringInfo(&query, "SELECT squeeze.finalize_task(%d)", td->id);
-				run_command(query.data, SPI_OK_SELECT);
-
-				if (!td->skip_analyze)
-				{
-					/*
-					 * Analyze the new table, unless user rejects it
-					 * explicitly.
-					 *
-					 * XXX Besides updating planner statistics in general,
-					 * this sets pg_class(relallvisible) to 0, so that planner
-					 * is not too optimistic about this figure. The
-					 * preferrable solution would be to run (lazy) VACUUM
-					 * (with the ANALYZE option) to initialize visibility map.
-					 * However, to make the effort worthwile, we shouldn't do
-					 * it until all transactions can see all the changes done
-					 * by squeeze_table() function. What's the most suitable
-					 * way to wait?  Asynchronous execution of the VACUUM is
-					 * probably needed in any case.
-					 */
-					resetStringInfo(&query);
-					appendStringInfo(&query, "ANALYZE %s.%s",
-									 NameStr(td->relschema),
-									 NameStr(td->relname));
-					run_command(query.data, SPI_OK_UTILITY);
-				}
-			}
-		}
-
-		if (MyWorkerTask)
-			release_task(MyWorkerTask, true);
-
-		/* Clear the relid field of this worker's slot. */
-		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
-		MyWorkerSlot->relid = InvalidOid;
-		reset_progress(&MyWorkerSlot->progress);
-		LWLockRelease(workerData->lock);
-
-		if (task_id >= 0)
-		{
-			/* The worker only receives a single task. */
+			found = true;
 			break;
 		}
-
-		/* See above */
-		goto restart;
 	}
+	if (found)
+	{
+		/* XXX The scheduler should not allow this.? */
+		ereport(DEBUG1,
+				(errmsg("task for table %s.%s is being processed by another worker",
+						NameStr(*relschema), NameStr(*relname))));
+		LWLockRelease(workerData->lock);
+		release_task(MyWorkerTask, true);
+		return;
+	}
+	/* Declare that this worker takes care of the relation. */
+	Assert(MyWorkerSlot->dbid == MyDatabaseId);
+	MyWorkerSlot->relid = relid;
+	reset_progress(&MyWorkerSlot->progress);
+	LWLockRelease(workerData->lock);
+	/*
+	 * The table can be dropped now, created again (with a different OID),
+	 * scheduled for processing and picked by another worker. The worst case
+	 * is that the table will be squeezed twice, so the time spent by the
+	 * worker that finished first will be wasted. However such a situation is
+	 * not really likely to happen.
+	 */
+
+	/*
+	 * The session origin will be used to mark WAL records produced by the
+	 * pg_squeeze extension itself so that they can be skipped easily during
+	 * decoded. (We avoid the decoding for performance reasons. Even if those
+	 * changes were decoded, our output plugin should not apply them because
+	 * squeeze_table_impl() exits before its transaction commits.)
+	 *
+	 * The origin needs to be created in a separate transaction because other
+	 * workers, waiting for an unique origin id, need to wait for this
+	 * transaction to complete. If we called both replorigin_create() and
+	 * squeeze_table_impl() in the same transaction, the calls of
+	 * squeeze_table_impl() would effectively get serialized.
+	 *
+	 * Errors are not catched here. If an operation as trivial as this fails,
+	 * worker's exit is just the appropriate action.
+	 */
+	manage_session_origin(relid);
+
+	/* Perform the actual work. */
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	start_ts = GetCurrentStatementStartTimestamp();
+	success = squeeze_table_impl(relschema, relname, cl_index,
+								 rel_tbsp, ind_tbsps, &edata, task_cxt);
+
+	if (success)
+	{
+		CommitTransactionCommand();
+
+		/*
+		 * Now that the transaction is committed, we can run a new one to
+		 * drop the origin.
+		 */
+		Assert(replorigin_session_origin != InvalidRepOriginId);
+
+		manage_session_origin(InvalidOid);
+	}
+	else
+	{
+		/*
+		 * The transaction should be aborted by squeeze_table_impl().
+		 */
+		squeeze_handle_error_app(edata, task);
+	}
+
+	/* Insert an entry into the "squeeze.log" table. */
+	if (success)
+	{
+		Oid			outfunc;
+		bool		isvarlena;
+		FmgrInfo	fmgrinfo;
+		char	   *start_ts_str;
+		StringInfoData	query;
+
+		initStringInfo(&query);
+		StartTransactionCommand();
+		getTypeOutputInfo(TIMESTAMPTZOID, &outfunc, &isvarlena);
+		fmgr_info(outfunc, &fmgrinfo);
+		start_ts_str = OutputFunctionCall(&fmgrinfo, TimestampTzGetDatum(start_ts));
+		/* Make sure the string survives TopTransactionContext. */
+		MemoryContextSwitchTo(task_cxt);
+		start_ts_str = pstrdup(start_ts_str);
+		MemoryContextSwitchTo(oldcxt);
+		CommitTransactionCommand();
+
+		resetStringInfo(&query);
+		/*
+		 * No one should change the progress fields now, so we can access
+		 * them w/o the spinlock below.
+		 */
+		appendStringInfo(&query,
+						 "INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
+VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
+						 NameStr(*relschema),
+						 NameStr(*relname),
+						 start_ts_str,
+						 MyWorkerProgress->ins_initial,
+						 MyWorkerProgress->ins,
+						 MyWorkerProgress->upd,
+						 MyWorkerProgress->del);
+		run_command(query.data, SPI_OK_INSERT);
+
+		if (task->task_id >= 0)
+		{
+			/* Finalize the task if it was a scheduled one. */
+			resetStringInfo(&query);
+			appendStringInfo(&query, "SELECT squeeze.finalize_task(%d)",
+							 task->task_id);
+			run_command(query.data, SPI_OK_SELECT);
+
+			if (!task->skip_analyze)
+			{
+				/*
+				 * Analyze the new table, unless user rejects it
+				 * explicitly.
+				 *
+				 * XXX Besides updating planner statistics in general,
+				 * this sets pg_class(relallvisible) to 0, so that planner
+				 * is not too optimistic about this figure. The
+				 * preferrable solution would be to run (lazy) VACUUM
+				 * (with the ANALYZE option) to initialize visibility map.
+				 * However, to make the effort worthwile, we shouldn't do
+				 * it until all transactions can see all the changes done
+				 * by squeeze_table() function. What's the most suitable
+				 * way to wait?  Asynchronous execution of the VACUUM is
+				 * probably needed in any case.
+				 */
+				resetStringInfo(&query);
+				appendStringInfo(&query, "ANALYZE %s.%s",
+								 NameStr(*relschema),
+								 NameStr(*relname));
+				run_command(query.data, SPI_OK_UTILITY);
+			}
+		}
+	}
+
+	release_task(MyWorkerTask, true);
+
+	/* Clear the relid field of this worker's slot. */
+	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+	MyWorkerSlot->relid = InvalidOid;
+	reset_progress(&MyWorkerSlot->progress);
+	LWLockRelease(workerData->lock);
 }
 
 /*
@@ -1388,7 +1466,7 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
  * such a case it's o.k. to let the ERROR stop the worker.
  */
 static void
-squeeze_handle_error_app(ErrorData *edata, TaskDetails *td)
+squeeze_handle_error_app(ErrorData *edata, WorkerTask *task)
 {
 	StringInfoData query;
 
@@ -1396,22 +1474,22 @@ squeeze_handle_error_app(ErrorData *edata, TaskDetails *td)
 	appendStringInfo(&query,
 					 "INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
 VALUES ('%s', '%s', '%s', '%s', '%s')",
-					 NameStr(td->relschema),
-					 NameStr(td->relname),
+					 NameStr(task->relschema),
+					 NameStr(task->relname),
 					 unpack_sql_state(edata->sqlerrcode),
 					 edata->message,
 					 edata->detail ? edata->detail : "");
 	run_command(query.data, SPI_OK_INSERT);
 
-	if (MyWorkerTask == NULL)
+	if (task->task_id >= 0)
 	{
 		/* If the active task failed too many times, cancel it. */
 		resetStringInfo(&query);
-		if (td->last_try)
+		if (task->last_try)
 		{
 			appendStringInfo(&query,
 							 "SELECT squeeze.cancel_task(%d)",
-							 td->id);
+							 task->task_id);
 			run_command(query.data, SPI_OK_SELECT);
 		}
 		else
@@ -1419,7 +1497,7 @@ VALUES ('%s', '%s', '%s', '%s', '%s')",
 			/* Account for the current attempt. */
 			appendStringInfo(&query,
 							 "UPDATE squeeze.tasks SET tried = tried + 1 WHERE id = %d",
-							 td->id);
+							 task->task_id);
 			run_command(query.data, SPI_OK_UPDATE);
 		}
 
@@ -1453,7 +1531,7 @@ release_task(WorkerTask *task, bool worker)
 	}
 	else
 	{
-		/* Called from backend. */
+		/* Called from backend or from the scheduler worker. */
 
 		Assert(task->assigned);
 		task->assigned = false;
@@ -1512,24 +1590,6 @@ run_command(char *command, int rc)
 	pgstat_report_activity(STATE_IDLE, NULL);
 
 	return ntup;
-}
-
-static void
-init_task_details(TaskDetails *task, int32 task_id, Name relschema,
-				  Name relname, Name cl_index, Name rel_tbsp,
-				  ArrayType *ind_tbsps, bool last_try, bool skip_analyze)
-{
-	memset(task, 0, sizeof(TaskDetails));
-	task->id = task_id;
-	namestrcpy(&task->relschema, NameStr(*relschema));
-	namestrcpy(&task->relname, NameStr(*relname));
-	if (cl_index)
-		namestrcpy(&task->cl_index, NameStr(*cl_index));
-	if (rel_tbsp)
-		namestrcpy(&task->rel_tbsp, NameStr(*rel_tbsp));
-	task->ind_tbsps = ind_tbsps;
-	task->last_try = last_try;
-	task->skip_analyze = skip_analyze;
 }
 
 #define	ACTIVE_WORKERS_RES_ATTRS	7

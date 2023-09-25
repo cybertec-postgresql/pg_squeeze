@@ -312,8 +312,13 @@ typedef struct WorkerTask
 	NameData	indname;		/* clustering index */
 	NameData	tbspname;		/* destination tablespace */
 
+	/* Fields of the squeeze.tasks table. */
+	int			task_id;
+	bool		last_try;
+	bool		skip_analyze;
+
 	/*
-	 * index destination tablespaces.
+	 * Index destination tablespaces.
 	 *
 	 * text[][] array is stored here. The space should only be used by the
 	 * interactive squeeze_table() function, which is only there for testing
