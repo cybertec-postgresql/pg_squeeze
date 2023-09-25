@@ -3668,6 +3668,7 @@ manage_session_origin(Oid relid)
 			 REPLORIGIN_NAME_PATTERN, MyDatabaseId,
 			 OidIsValid(relid) ? relid : my_relid);
 
+	StartTransactionCommand();
 	if (OidIsValid(relid))
 	{
 		origin = replorigin_create(origin_name);
