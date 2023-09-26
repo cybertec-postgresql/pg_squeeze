@@ -372,16 +372,8 @@ exit_if_requested(void)
 		return;
 
 	/*
-	 * There seems to be no automatic cleanup of the origin, so do it here.
-	 * The insertion into the ReplicationOriginRelationId catalog will be
-	 * rolled back due to the transaction abort.
-	 */
-	if (replorigin_session_origin != InvalidRepOriginId)
-		replorigin_session_origin = InvalidRepOriginId;
-
-	/*
 	 * Message similar to that in ProcessInterrupts(), but ERROR is
-	 * sufficient here. rewrite_worker_main() should catch it.
+	 * sufficient here. squeeze_table_impl() should catch it.
 	 */
 	ereport(ERROR,
 			(errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -3617,14 +3609,6 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	MemoryContextSwitchTo(old_context);
 
 	FlushErrorState();
-
-	/*
-	 * Clear the session origin if there's one, else RecordTransactionAbort()
-	 * will try to advance session_replication_state which we haven't
-	 * initialized.
-	 */
-	if (replorigin_session_origin != InvalidRepOriginId)
-		replorigin_session_origin = InvalidRepOriginId;
 
 	/*
 	 * Abort the transaction as we do not call PG_RETHROW() below in this
