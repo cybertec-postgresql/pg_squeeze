@@ -20,8 +20,10 @@
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "replication/slot.h"
+#include "replication/snapbuild.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 #if PG_VERSION_NUM >= 160000
 #include "utils/backend_status.h"
 #endif
@@ -34,16 +36,49 @@
 #endif
 #include "utils/snapmgr.h"
 
+#if PG_VERSION_NUM < 120000
+#include "utils/tqual.h"
+#endif
+
 #include "pg_squeeze.h"
+
+/*
+ * There are 2 kinds of worker: 1) scheduler, which creates new tasks, 2) the
+ * actual "squeeze worker" which calls the squeeze_table() function. With
+ * scheduling independent from the actual table processing we check the table
+ * status exactly (with the granularity of one minute) at the scheduled
+ * time. This way we avoid the tricky question how long should particular
+ * schedule stay valid and thus we can use equality operator to check if the
+ * scheduled time is there.
+ *
+ * There are 2 alternatives to the equality test: 1) schedule is valid for
+ * some time interval which is hard to define, 2) the schedule is valid
+ * forever - this is bad because it allows table processing even hours after
+ * the schedule if the table happens to get bloated some time after the
+ * schedule.
+ *
+ * If the squeeze_table() function makes the following tasks delayed, it's
+ * another problem that we can address by increasing the number of "squeeze
+ * workers". (In that case we'd have to adjust the replication slot naming
+ * scheme so that there are no conflicts.)
+ */
+static bool am_i_scheduler = false;
+
+/*
+ * Indicates that the squeeze worker was launched by an user backend (using
+ * the squeeze_table() function), as opposed to the scheduler worker.
+ */
+static bool	am_i_standalone = false;
 
 /*
  * The shmem_request_hook_type hook was introduced in PG 15. Since the number
  * of slots depends on the max_worker_processes GUC, the maximum number of
  * squeeze workers must be a compile time constant for PG < 15.
  *
- * XXX Maybe we don't need to worry about dependency on an in-core GUC - the
- * value should be known at the load time and no loadable module should be
- * able to change it.
+ * XXX Regarding PG < 15: maybe we don't need to worry about dependency on an
+ * in-core GUC - the value should be known at load time and no other loadable
+ * module should be able to change it before we start the shared memory
+ * allocation.
  */
 static int
 max_squeeze_workers(void)
@@ -51,7 +86,7 @@ max_squeeze_workers(void)
 #if PG_VERSION_NUM >= 150000
 	return max_worker_processes;
 #else
-#define	MAX_SQUEEZE_WORKERS	8
+#define	MAX_SQUEEZE_WORKERS	32
 
 	/*
 	 * If max_worker_processes appears to be greater than MAX_SQUEEZE_WORKERS,
@@ -109,12 +144,38 @@ typedef struct SqueezeWorker
 	WorkerTask	*task;
 } SqueezeWorker;
 
-static SqueezeWorker	*SqueezeWorkers = NULL;
+static SqueezeWorker	*squeezeWorkers = NULL;
+static int	squeezeWorkerCount = 0;
+/* One slot per worker. */
+static ReplSlotStatus	*squeezeWorkerSlots = NULL;
+
+#define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
+#define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 static void interrupt_worker(WorkerTask *task);
 static void release_task(WorkerTask *task, bool worker);
 static void reset_progress(WorkerProgress *progress);
 static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
+
+static int get_unused_task_slot_id(int task_id);
+static void initialize_worker_task(WorkerTask *task, int id, Name relschema,
+								   Name relname, Name indname, Name tbspname,
+								   ArrayType *ind_tbsps, bool last_try,
+								   bool skip_analyze);
+static bool start_worker_internal(bool scheduler, int task_id,
+								  BackgroundWorkerHandle **handle);
+
+static void worker_sighup(SIGNAL_ARGS);
+static void worker_sigterm(SIGNAL_ARGS);
+
+static void scheduler_worker_loop(void);
+static void process_task(int task_id);
+static void create_replication_slots(bool snap_shmem);
+static void drop_replication_slots(void);
+static Snapshot build_historic_snapshot(SnapBuild *builder);
+static void process_task_internal(MemoryContext task_cxt);
+
+static uint64 run_command(char *command, int rc);
 
 static Size
 worker_shmem_size(void)
@@ -183,7 +244,6 @@ squeeze_worker_shmem_startup(void)
 			SpinLockInit(&slot->progress.mutex);
 			reset_progress(&slot->progress);
 			slot->pid = InvalidPid;
-			slot->latch = NULL;
 		}
 	}
 
@@ -203,7 +263,6 @@ worker_shmem_shutdown(int code, Datum arg)
 		MyWorkerSlot->relid = InvalidOid;
 		reset_progress(&MyWorkerSlot->progress);
 		MyWorkerSlot->pid = InvalidPid;
-		MyWorkerSlot->latch = NULL;
 		LWLockRelease(workerData->lock);
 
 		/* This shouldn't be necessary, but ... */
@@ -215,49 +274,44 @@ worker_shmem_shutdown(int code, Datum arg)
 		release_task(MyWorkerTask, true);
 
 	/*
-	 * The scheduler worker needs to clean up the task it launched, so they do
-	 * not leak Besides that, it should terminate all the squeeze workers it
-	 * launched, otherwise it'd be hard to keep track of the number of running
-	 * workers if it's started again before the existing workers finish.
+	 * Workers cleanup. It's easier for the user to stop the worker(s) via the
+	 * scheduler than to kill the individual workers.
 	 */
-	if (SqueezeWorkers)
+	if (am_i_scheduler)
 	{
 		int		i;
 
-		for (i = 0; i < squeeze_workers_per_database; i++)
+		for (i = 0; i < squeezeWorkerCount; i++)
 		{
-			SqueezeWorker	*worker = &SqueezeWorkers[i];
+			SqueezeWorker	*worker;
+
+			worker = &squeezeWorkers[i];
+			/*
+			 * Tasks, whose worker could not even get registered, should have been
+			 * handled immediately.
+			 */
+			if (worker->handle == NULL)
+				continue;
 
 			if (worker->task)
 			{
 				interrupt_worker(worker->task);
 				release_task(worker->task, false);
+				worker->task = NULL;
 			}
 		}
 	}
+
+	/*
+	 * Do slot cleanup separately because ERROR possibly had occurred before
+	 * tasks setup started, so the slot information might be missing in the
+	 * tasks. Also note that the worker launched by the squeeze_table()
+	 * function needs to do the cleanup on its own.
+	 */
+	if (am_i_scheduler || am_i_standalone)
+		drop_replication_slots();
+
 }
-
-#if PG_VERSION_NUM >= 150000
-extern Datum create_squeeze_worker_task(PG_FUNCTION_ARGS);
-#endif
-
-static int get_unused_task_slot_id(int task_id);
-static int count_workers(void);
-static void fill_worker_task(WorkerTask *task, int id, Name relschema,
-							 Name relname, Name indname, Name tbspname,
-							 ArrayType *ind_tbsps, bool last_try,
-							 bool skip_analyze);
-static bool start_worker_internal(bool scheduler, int task_id,
-								  BackgroundWorkerHandle **handle);
-
-static void worker_sighup(SIGNAL_ARGS);
-static void worker_sigterm(SIGNAL_ARGS);
-
-static void scheduler_worker_loop(void);
-static void squeeze_worker_loop(int task_id);
-static void process_task(int task_id, MemoryContext task_cxt);
-
-static uint64 run_command(char *command, int rc);
 
 /*
  * Start the scheduler worker.
@@ -266,6 +320,12 @@ PG_FUNCTION_INFO_V1(squeeze_start_worker);
 Datum
 squeeze_start_worker(PG_FUNCTION_ARGS)
 {
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("pg_squeeze cannot be used during recovery.")));
+
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -276,6 +336,9 @@ squeeze_start_worker(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * Stop the scheduler worker.
+ */
 PG_FUNCTION_INFO_V1(squeeze_stop_worker);
 Datum
 squeeze_stop_worker(PG_FUNCTION_ARGS)
@@ -292,13 +355,16 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 	{
 		WorkerSlot *slot = &workerData->slots[i];
 
-		/*
-		 * There should be at least two workers per database: one scheduler
-		 * and one or more workers. Therefore we need to check all the slots
-		 * even if a match is found.
-		 */
-		if (slot->dbid == MyDatabaseId)
+		if (slot->dbid == MyDatabaseId && slot->scheduler)
+		{
 			kill(slot->pid, SIGTERM);
+
+			/*
+			 * There should only be one scheduler per database. (It'll stop
+			 * the squeeze workers it launched.)
+			 */
+			break;
+		}
 	}
 	LWLockRelease(workerData->lock);
 
@@ -327,6 +393,12 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
 
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("pg_squeeze cannot be used during recovery.")));
+
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -353,8 +425,13 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 
 	/* Fill-in the remaining task information. */
 	task = &workerData->tasks[task_id];
-	fill_worker_task(task, -1, relschema, relname, indname, tbspname,
-					 ind_tbsps, false, true);
+	initialize_worker_task(task, -1, relschema, relname, indname, tbspname,
+						   ind_tbsps, false, true);
+	/*
+	 * Unlike scheduler_worker_loop() we cannot build the snapshot here, the
+	 * worker will do. (It will also create the replication slot.) This is
+	 * related to the variable am_i_standalone in process_task().
+	 */
 
 	/* Start the worker to handle the task. */
 	PG_TRY();
@@ -450,9 +527,6 @@ get_unused_task_slot_id(int task_id)
 		 * If task_id is valid, we check below if another task has the same
 		 * task_id.
 		 */
-		if (res >= 0 && task_id < 0)
-			break;
-
 		if (task_id > 0 && task_id == this_task_id)
 		{
 			/* Undo the assignment if made one above. */
@@ -468,38 +542,18 @@ get_unused_task_slot_id(int task_id)
 			/* No point in searching further. */
 			break;
 		}
+		else if (res >= 0)
+			break;
 	}
 
 	return res;
 }
 
 /*
- * Count active workers running in the current database.
- */
-static int
-count_workers(void)
-{
-	int		i;
-	int		nworkers = 0;
-
-	LWLockAcquire(workerData->lock, LW_SHARED);
-	for (i = 0; i < workerData->nslots; i++)
-	{
-		WorkerSlot *slot = &workerData->slots[i];
-
-		if (slot->dbid == MyDatabaseId && !slot->scheduler)
-			nworkers++;
-	}
-	LWLockRelease(workerData->lock);
-
-	return nworkers;
-}
-
-/*
  * Fill-in "user data" of WorkerTask.
  */
 static void
-fill_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
+initialize_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
 				 Name indname, Name tbspname, ArrayType *ind_tbsps,
 				 bool last_try, bool skip_analyze)
 {
@@ -525,7 +579,6 @@ fill_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
 
 	task->last_try = last_try;
 	task->skip_analyze = skip_analyze;
-
 }
 
 /*
@@ -534,11 +587,8 @@ fill_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
  * The number of scheduler workers per database is limited by the
  * squeeze_workers_per_database configuration variable.
  *
- * If task_id is >=0, then it's an index into the array of WorkerTask's in the
- * shared memory. In such a case, wait for the worker to start.
- *
- * Returns false if the worker could not be started due to
- * squeeze_workers_per_database, true in other cases.
+ * The return value tells whether we could at least register the
+ * worker. If true, also wait for the startup.
  */
 static bool
 start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **handle)
@@ -551,19 +601,16 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 
 	Assert(!scheduler || task_id < 0);
 
-	/* Count the squeeze workers. */
-	if (!scheduler)
-	{
-		int		nworkers = count_workers();
-
-		if (nworkers >= squeeze_workers_per_database)
-		{
-			ereport(DEBUG1,
-					(errmsg("cannot start a new squeeze worker, %d workers already running for database %u",
-							squeeze_workers_per_database, MyDatabaseId)));
-			return false;
-		}
-	}
+	/*
+	 * Make sure all the task fields are visible to the worker before starting
+	 * it. This is similar to the use of the write barrier in
+	 * RegisterDynamicBackgroundWorker() in PG core. However, the new process
+	 * does not need to use "read barrier" because once it's started, the
+	 * shared memory writes done by start_worker_internal() must essentially
+	 * have been read. (Otherwise the worker would not start.)
+	 */
+	if (task_id >= 0)
+		pg_write_barrier();
 
 	kind = scheduler ? "scheduler" : "squeeze";
 
@@ -580,28 +627,27 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 				 errmsg("could not register background process"),
 				 errhint("More details may be available in the server log.")));
 
-	if (task_id < 0)
-		return true;
-
 	if (handle == NULL)
-		return true;
+		/*
+		 * Caller is not interested in the status, the return value does not
+		 * matter.
+		 */
+		return false;
+
+	if (*handle == NULL)
+		return false;
 
 	status = WaitForBackgroundWorkerStartup(*handle, &pid);
-	if (status == BGWH_STOPPED)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("could not start background process"),
-				 errhint("More details may be available in the server log.")));
 	if (status == BGWH_POSTMASTER_DIED)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("cannot start background processes without postmaster"),
 				 errhint("Kill all remaining database processes and restart the database.")));
 	/*
-	 * WaitForBackgroundWorkerStartup() should not return
-	 * BGWH_NOT_YET_STARTED.
+	 * The worker could already have stopped. WaitForBackgroundWorkerStartup()
+	 * should not return BGWH_NOT_YET_STARTED.
 	 */
-	Assert(status == BGWH_STARTED);
+	Assert(status == BGWH_STARTED || status == BGWH_STOPPED);
 
 	ereport(DEBUG1,
 			(errmsg("pg_squeeze %s worker started, pid=%d", kind, pid)));
@@ -698,28 +744,6 @@ static volatile sig_atomic_t got_sigterm = false;
  */
 static int	worker_naptime = 20;
 
-/*
- * There are 2 kinds of worker: 1) scheduler, which creates new tasks, 2) the
- * actual "squeeze worker" which calls the squeeze_table() function. With
- * scheduling independent from the actual table processing we check the table
- * status exactly (with the granularity of one minute) at the scheduled
- * time. This way we avoid the tricky question how long should particular
- * schedule stay valid and thus we can use equality operator to check if the
- * scheduled time is there.
- *
- * There are 2 alternatives to the equality test: 1) schedule is valid for
- * some time interval which is hard to define, 2) the schedule is valid
- * forever - this is bad because it allows table processing even hours after
- * the schedule if the table happens to get bloated some time after the
- * schedule.
- *
- * If the squeeze_table() function makes the following tasks delayed, it's
- * another problem that we can address by increasing the number of "squeeze
- * workers". (In that case we'd have to adjust the replication slot naming
- * scheme so that there are no conflicts.)
- */
-static bool am_i_scheduler = false;
-
 void
 squeeze_worker_main(Datum main_arg)
 {
@@ -786,7 +810,7 @@ squeeze_worker_main(Datum main_arg)
 			}
 			else if (!am_i_scheduler && !slot->scheduler)
 			{
-				if (nworkers++ >= squeeze_workers_per_database)
+				if (++nworkers >= squeeze_workers_per_database)
 				{
 					elog(WARNING,
 						 "%d squeeze worker(s) already running on database oid=%u",
@@ -796,14 +820,15 @@ squeeze_worker_main(Datum main_arg)
 			}
 		}
 	}
-	LWLockRelease(workerData->lock);
+
 	if (found || (nworkers >= squeeze_workers_per_database))
+	{
+		LWLockRelease(workerData->lock);
 		goto done;
+	}
 
 	/* Find and initialize a slot for this worker. */
 	Assert(MyWorkerSlot == NULL);
-	found = false;
-	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
 		WorkerSlot *slot = &workerData->slots[i];
@@ -815,7 +840,6 @@ squeeze_worker_main(Datum main_arg)
 			Assert(slot->pid == InvalidPid);
 			slot->pid = MyProcPid;
 			slot->scheduler = am_i_scheduler;
-			slot->latch = MyLatch;
 
 			MyWorkerSlot = slot;
 			MyWorkerProgress = &slot->progress;
@@ -844,7 +868,7 @@ squeeze_worker_main(Datum main_arg)
 	if (am_i_scheduler)
 		scheduler_worker_loop();
 	else
-		squeeze_worker_loop(task_id);
+		process_task(task_id);
 
 done:
 	proc_exit(0);
@@ -877,33 +901,20 @@ scheduler_worker_loop(void)
 {
 	long		delay = 0L;
 	int		i;
-	SqueezeWorker	*worker;
 	MemoryContext	sched_cxt, old_cxt;
-
-	/* Initialize the array to track the workers we start. */
-	SqueezeWorkers = (SqueezeWorker *) palloc(squeeze_workers_per_database *
-											  sizeof(SqueezeWorker));
-	for (i = 0; i < squeeze_workers_per_database; i++)
-	{
-		worker = &SqueezeWorkers[i];
-		worker->handle = NULL;
-		worker->task = NULL;
-	}
 
 	/* Context for allocations which cannot be freed too early. */
 	sched_cxt = AllocSetContextCreate(TopMemoryContext,
 									  "pg_squeeze scheduler context",
 									  ALLOCSET_DEFAULT_SIZES);
-
 	while (!got_sigterm)
 	{
-		int		navail = 0;
 		StringInfoData	query;
 		int			rc;
 		uint64		ntask;
 		TupleDesc	tupdesc;
 		TupleTableSlot *slot;
-		List	*ids = NIL;
+		List	*ids;
 		ListCell	*lc;
 
 		rc = WaitLatch(MyLatch,
@@ -921,47 +932,51 @@ scheduler_worker_loop(void)
 		}
 
 		/*
-		 * Check the status of the workers we have started in the previous
-		 * loops, and see how many workers we can launch in this loop.
+		 * Wait until all the workers started in the previous loops have
+		 * finished.
 		 */
-		for (i = 0; i < squeeze_workers_per_database; i++)
+		for (i = 0; i < squeezeWorkerCount; i++)
 		{
-			worker = &SqueezeWorkers[i];
+			SqueezeWorker	*worker = &squeezeWorkers[i];
+			BgwHandleStatus	status;
 
-			if (worker->handle)
-			{
-				pid_t		pid;
-				BgwHandleStatus	status;
-
-				status = GetBackgroundWorkerPid(worker->handle, &pid);
-
-				if (status == BGWH_STOPPED)
-				{
-					worker->handle = NULL;
-					release_task(worker->task, false);
-					worker->task = NULL;
-				}
-				else if (status == BGWH_POSTMASTER_DIED)
-				{
-					ereport(ERROR,
-							(errmsg("the postmaster died before the squeeze worker could finish"),
-							 errhint("More details may be available in the server log.")));
-				}
-
-			}
+			/*
+			 * Not even started? (Task for this worker should be released
+			 * immediately after the failed start.
+			 */
 			if (worker->handle == NULL)
-				navail++;
+				continue;
+
+			status = WaitForBackgroundWorkerShutdown(worker->handle);
+			if (status == BGWH_POSTMASTER_DIED)
+			{
+				ereport(ERROR,
+						(errmsg("the postmaster died before the squeeze worker could finish"),
+						 errhint("More details may be available in the server log.")));
+			}
+			/*
+			 * WaitForBackgroundWorkerShutdown() should not return anything
+			 * else.
+			 */
+			Assert(status == BGWH_STOPPED);
+
+			/* Cleanup. */
+			release_task(worker->task, false);
 		}
 
-		/*
-		 * If we cannot start a new worker, wait on the latch until we're
-		 * notified about a status change of a worker we launched earlier.
-		 */
-		if (navail == 0)
-			continue;
+		if (squeezeWorkers)
+		{
+			pfree(squeezeWorkers);
+			squeezeWorkers = NULL;
+		}
 
-		ereport(DEBUG1, (errmsg("scheduler worker: %d workers available",
-								navail)));
+		/* Drop the replication slots. */
+		if (squeezeWorkerCount > 0)
+			drop_replication_slots();
+		squeezeWorkerCount = 0;
+
+		/* Free other memory allocated for the just-stopped workers. */
+		MemoryContextReset(sched_cxt);
 
 		run_command("SELECT squeeze.check_schedule()", SPI_OK_SELECT);
 
@@ -985,7 +1000,7 @@ scheduler_worker_loop(void)
 			"ON (tb.tabschema, tb.tabname) = (w.tabschema, w.tabname) "
 			"WHERE w.tabname ISNULL AND t.state = 'ready' AND t.table_id = tb.id "
 			"ORDER BY t.id "
-			"LIMIT %d", navail);
+			"LIMIT %d", squeeze_workers_per_database);
 
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -1003,6 +1018,9 @@ scheduler_worker_loop(void)
 #else
 		ntask = SPI_processed;
 #endif
+
+		ereport(DEBUG1, (errmsg("scheduler worker: %zu tasks available",
+								ntask)));
 
 		if (ntask > 0)
 		{
@@ -1083,9 +1101,9 @@ scheduler_worker_loop(void)
 			skip_analyze = DatumGetBool(datum);
 
 			/* Fill the task. */
-			fill_worker_task(task, task_id, relschema, relname, cl_index,
-							 rel_tbsp, ind_tbsps, last_try, skip_analyze);
-
+			initialize_worker_task(task, task_id, relschema, relname,
+								   cl_index, rel_tbsp, ind_tbsps, last_try,
+								   skip_analyze);
 
 			/* The list must survive SPI_finish(). */
 			old_cxt = MemoryContextSwitchTo(sched_cxt);
@@ -1105,63 +1123,64 @@ scheduler_worker_loop(void)
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		/*
-		 * Now that the transaction has committed, we can start the
-		 * workers. (start_worker_internal() needs to run in a transaction
-		 * because it does access the system catalog.)
-		 */
-		foreach(lc, ids)
+		/* Initialize the array to track the workers we start. */
+		squeezeWorkerCount = list_length(ids);
+
+		if (squeezeWorkerCount > 0)
 		{
-			SqueezeWorker	*worker = NULL;
-			bool	found = false;
-			int	task_id;
-			bool	too_many;
+			squeezeWorkers = (SqueezeWorker *) palloc0(squeezeWorkerCount *
+													   sizeof(SqueezeWorker));
 
-			/* Find the array element for the next worker. */
-			for (i = 0; i < squeeze_workers_per_database; i++)
-			{
-				worker = &SqueezeWorkers[i];
-				if (worker->handle == NULL)
-				{
-					Assert(worker->task == NULL);
-
-					found = true;
-					break;
-				}
-			}
-			if (!found)
-				/* Should not happen, given we check of navail above ... */
-				ereport(ERROR,
-						(errmsg("cannot launch more squeeze workers")));
-
-			task_id = lfirst_int(lc);
-			worker->task = &workerData->tasks[task_id];
-
-			SetCurrentStatementStartTimestamp();
-			StartTransactionCommand();
+			/* Create and initialize the replication slot for each worker. */
+			create_replication_slots(true);
 
 			/*
-			 * The handle (and possibly other allocations) must survive
-			 * the current transaction.
+			 * Now that the transaction has committed, we can start the
+			 * workers. (start_worker_internal() needs to run in a transaction
+			 * because it does access the system catalog.)
 			 */
-			old_cxt = MemoryContextSwitchTo(sched_cxt);
-			too_many = !start_worker_internal(false, task_id,
-											  &worker->handle);
-			MemoryContextSwitchTo(old_cxt);
-
-			/*
-			 * workers_per_database can be exceeded if we are using all the
-			 * workers allowed by this limit and the squeeze_table() function
-			 * manages to use some of them at the same time. If we release the
-			 * task, the query should fetch it again.
-			 */
-			if (too_many)
+			i = 0;
+			foreach(lc, ids)
 			{
-				release_task(worker->task, false);
-				worker->task = NULL;
+				SqueezeWorker	*worker;
+				int	task_id;
+				bool	not_registered;
+
+				worker = &squeezeWorkers[i];
 				worker->handle = NULL;
+				task_id = lfirst_int(lc);
+				worker->task = &workerData->tasks[task_id];
+				worker->task->repl_slot = squeezeWorkerSlots[i];
+
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+
+				/*
+				 * The handle (and possibly other allocations) must survive
+				 * the current transaction.
+				 */
+				old_cxt = MemoryContextSwitchTo(sched_cxt);
+				not_registered = !start_worker_internal(false, task_id,
+														&worker->handle);
+				MemoryContextSwitchTo(old_cxt);
+
+				/*
+				 * The query to fetch tasks above uses the
+				 * workers_per_database GUC as LIMIT, but squeeze_table() can
+				 * run additional worker(s) before we get here. Release the
+				 * task immediately so it can possibly be used for another
+				 * database in the cluster.
+				 */
+				if (not_registered)
+				{
+					Assert(worker->handle == NULL);
+
+					release_task(worker->task, false);
+				}
+				CommitTransactionCommand();
+
+				i++;
 			}
-			CommitTransactionCommand();
 		}
 
 		/* Check later if any table meets the schedule. */
@@ -1171,11 +1190,11 @@ scheduler_worker_loop(void)
 	MemoryContextDelete(sched_cxt);
 }
 
-/* TODO No longer a loop - rename? Or get rid of the function altogether? */
 static void
-squeeze_worker_loop(int task_id)
+process_task(int task_id)
 {
 	MemoryContext task_cxt;
+	ErrorData  *edata;
 
 	/*
 	 * Memory context for auxiliary per-task allocations.
@@ -1184,15 +1203,297 @@ squeeze_worker_loop(int task_id)
 									 "pg_squeeze task context",
 									 ALLOCSET_DEFAULT_SIZES);
 
-	/* Process the assigned task. */
-	process_task(task_id, task_cxt);
+	Assert(task_id < NUM_WORKER_TASKS);
+	MyWorkerTask = &workerData->tasks[task_id];
 
-	/*
-	 * Regarding the replication slot, ReplicationSlotInitialize() callback
-	 * should be setup via before_shmem_exit() during bgworker startup.
-	 */
+	/* Process the assigned task. */
+	PG_TRY();
+	{
+		process_task_internal(task_cxt);
+	}
+	PG_CATCH();
+	{
+		squeeze_handle_error_db(&edata, task_cxt);
+		squeeze_handle_error_app(edata, MyWorkerTask);
+
+		/*
+		 * Not sure it makes sense to rethrow the ERROR. The worker is going
+		 * to exit anyway.
+		 */
+	}
+	PG_END_TRY();
 
 	MemoryContextDelete(task_cxt);
+}
+
+/*
+ * Create a replication slot for each squeeze worker and find the start point
+ * for logical decoding.
+ *
+ * We create and initialize all the slots at once because
+ * DecodingContextFindStartpoint() waits for the running transactions to
+ * complete. If each worker had to initialize its slot, it'd have wait until
+ * the other worker(s) are done with their current job (which usually takes
+ * some time), so the workers wouldn't actually do their work in parallel.
+ *
+ * If snap_shmem is true, the historic snapshot is stored in the shared
+ * memory, otherwise in the backend private memory.
+ */
+static void
+create_replication_slots(bool snap_shmem)
+{
+	uint32		i;
+	ReplSlotStatus	*res_ptr;
+	MemoryContext	old_cxt;
+
+	Assert(squeezeWorkerSlots == NULL && squeezeWorkerCount > 0);
+
+	/*
+	 * Use a transaction so that all the slot related locks are freed on ERROR
+	 * and thus drop_replication_slots() can do its work.
+	 */
+	StartTransactionCommand();
+
+#if PG_VERSION_NUM >= 150000
+	CheckSlotPermissions();
+#endif
+	CheckLogicalDecodingRequirements();
+
+	/*
+	 * We are in a transaction, so make sure various allocations survive the
+	 * transaction commit.
+	 */
+	old_cxt = MemoryContextSwitchTo(TopMemoryContext);
+	squeezeWorkerSlots = (ReplSlotStatus *) palloc0(squeezeWorkerCount *
+													sizeof(ReplSlotStatus));
+
+	res_ptr = squeezeWorkerSlots;
+
+	/*
+	 * XXX It might be faster if we created one slot using the API and the
+	 * other ones by copying, however pg_copy_logical_replication_slot() is
+	 * not present in PG 11. Moreover, it passes need_full_snapshot=false to
+	 * CreateInitDecodingContext().
+	 */
+	for (i = 0; i < squeezeWorkerCount; i++)
+	{
+		char	name[NAMEDATALEN];
+		LogicalDecodingContext *ctx;
+		ReplicationSlot *slot;
+		Snapshot	snapshot;
+		Size		snap_size;
+		char		*snap_dst;
+
+		snprintf(name, NAMEDATALEN, REPL_SLOT_BASE_NAME "%u_%u", MyDatabaseId,
+				 i);
+
+#if PG_VERSION_NUM >= 140000
+		ReplicationSlotCreate(name, true, RS_PERSISTENT, false);
+#else
+		ReplicationSlotCreate(name, true, RS_PERSISTENT);
+#endif
+		slot = MyReplicationSlot;
+
+		/*
+		 * Save the name early so that the slot gets cleaned up if the steps
+		 * below throw ERROR.
+		 */
+		namestrcpy(&res_ptr->name, slot->data.name.data);
+
+		/*
+		 * Neither prepare_write nor do_write callback nor update_progress is
+		 * useful for us.
+		 *
+		 * Regarding the value of need_full_snapshot, we pass true to protect
+		 * its data from VACUUM. Otherwise the historical snapshot we use for
+		 * the initial load could miss some data. (Unlike logical decoding, we
+		 * need the historical snapshot for non-catalog tables.)
+		 */
+		ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
+										NIL,
+										true,
+#if PG_VERSION_NUM >= 120000
+										InvalidXLogRecPtr,
+#endif
+#if PG_VERSION_NUM >= 130000
+										XL_ROUTINE(.page_read = read_local_xlog_page,
+												   .segment_open = wal_segment_open,
+												   .segment_close = wal_segment_close),
+#else
+										logical_read_local_xlog_page,
+#endif
+										NULL, NULL, NULL);
+
+
+		/*
+		 * We don't have control on setting fast_forward, so at least check
+		 * it.
+		 */
+		Assert(!ctx->fast_forward);
+
+		SpinLockAcquire(&slot->mutex);
+		Assert(TransactionIdIsValid(slot->effective_xmin) &&
+			   !TransactionIdIsValid(slot->data.xmin));
+		/* Prevent ReplicationSlotRelease() from clearing effective_xmin. */
+		slot->data.xmin = slot->effective_xmin;
+		SpinLockRelease(&slot->mutex);
+
+		/*
+		 * Bring the snapshot builder into the SNAPBUILD_CONSISTENT state so
+		 * that the worker can get its snapshot and start decoding
+		 * immediately. This is where we might need to wait for other
+		 * transactions to finish, so it should not be done by the workers.
+		 */
+		DecodingContextFindStartpoint(ctx);
+
+		/* Get the values the caller is interested int. */
+		res_ptr->confirmed_flush = slot->data.confirmed_flush;
+
+		/*
+		 * Unfortunately the API is such that CreateDecodingContext() assumes
+		 * need_full_snapshot=false, so the worker won't be able to create the
+		 * snapshot for the initial load. Therefore we serialize the snapshot
+		 * here and pass the name to the worker via shared memory.
+		 */
+		snapshot = build_historic_snapshot(ctx->snapshot_builder);
+		snap_size = EstimateSnapshotSpace(snapshot);
+		if (snap_shmem)
+		{
+			res_ptr->snap_seg = dsm_create(snap_size, 0);
+			/*
+			 * The current transaction's commit must not detach the
+			 * segment.
+			 */
+			dsm_pin_mapping(res_ptr->snap_seg);
+			res_ptr->snap_handle = dsm_segment_handle(res_ptr->snap_seg);
+			res_ptr->snap_private = NULL;
+			snap_dst = (char *) dsm_segment_address(res_ptr->snap_seg);
+		}
+		else
+		{
+			res_ptr->snap_seg = NULL;
+			res_ptr->snap_handle = DSM_HANDLE_INVALID;
+			snap_dst = res_ptr->snap_private = (char *) palloc(snap_size);
+		}
+		/*
+		 * XXX Should we care about alignment? The function doesn't seem to
+		 * need that.
+		 */
+		SerializeSnapshot(snapshot, snap_dst);
+
+		res_ptr++;
+
+		/*
+		 * Done for now, the worker will have to setup the context on its own.
+		 */
+		FreeDecodingContext(ctx);
+		ReplicationSlotRelease();
+	}
+
+	MemoryContextSwitchTo(old_cxt);
+	CommitTransactionCommand();
+}
+
+/*
+ * Drop replication slots the worker created. If this is the scheduler worker,
+ * we may need to wait for the squeeze workers to release the slots.
+ */
+static void
+drop_replication_slots(void)
+{
+	int		i;
+
+	/*
+	 * Called during normal operation and now called again by the
+	 * worker_shmem_shutdown callback?
+	 */
+	if (squeezeWorkerSlots == NULL)
+		return;
+
+	/*
+	 * ERROR in create_replication_slots() can leave us with one of the slots
+	 * acquired, so release it before we start dropping them all.
+	 */
+	if (MyReplicationSlot)
+		ReplicationSlotRelease();
+
+	for (i = 0; i < squeezeWorkerCount; i++)
+	{
+		ReplSlotStatus	*slot;
+
+		slot = &squeezeWorkerSlots[i];
+		if (strlen(NameStr(slot->name)) > 0)
+		{
+			/* nowait=false, i.e. wait */
+			ReplicationSlotDrop(NameStr(slot->name), false);
+		}
+	}
+
+	if (squeezeWorkerSlots)
+		pfree(squeezeWorkerSlots);
+	squeezeWorkerSlots = NULL;
+}
+
+/*
+ * Wrapper for SnapBuildInitialSnapshot().
+ *
+ * We do not have to meet the assertions that SnapBuildInitialSnapshot()
+ * contains, nor should we set MyPgXact->xmin.
+ */
+static Snapshot
+build_historic_snapshot(SnapBuild *builder)
+{
+	Snapshot	result;
+	int			XactIsoLevel_save;
+	TransactionId xmin_save;
+
+	/*
+	 * Fake XactIsoLevel so that the assertions in SnapBuildInitialSnapshot()
+	 * don't fire.
+	 */
+	XactIsoLevel_save = XactIsoLevel;
+	XactIsoLevel = XACT_REPEATABLE_READ;
+
+	/*
+	 * Likewise, fake MyPgXact->xmin so that the corresponding check passes.
+	 */
+#if PG_VERSION_NUM >= 140000
+	xmin_save = MyProc->xmin;
+	MyProc->xmin = InvalidTransactionId;
+#else
+	xmin_save = MyPgXact->xmin;
+	MyPgXact->xmin = InvalidTransactionId;
+#endif
+
+	/*
+	 * Call the core function to actually build the snapshot.
+	 */
+	result = SnapBuildInitialSnapshot(builder);
+
+	/*
+	 * Restore the original values.
+	 */
+	XactIsoLevel = XactIsoLevel_save;
+#if PG_VERSION_NUM >= 140000
+	MyProc->xmin = xmin_save;
+#else
+	MyPgXact->xmin = xmin_save;
+#endif
+
+	/*
+	 * Fix the "satisfies" function that PG core incorrectly sets to
+	 * HeapTupleSatisfiesHistoricMVCC.
+	 *
+	 * https://www.postgresql.org/message-id/23215.1527665193%40localhost
+	 *
+	 * XXX Remove this assignment as soon as all the supported PG versions
+	 * have the problem fixed.
+	 */
+#if PG_VERSION_NUM < 120000
+	result->satisfies = HeapTupleSatisfiesMVCC;
+#endif
+
+	return result;
 }
 
 /*
@@ -1205,7 +1506,7 @@ squeeze_worker_loop(int task_id)
  * task_id is an index into the shared memory array of tasks
  */
 static void
-process_task(int task_id, MemoryContext task_cxt)
+process_task_internal(MemoryContext task_cxt)
 {
 	int			i;
 	Name		relschema,
@@ -1213,7 +1514,6 @@ process_task(int task_id, MemoryContext task_cxt)
 	Name		cl_index = NULL;
 	Name		rel_tbsp = NULL;
 	ArrayType  *ind_tbsps = NULL;
-	MemoryContext oldcxt;
 	WorkerTask *task;
 	uint32		arr_size;
 	TimestampTz start_ts;
@@ -1224,11 +1524,23 @@ process_task(int task_id, MemoryContext task_cxt)
 	bool		found;
 	ErrorData  *edata;
 
-	Assert(MyWorkerTask == NULL);
+	task = MyWorkerTask;
 
-	/* First, check for a task in the shared memory. */
-	Assert(task_id < NUM_WORKER_TASKS);
-	task = MyWorkerTask = &workerData->tasks[task_id];
+	/*
+	 * Create the replication slot if there is none. This happens when the
+	 * worker is started by the squeeze_table() function, which is run by the
+	 * PG executor and therefore cannot build the historic snapshot (due to
+	 * the commit 240e0dbacd in PG core).
+	 */
+	if (task->repl_slot.snap_handle == DSM_HANDLE_INVALID)
+		am_i_standalone = true;
+
+	if (am_i_standalone)
+	{
+		squeezeWorkerCount = 1;
+		create_replication_slots(false);
+		task->repl_slot = squeezeWorkerSlots[0];
+	}
 
 	/*
 	 * Once the backend sets "assigned" and the worker is launched, only the
@@ -1267,33 +1579,16 @@ process_task(int task_id, MemoryContext task_cxt)
 	/* Retrieve relid of the table. */
 	StartTransactionCommand();
 	relrv = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
-	success = true;
-	PG_TRY();
-	{
 #if PG_VERSION_NUM >= 120000
-		rel = table_openrv(relrv, AccessShareLock);
-		relid = RelationGetRelid(rel);
-		table_close(rel, AccessShareLock);
+	rel = table_openrv(relrv, AccessShareLock);
+	relid = RelationGetRelid(rel);
+	table_close(rel, AccessShareLock);
 #else
-		rel = heap_openrv(relrv, AccessShareLock);
-		relid = RelationGetRelid(rel);
-		heap_close(rel, AccessShareLock);
+	rel = heap_openrv(relrv, AccessShareLock);
+	relid = RelationGetRelid(rel);
+	heap_close(rel, AccessShareLock);
 #endif
-		CommitTransactionCommand();
-	}
-	PG_CATCH();
-	{
-		squeeze_handle_error_db(&edata, task_cxt);
-		squeeze_handle_error_app(edata, task);
-		success = false;
-	}
-	PG_END_TRY();
-
-	if (!success)
-	{
-		release_task(MyWorkerTask, true);
-		return;
-	}
+	CommitTransactionCommand();
 
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	found = false;
@@ -1310,12 +1605,11 @@ process_task(int task_id, MemoryContext task_cxt)
 	}
 	if (found)
 	{
-		/* XXX The scheduler should not allow this.? */
+		/* XXX The scheduler should not allow this? */
 		ereport(DEBUG1,
 				(errmsg("task for table %s.%s is being processed by another worker",
 						NameStr(*relschema), NameStr(*relname))));
 		LWLockRelease(workerData->lock);
-		release_task(MyWorkerTask, true);
 		return;
 	}
 	/* Declare that this worker takes care of the relation. */
@@ -1384,6 +1678,7 @@ process_task(int task_id, MemoryContext task_cxt)
 		FmgrInfo	fmgrinfo;
 		char	   *start_ts_str;
 		StringInfoData	query;
+		MemoryContext oldcxt;
 
 		initStringInfo(&query);
 		StartTransactionCommand();
@@ -1391,7 +1686,7 @@ process_task(int task_id, MemoryContext task_cxt)
 		fmgr_info(outfunc, &fmgrinfo);
 		start_ts_str = OutputFunctionCall(&fmgrinfo, TimestampTzGetDatum(start_ts));
 		/* Make sure the string survives TopTransactionContext. */
-		MemoryContextSwitchTo(task_cxt);
+		oldcxt = MemoryContextSwitchTo(task_cxt);
 		start_ts_str = pstrdup(start_ts_str);
 		MemoryContextSwitchTo(oldcxt);
 		CommitTransactionCommand();
@@ -1447,8 +1742,6 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 		}
 	}
 
-	release_task(MyWorkerTask, true);
-
 	/* Clear the relid field of this worker's slot. */
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	MyWorkerSlot->relid = InvalidOid;
@@ -1473,12 +1766,12 @@ squeeze_handle_error_app(ErrorData *edata, WorkerTask *task)
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
-VALUES ('%s', '%s', '%s', '%s', '%s')",
+VALUES ('%s', '%s', '%s', %s, %s)",
 					 NameStr(task->relschema),
 					 NameStr(task->relname),
 					 unpack_sql_state(edata->sqlerrcode),
-					 edata->message,
-					 edata->detail ? edata->detail : "");
+					 quote_literal_cstr(edata->message),
+					 edata->detail ? quote_literal_cstr(edata->detail) : "''");
 	run_command(query.data, SPI_OK_INSERT);
 
 	if (task->task_id >= 0)
@@ -1523,18 +1816,39 @@ release_task(WorkerTask *task, bool worker)
 	SpinLockAcquire(&task->mutex);
 	if (worker)
 	{
-		/* Called from background worker. */
+		/* Called from squeeze worker. */
 		task->slot = NULL;
 		Assert(task == MyWorkerTask);
 		task->exit_requested = false;
+		/*
+		 * The "standalone" worker might have used its private memory for the
+		 * snapshot.
+		 */
+		if (task->repl_slot.snap_private)
+		{
+			Assert(am_i_standalone);
+			pfree(task->repl_slot.snap_private);
+			task->repl_slot.snap_private = NULL;
+		}
+		/*
+		 * Do not care about detaching from the shared memory:
+		 * setup_decoding() runs in a transaction, so the resource owner of
+		 * that transaction will take care.
+		 */
+
 		MyWorkerTask = NULL;
 	}
 	else
 	{
 		/* Called from backend or from the scheduler worker. */
-
 		Assert(task->assigned);
 		task->assigned = false;
+		if (task->repl_slot.snap_seg)
+		{
+			dsm_detach(task->repl_slot.snap_seg);
+			task->repl_slot.snap_seg = NULL;
+			task->repl_slot.snap_handle = DSM_HANDLE_INVALID;
+		}
 	}
 	SpinLockRelease(&task->mutex);
 }

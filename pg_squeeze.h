@@ -20,12 +20,18 @@
 #if PG_VERSION_NUM < 130000
 #include "access/tuptoaster.h"
 #endif
-#include "access/xlog_internal.h"
 #include "access/xact.h"
+#if PG_VERSION_NUM >= 130000
+#include "access/xlogutils.h"
+#endif
+#include "access/xlog_internal.h"
 #include "catalog/pg_class.h"
 #include "nodes/execnodes.h"
 #include "postmaster/bgworker.h"
 #include "replication/logical.h"
+#if PG_VERSION_NUM < 130000
+#include "replication/logicalfuncs.h"
+#endif
 #include "replication/origin.h"
 #include "storage/ipc.h"
 #include "utils/array.h"
@@ -285,8 +291,27 @@ typedef struct WorkerSlot
 	bool		scheduler;		/* true if scheduler, false if the "squeeze
 								 * worker" */
 	WorkerProgress progress;	/* progress tracking information */
-	Latch	   *latch;			/* use this to wake up the worker */
 } WorkerSlot;
+
+/*
+ * Information on a replication slot that we pass to squeeze workers.
+ */
+typedef struct ReplSlotStatus
+{
+	/* Slot name */
+	NameData	name;
+
+	/* A copy of the same field of ReplicationSlotPersistentData. */
+	XLogRecPtr	confirmed_flush;
+
+	/* Shared memory to pass the initial snapshot to the worker. */
+	dsm_handle	snap_handle;
+	/* Only needed by the scheduler. */
+	dsm_segment	*snap_seg;
+
+	/* The snapshot in the backend private memory. */
+	char	*snap_private;
+} ReplSlotStatus;
 
 /*
  * This structure represents a task assigned to the worker via shared memory.
@@ -328,6 +353,8 @@ typedef struct WorkerTask
 	 */
 #define IND_TABLESPACES_ARRAY_SIZE	1024
 	char		ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
+
+	ReplSlotStatus	repl_slot;
 } WorkerTask;
 
 extern WorkerTask *MyWorkerTask;

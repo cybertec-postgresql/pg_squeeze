@@ -45,14 +45,9 @@
 #else
 #include "optimizer/planner.h"
 #endif
-#if PG_VERSION_NUM < 130000
-#include "replication/logicalfuncs.h"
-#endif
-#include "replication/snapbuild.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
-#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/standbydefs.h"
 #include "tcop/tcopprot.h"
@@ -65,18 +60,11 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-#if PG_VERSION_NUM < 120000
-#include "utils/tqual.h"
-#endif
-
 #if PG_VERSION_NUM < 100000
 #error "PostgreSQL version 10 or higher is required"
 #endif
 
 PG_MODULE_MAGIC;
-
-#define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
-#define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 static void squeeze_table_internal(Name relschema, Name relname, Name indname,
 								   Name tbspname, ArrayType *ind_tbsp);
@@ -102,7 +90,8 @@ typedef struct TablespaceInfo
 XLogSegNo	squeeze_current_segment = 0;
 
 static void check_prerequisites(Relation rel);
-static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
+static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc,
+											  Snapshot *snap_hist);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
 static void get_pg_class_info(Oid relid, TransactionId *xmin,
@@ -125,7 +114,6 @@ static void free_tablespace_info(TablespaceInfo *tbsp_info);
 static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
 									 CatalogState *cat_state,
 									 ArrayType *ind_tbsp_a);
-static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst,
 								 LogicalDecodingContext *ctx);
@@ -446,6 +434,7 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	TablespaceInfo *tbsp_info;
 	ObjectAddress object;
 	bool		source_finalized;
+	bool		xmin_valid;
 
 	relrv_src = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
 #if PG_VERSION_NUM >= 120000
@@ -503,6 +492,14 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	 *
 	 * We can't keep the lock till the end of transaction anyway - that's why
 	 * check_catalog_changes() exists.
+	 *
+	 * XXX Now that the squeeze worker launched by the scheduler worker no
+	 * longer needs to call DecodingContextFindStartpoint(), it should not see
+	 * running transactions that started before the restart_lsn, so it's
+	 * probably no longer necessary to close the relation here. (The worker
+	 * launched by the squeeze_table() function does call
+	 * DecodingContextFindStartpoint(), however it does so before the current
+	 * transaction is started.) Reconsider.
 	 */
 #if PG_VERSION_NUM >= 120000
 	table_close(rel_src, AccessShareLock);
@@ -596,13 +593,7 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	for (i = 0; i < nindexes; i++)
 		indexes_src[i] = cat_state->indexes[i].oid;
 
-	ctx = setup_decoding(relid_src, tup_desc);
-
-	/*
-	 * Build an "historic snapshot", i.e. one that reflect the table state at
-	 * the moment the snapshot builder reached SNAPBUILD_CONSISTENT state.
-	 */
-	snap_hist = build_historic_snapshot(ctx->snapshot_builder);
+	ctx = setup_decoding(relid_src, tup_desc, &snap_hist);
 
 	relid_dst = create_transient_table(cat_state, tup_desc, tbsp_info->table,
 									   rel_src_owner);
@@ -653,16 +644,25 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	 */
 	slot = ctx->slot;
 	SpinLockAcquire(&slot->mutex);
-	Assert(TransactionIdIsValid(slot->effective_xmin) &&
-		   !TransactionIdIsValid(slot->data.xmin));
+	xmin_valid = TransactionIdIsValid(slot->effective_xmin);
 	slot->effective_xmin = InvalidTransactionId;
 	SpinLockRelease(&slot->mutex);
+
+	/*
+	 * This should not happen, but it's critical, therefore use ereport()
+	 * rather than Assert(). If the value got lost somehow due to releasing
+	 * and acquiring the slot, VACUUM could have removed some rows from the
+	 * source table that the historic snapshot was still supposed to see.
+	 */
+	if (!xmin_valid)
+		ereport(ERROR,
+				(errmsg("effective_xmin of the replication slot \"%s\" is invalid",
+						NameStr(slot->data.name))));
 
 	/*
 	 * The historic snapshot won't be needed anymore.
 	 */
 	PopActiveSnapshot();
-	pfree(snap_hist);
 
 	/*
 	 * This is rather paranoia than anything else --- perform_initial_load()
@@ -982,90 +982,63 @@ check_prerequisites(Relation rel)
 }
 
 /*
- * This function is much like pg_create_logical_replication_slot() except that
- * the new slot is neither released (if anyone else could read changes from
- * our slot, we could miss changes other backends do while we copy the
- * existing data into temporary table), nor persisted (it's easier to handle
- * crash by restarting all the work from scratch).
- *
- * XXX Even though CreateInitDecodingContext() does not set state to
- * RS_PERSISTENT, it does write the slot to disk. We rely on
- * RestoreSlotFromDisk() to delete ephemeral slots during startup. (Both ERROR
- * and FATAL should lead to cleanup even before the cluster goes down.)
+ * Acquire logical replication slot which created either by the scheduler
+ * worker or by a backend executing the squeeze_table() function.
  */
 static LogicalDecodingContext *
-setup_decoding(Oid relid, TupleDesc tup_desc)
+setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 {
-	StringInfo	buf;
-	LogicalDecodingContext *ctx;
+	ReplSlotStatus	*repl_slot = &MyWorkerTask->repl_slot;
 	DecodingOutputState *dstate;
 	MemoryContext oldcontext;
+	LogicalDecodingContext *ctx;
+	XLogRecPtr	restart_lsn;
+	dsm_segment *seg = NULL;
+	char	*snap_src;
 
-	/* check_permissions() "inlined", as logicalfuncs.c does not export it. */
-	if (!superuser() && !has_rolreplication(GetUserId()))
+	/*
+	 * Use the slot initialized by the scheduler worker (or by the backend
+	 * running the squeeze_table() function ).
+	 */
+	ReplicationSlotAcquire(NameStr(repl_slot->name), true);
+
+	/*
+	 * It's pretty unlikely for some client to have consumed data changes
+	 * (accidentally?)  before this worker could acquire the slot, but it's
+	 * easy enough to check.
+	 */
+	if (MyReplicationSlot->data.confirmed_flush != repl_slot->confirmed_flush)
 		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("must be superuser or replication role to use replication slots"))));
+				(errmsg("replication slot \"%s\" has incorrect confirm position",
+						NameStr(repl_slot->name))));
 
-	CheckLogicalDecodingRequirements();
+	restart_lsn = MyReplicationSlot->data.restart_lsn;
 
-	/* Make sure there's no conflict with the SPI and its contexts. */
-	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
-
-	/*
-	 * Each database has a single background worker, so database-specific slot
-	 * name should be fine. However, an user might want to squeeze arbitrary
-	 * number of tables manually, therefore we include relid in the slot name.
-	 */
-	buf = makeStringInfo();
-	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
-	appendStringInfo(buf, "%u_%u", MyDatabaseId, relid);
-#if PG_VERSION_NUM >= 140000
-	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
-#else
-	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL);
-#endif
-
-	/*
-	 * Neither prepare_write nor do_write callback nor update_progress is
-	 * useful for us.
-	 *
-	 * Regarding the value of need_full_snapshot, we pass true to protect its
-	 * data from VACUUM. Otherwise the historical snapshot we use for the
-	 * initial load could miss some data. (Unlike logical decoding, we need
-	 * the historical snapshot for non-catalog tables.)
-	 */
-	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
-									NIL,
-									true,
-#if PG_VERSION_NUM >= 120000
-									InvalidXLogRecPtr,
-#endif
+	/* Restart the decoding context at slot's confirmed_flush */
+	ctx = CreateDecodingContext(InvalidXLogRecPtr,
+								NIL,
+								false,
 #if PG_VERSION_NUM >= 130000
-									XL_ROUTINE(.page_read = read_local_xlog_page,
-											   .segment_open = wal_segment_open,
-											   .segment_close = wal_segment_close),
+								XL_ROUTINE(.page_read = read_local_xlog_page,
+										   .segment_open = wal_segment_open,
+										   .segment_close = wal_segment_close),
 #else
-									logical_read_local_xlog_page,
+								logical_read_local_xlog_page,
 #endif
-									NULL, NULL, NULL);
+								NULL, NULL, NULL);
 
-	/*
-	 * We don't have control on setting fast_forward, so at least check it.
-	 */
-	Assert(!ctx->fast_forward);
+#if PG_VERSION_NUM >= 130000
+	/* decode_concurrent_changes() handles the older versions. */
+	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
+#endif
 
-	DecodingContextFindStartpoint(ctx);
-
-	/* Some WAL records should have been read. */
-	Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
-
-	XLByteToSeg(ctx->reader->EndRecPtr, squeeze_current_segment,
-				wal_segment_size);
+	XLByteToSeg(restart_lsn, squeeze_current_segment, wal_segment_size);
 
 	/*
 	 * Setup structures to store decoded changes.
 	 */
+	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+
 	dstate = palloc0(sizeof(DecodingOutputState));
 	dstate->relid = relid;
 	dstate->tstore = tuplestore_begin_heap(false, false,
@@ -1094,6 +1067,21 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	MemoryContextSwitchTo(oldcontext);
 
 	ctx->output_writer_private = dstate;
+
+	/* Retrieve the historic snapshot. */
+	if (repl_slot->snap_handle != DSM_HANDLE_INVALID)
+	{
+		seg = dsm_attach(repl_slot->snap_handle);
+		snap_src = (char *) dsm_segment_address(seg);
+	}
+	else
+		snap_src = repl_slot->snap_private;
+
+	*snap_hist = RestoreSnapshot(snap_src);
+
+	if (seg)
+		dsm_detach(seg);
+
 	return ctx;
 }
 
@@ -2031,74 +2019,6 @@ free_tablespace_info(TablespaceInfo *tbsp_info)
 	if (tbsp_info->indexes != NULL)
 		pfree(tbsp_info->indexes);
 	pfree(tbsp_info);
-}
-
-
-/*
- * Wrapper for SnapBuildInitialSnapshot().
- *
- * We do not have to meet the assertions that SnapBuildInitialSnapshot()
- * contains, nor should we set MyPgXact->xmin.
- */
-static Snapshot
-build_historic_snapshot(SnapBuild *builder)
-{
-	Snapshot	result;
-	bool		FirstSnapshotSet_save;
-	int			XactIsoLevel_save;
-	TransactionId xmin_save;
-
-	/*
-	 * Fake both FirstSnapshotSet and XactIsoLevel so that the assertions in
-	 * SnapBuildInitialSnapshot() don't fire. Otherwise squeeze_table() has no
-	 * reason to apply these values.
-	 */
-	FirstSnapshotSet_save = FirstSnapshotSet;
-	FirstSnapshotSet = false;
-	XactIsoLevel_save = XactIsoLevel;
-	XactIsoLevel = XACT_REPEATABLE_READ;
-
-	/*
-	 * Likewise, fake MyPgXact->xmin so that the corresponding check passes.
-	 */
-#if PG_VERSION_NUM >= 140000
-	xmin_save = MyProc->xmin;
-	MyProc->xmin = InvalidTransactionId;
-#else
-	xmin_save = MyPgXact->xmin;
-	MyPgXact->xmin = InvalidTransactionId;
-#endif
-
-	/*
-	 * Call the core function to actually build the snapshot.
-	 */
-	result = SnapBuildInitialSnapshot(builder);
-
-	/*
-	 * Restore the original values.
-	 */
-	FirstSnapshotSet = FirstSnapshotSet_save;
-	XactIsoLevel = XactIsoLevel_save;
-#if PG_VERSION_NUM >= 140000
-	MyProc->xmin = xmin_save;
-#else
-	MyPgXact->xmin = xmin_save;
-#endif
-
-	/*
-	 * Fix the "satisfies" function that PG core incorrectly sets to
-	 * HeapTupleSatisfiesHistoricMVCC.
-	 *
-	 * https://www.postgresql.org/message-id/23215.1527665193%40localhost
-	 *
-	 * XXX Remove this assignment as soon as all the supported PG versions
-	 * have the problem fixed.
-	 */
-#if PG_VERSION_NUM < 120000
-	result->satisfies = HeapTupleSatisfiesMVCC;
-#endif
-
-	return result;
 }
 
 /*
@@ -3614,7 +3534,8 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	 * Abort the transaction as we do not call PG_RETHROW() below in this
 	 * case.
 	 */
-	AbortOutOfAnyTransaction();
+	if (IsTransactionState())
+		AbortOutOfAnyTransaction();
 
 	/*
 	 * Now that the transaction is aborted, we can run a new one to drop the
@@ -3661,8 +3582,11 @@ manage_session_origin(Oid relid)
 		 * the session state because both RecordTransactionCommit() and
 		 * RecordTransactionAbort() do expect that.
 		 */
+#if PG_VERSION_NUM >= 160000
 		replorigin_session_setup(origin, 0);
-
+#else
+		replorigin_session_setup(origin);
+#endif
 		Assert(replorigin_session_origin == InvalidRepOriginId);
 		replorigin_session_origin = origin;
 
@@ -3672,13 +3596,13 @@ manage_session_origin(Oid relid)
 	else
 	{
 		replorigin_session_reset();
-		replorigin_session_origin = InvalidRepOriginId;
 
 #if PG_VERSION_NUM >= 140000
 		replorigin_drop_by_name(origin_name, false, true);
 #else
 		replorigin_drop(replorigin_session_origin, false);
 #endif
+		replorigin_session_origin = InvalidRepOriginId;
 
 		Assert(OidIsValid(my_relid));
 		my_relid = InvalidOid;
