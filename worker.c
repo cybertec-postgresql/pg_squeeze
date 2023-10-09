@@ -1578,9 +1578,6 @@ process_task_internal(MemoryContext task_cxt)
 			(errmsg("task for table %s.%s is ready for processing",
 					NameStr(*relschema), NameStr(*relname))));
 
-	cl_index = NULL;
-	rel_tbsp = NULL;
-
 	/* Retrieve relid of the table. */
 	StartTransactionCommand();
 	relrv = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
