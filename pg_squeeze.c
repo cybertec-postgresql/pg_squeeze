@@ -554,8 +554,13 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	 * out.
 	 */
 	if (indname)
+	{
+		ereport(DEBUG1,
+				(errmsg("clustering index: %s", NameStr(*indname))));
+
 		relrv_cl_idx = makeRangeVar(NameStr(*relschema),
 									NameStr(*indname), -1);
+	}
 
 	/*
 	 * Process tablespace arguments, if provided.
