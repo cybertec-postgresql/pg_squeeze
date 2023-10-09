@@ -663,7 +663,7 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
  * provide enough space for us.)
  */
 WorkerConInit *
-allocate_worker_con_info(char *dbname, char *rolename, bool scheduler)
+allocate_worker_con_info(char *dbname, char *rolename)
 {
 	WorkerConInit *result;
 
@@ -671,11 +671,16 @@ allocate_worker_con_info(char *dbname, char *rolename, bool scheduler)
 													  sizeof(WorkerConInit));
 	result->dbname = MemoryContextStrdup(TopMemoryContext, dbname);
 	result->rolename = MemoryContextStrdup(TopMemoryContext, rolename);
-	result->scheduler = scheduler;
 	return result;
 }
 
-/* Initialize the worker and pass connection info in the appropriate form. */
+/*
+ * Initialize the worker and pass connection info in the appropriate form.
+ *
+ * 'con_init' is passed only for the scheduler worker, whereas
+ * 'con_interactive' can be passed for both squeeze worker and scheduler
+ * worker.
+ */
 void
 squeeze_initialize_bgworker(BackgroundWorker *worker,
 							WorkerConInit *con_init,
@@ -697,7 +702,7 @@ squeeze_initialize_bgworker(BackgroundWorker *worker,
 	{
 		worker->bgw_main_arg = (Datum) PointerGetDatum(con_init);
 		dbname = con_init->dbname;
-		scheduler = con_init->scheduler;
+		scheduler = true;
 	}
 	else if (con_interactive != NULL)
 	{
@@ -769,7 +774,7 @@ squeeze_worker_main(Datum main_arg)
 		WorkerConInit *con;
 
 		con = (WorkerConInit *) DatumGetPointer(arg);
-		am_i_scheduler = con->scheduler;
+		am_i_scheduler = true;
 		BackgroundWorkerInitializeConnection(con->dbname, con->rolename, 0	/* flags */
 			);
 	}

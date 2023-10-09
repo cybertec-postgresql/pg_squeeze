@@ -239,12 +239,14 @@ extern int	squeeze_workers_per_database;
  * The structure is allocated in TopMemoryContext during postmaster startup,
  * so the worker should access it correctly if it receives pointer from the
  * bgw_main_arg field of BackgroundWorker.
+ *
+ * Unlike WorkerConInteractive, this is currently used only for the scheduler
+ * worker.
  */
 typedef struct WorkerConInit
 {
 	char	   *dbname;
 	char	   *rolename;
-	bool		scheduler;
 } WorkerConInit;
 
 /*
@@ -361,8 +363,7 @@ extern WorkerTask *MyWorkerTask;
 extern WorkerProgress *MyWorkerProgress;
 
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
-											   char *rolename,
-											   bool scheduler);
+											   char *rolename);
 extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
 										WorkerConInit *con_init,
 										WorkerConInteractive *con_interactive,

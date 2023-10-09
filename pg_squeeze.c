@@ -291,7 +291,7 @@ _PG_init(void)
 
 			dbname = lfirst(lc);
 
-			con = allocate_worker_con_info(dbname, squeeze_worker_role, true);
+			con = allocate_worker_con_info(dbname, squeeze_worker_role);
 			squeeze_initialize_bgworker(&worker, con, NULL, 0);
 			RegisterBackgroundWorker(&worker);
 		}
