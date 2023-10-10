@@ -776,6 +776,8 @@ squeeze_worker_main(Datum main_arg)
 	int			nworkers;
 	int			task_id = -1;
 
+	ereport(DEBUG1, (errmsg("squeeze_worker_main() started")));
+
 	/* The worker should do its cleanup when exiting. */
 	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
 
@@ -808,6 +810,8 @@ squeeze_worker_main(Datum main_arg)
 
 		task_id = con.task_id;
 	}
+	ereport(DEBUG1, (errmsg("squeeze_worker_main(), am_i_scheduler: %u",
+							am_i_scheduler)));
 
 	/*
 	 * Make sure that there is no more than one scheduler and no more than
@@ -846,6 +850,7 @@ squeeze_worker_main(Datum main_arg)
 
 	if (found || (nworkers >= squeeze_workers_per_database))
 	{
+		ereport(DEBUG1, (errmsg("squeeze_worker_main() exited early")));
 		LWLockRelease(workerData->lock);
 		goto done;
 	}
