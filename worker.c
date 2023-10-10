@@ -557,17 +557,33 @@ initialize_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
 				 Name indname, Name tbspname, ArrayType *ind_tbsps,
 				 bool last_try, bool skip_analyze)
 {
+	StringInfoData	buf;
+
+	initStringInfo(&buf);
+
 	task->task_id = id;
 	namestrcpy(&task->relschema, NameStr(*relschema));
 	namestrcpy(&task->relname, NameStr(*relname));
+	appendStringInfo(&buf,
+					 "squeeze worker task: id=%d, relschema=%s, relname=%s",
+					 task->task_id, NameStr(task->relschema),
+					 NameStr(task->relname));
+
 	if (indname)
+	{
 		namestrcpy(&task->indname, NameStr(*indname));
+		appendStringInfo(&buf, ", indname: %s", NameStr(task->indname));
+	}
 	else
 		NameStr(task->indname)[0] = '\0';
 	if (tbspname)
+	{
 		namestrcpy(&task->tbspname, NameStr(*tbspname));
+		appendStringInfo(&buf, ", tbspname: %s", NameStr(task->tbspname));
+	}
 	else
 		NameStr(task->tbspname)[0] = '\0';
+	/* ind_tbsps is in a binary format, don't bother logging it right now. */
 	if (ind_tbsps)
 	{
 		if (VARSIZE(ind_tbsps) > IND_TABLESPACES_ARRAY_SIZE)
@@ -576,6 +592,8 @@ initialize_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
 	}
 	else
 		SET_VARSIZE(task->ind_tbsps, 0);
+	ereport(DEBUG1, (errmsg("%s", buf.data)));
+	pfree(buf.data);
 
 	task->last_try = last_try;
 	task->skip_analyze = skip_analyze;
