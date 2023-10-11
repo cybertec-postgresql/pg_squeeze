@@ -229,6 +229,7 @@ squeeze_worker_shmem_startup(void)
 			task->assigned = false;
 			task->exit_requested = false;
 			task->slot = NULL;
+			task->error_msg[0] = '\0';
 			SpinLockInit(&task->mutex);
 		}
 
@@ -392,6 +393,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	WorkerTask *task = NULL;
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
+	char	*error_msg = NULL;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -485,7 +487,13 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	 */
 	Assert(status == BGWH_STOPPED);
 
+	if (strlen(task->error_msg) > 0)
+		error_msg = pstrdup(task->error_msg);
+
 	release_task(task, false);
+
+	if (error_msg)
+		ereport(ERROR, (errmsg("%s", error_msg)));
 
 	PG_RETURN_VOID();
 }

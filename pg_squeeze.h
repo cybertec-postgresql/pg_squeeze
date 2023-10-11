@@ -357,6 +357,9 @@ typedef struct WorkerTask
 	char		ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
 
 	ReplSlotStatus	repl_slot;
+
+#define ERROR_MESSAGE_MAX_SIZE		1024
+	char		error_msg[];
 } WorkerTask;
 
 extern WorkerTask *MyWorkerTask;

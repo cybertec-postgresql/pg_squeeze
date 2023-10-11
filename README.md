@@ -197,10 +197,6 @@ Sample execution:
 SELECT squeeze.squeeze_table('public', 'pgbench_accounts');
 ```
 
-Please note that the function does not throw errors. It just inserts a record
-either into `squeeze.log` or `squeeze.errors`, depending on whether it
-succeeded or failed.
-
 # Enable / disable table processing
 
 To enable processing of bloated tables, run this statement as superuser:

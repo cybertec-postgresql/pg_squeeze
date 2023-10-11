@@ -3533,6 +3533,14 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	*edata_p = CopyErrorData();
 	MemoryContextSwitchTo(old_context);
 
+	/*
+	 * Send the message to the server log, as well as to the process that
+	 * assigned the task.
+	 */
+	EmitErrorReport();
+	strlcpy(MyWorkerTask->error_msg, (*edata_p)->message,
+			ERROR_MESSAGE_MAX_SIZE);
+
 	FlushErrorState();
 
 	/*
