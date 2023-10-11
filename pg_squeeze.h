@@ -339,7 +339,13 @@ typedef struct WorkerTask
 	NameData	indname;		/* clustering index */
 	NameData	tbspname;		/* destination tablespace */
 
-	/* Fields of the squeeze.tasks table. */
+	/*
+	 * Fields of the squeeze.tasks table.
+	 *
+	 * task_id can be -1 if there is no corresponding record in the
+	 * squeeze.table. In any case, it must be set as soon as we set
+	 * ->assigned, before ->mutex is released.
+	 */
 	int			task_id;
 	bool		last_try;
 	bool		skip_analyze;

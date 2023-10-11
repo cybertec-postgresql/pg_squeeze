@@ -514,43 +514,62 @@ get_unused_task_slot_id(int task_id)
 
 	for (i = 0; i < NUM_WORKER_TASKS; i++)
 	{
-		int		this_task_id;
-
 		task = &workerData->tasks[i];
 		SpinLockAcquire(&task->mutex);
 		/*
 		 * If slot is valid, the worker is still working on an earlier task,
 		 * although the backend that assigned the task already exited.
 		 */
-		if (!task->assigned && task->slot == NULL)
+		if (res < 0 && !task->assigned && task->slot == NULL)
 		{
 			/* Make sure that no other backend can use the task. */
 			task->assigned = true;
+			task->task_id = task_id;
+			task->error_msg[0] = '\0';
 			res = i;
 		}
-		this_task_id = task->task_id;
 		SpinLockRelease(&task->mutex);
 
+		if (res >= 0)
+			break;
+	}
+
+	/* No slot found? */
+	if (res < 0)
+		return res;
+
+	/* No need to check for a duplicate task_id? */
+	if (task_id < 0)
+		return res;
+
+	/*
+	 * Check if another worker is already working on this task_id.
+	 *
+	 * It's possible that both callers of this function cancel the task here,
+	 * but in such a case the scheduler worker should assign it to a worker
+	 * again. (Anyway, taks_id>=0 only if assigned by the scheduler worker,
+	 * and there's only 1 scheduler worker per database, so the duplicate
+	 * task_id is quite unlikely.)
+	 */
+	for (i = 0; i < NUM_WORKER_TASKS; i++)
+	{
+		task = &workerData->tasks[i];
+		SpinLockAcquire(&task->mutex);
+
 		/*
-		 * If task_id is valid, we check below if another task has the same
-		 * task_id.
+		 * Check if an existing task, other than the one we picked above,
+		 * already has the same task_id.
 		 */
-		if (task_id > 0 && task_id == this_task_id)
+		if (task_id == task->task_id && i != res)
 		{
 			/* Undo the assignment if made one above. */
-			if (res >= 0)
-			{
-				task = &workerData->tasks[res];
-				SpinLockAcquire(&task->mutex);
-				task->assigned = false;
-				SpinLockRelease(&task->mutex);
-				res = -1;
-			}
-
-			/* No point in searching further. */
-			break;
+			task->assigned = false;
+			res = -1;
 		}
-		else if (res >= 0)
+		SpinLockRelease(&task->mutex);
+
+		if (res < 0)
+			/* No point in checking further. */
 			break;
 	}
 
