@@ -170,7 +170,7 @@ static void worker_sigterm(SIGNAL_ARGS);
 
 static void scheduler_worker_loop(void);
 static void process_task(int task_id);
-static void create_replication_slots(bool snap_shmem);
+static void create_replication_slots(void);
 static void drop_replication_slots(void);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void process_task_internal(MemoryContext task_cxt);
@@ -1141,7 +1141,7 @@ scheduler_worker_loop(void)
 													   sizeof(SqueezeWorker));
 
 			/* Create and initialize the replication slot for each worker. */
-			create_replication_slots(true);
+			create_replication_slots();
 
 			/*
 			 * Now that the transaction has committed, we can start the
@@ -1244,12 +1244,9 @@ process_task(int task_id)
  * complete. If each worker had to initialize its slot, it'd have wait until
  * the other worker(s) are done with their current job (which usually takes
  * some time), so the workers wouldn't actually do their work in parallel.
- *
- * If snap_shmem is true, the historic snapshot is stored in the shared
- * memory, otherwise in the backend private memory.
  */
 static void
-create_replication_slots(bool snap_shmem)
+create_replication_slots(void)
 {
 	uint32		i;
 	ReplSlotStatus	*res_ptr;
@@ -1292,9 +1289,23 @@ create_replication_slots(bool snap_shmem)
 		Snapshot	snapshot;
 		Size		snap_size;
 		char		*snap_dst;
+		int		slot_nr;
+
+		if (am_i_standalone)
+		{
+			/*
+			 * squeeze_table() can be called concurrently (for different
+			 * tables), so make sure that each call generates an unique slot
+			 * name.
+			 */
+			Assert(squeezeWorkerCount == 1);
+			slot_nr = MyProcPid;
+		}
+		else
+			slot_nr = i;
 
 		snprintf(name, NAMEDATALEN, REPL_SLOT_BASE_NAME "%u_%u", MyDatabaseId,
-				 i);
+				 slot_nr);
 
 #if PG_VERSION_NUM >= 140000
 		ReplicationSlotCreate(name, true, RS_PERSISTENT, false);
@@ -1366,7 +1377,7 @@ create_replication_slots(bool snap_shmem)
 		 */
 		snapshot = build_historic_snapshot(ctx->snapshot_builder);
 		snap_size = EstimateSnapshotSpace(snapshot);
-		if (snap_shmem)
+		if (!am_i_standalone)
 		{
 			res_ptr->snap_seg = dsm_create(snap_size, 0);
 			/*
@@ -1547,7 +1558,7 @@ process_task_internal(MemoryContext task_cxt)
 	if (am_i_standalone)
 	{
 		squeezeWorkerCount = 1;
-		create_replication_slots(false);
+		create_replication_slots();
 		task->repl_slot = squeezeWorkerSlots[0];
 	}
 
