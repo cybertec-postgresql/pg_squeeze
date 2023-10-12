@@ -627,10 +627,7 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 
 	ereport(DEBUG1, (errmsg("registering pg_squeeze %s worker", kind)));
 	if (!RegisterDynamicBackgroundWorker(&worker, handle))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("could not register background process"),
-				 errhint("More details may be available in the server log.")));
+		return false;
 
 	if (handle == NULL)
 		/*
@@ -644,6 +641,12 @@ start_worker_internal(bool scheduler, int task_id, BackgroundWorkerHandle **hand
 
 	status = WaitForBackgroundWorkerStartup(*handle, &pid);
 	if (status == BGWH_POSTMASTER_DIED)
+		/*
+		 * XXX Should we return false instead? Not sure, the server should be
+		 * restarted anyway, so it's not critical if the caller, due to the
+		 * ERROR, does not properly cleanup the task for which he just tried
+		 * to start the worker.
+		 */
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("cannot start background processes without postmaster"),
