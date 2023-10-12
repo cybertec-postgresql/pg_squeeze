@@ -157,11 +157,11 @@ static void release_task(WorkerTask *task, bool worker);
 static void reset_progress(WorkerProgress *progress);
 static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
 
-static int get_unused_task_slot_id(int task_id);
-static void initialize_worker_task(WorkerTask *task, int id, Name relschema,
-								   Name relname, Name indname, Name tbspname,
-								   ArrayType *ind_tbsps, bool last_try,
-								   bool skip_analyze);
+static WorkerTask *get_unused_task(int *task_idx);
+static void initialize_worker_task(WorkerTask *task, int task_id,
+								   Name relschema, Name relname, Name indname,
+								   Name tbspname, ArrayType *ind_tbsps,
+								   bool last_try, bool skip_analyze);
 static bool start_worker_internal(bool scheduler, int task_id,
 								  BackgroundWorkerHandle **handle);
 
@@ -389,7 +389,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	Name		indname = NULL;
 	Name		tbspname = NULL;
 	ArrayType  *ind_tbsps = NULL;
-	int		task_id;
+	int		task_idx;
 	WorkerTask *task = NULL;
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
@@ -421,12 +421,11 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	}
 
 	/* Find free task structure. */
-	task_id = get_unused_task_slot_id(-1);
-	if (task_id < 0)
+	task = get_unused_task(&task_idx);
+	if (task == NULL)
 		ereport(ERROR, (errmsg("too many concurrent tasks in progress")));
 
 	/* Fill-in the remaining task information. */
-	task = &workerData->tasks[task_id];
 	initialize_worker_task(task, -1, relschema, relname, indname, tbspname,
 						   ind_tbsps, false, true);
 	/*
@@ -438,7 +437,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	/* Start the worker to handle the task. */
 	PG_TRY();
 	{
-		if (!start_worker_internal(false, task_id, &handle))
+		if (!start_worker_internal(false, task_idx, &handle))
 			ereport(ERROR,
 					(errmsg("a new worker could not start due to squeeze.workers_per_database")));
 	}
@@ -499,96 +498,57 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 }
 
 /*
- * Returns a zero-based index of an unused task slot in the shared memory, or
- * -1 if there's no unused slot.
+ * Returns a newly assigned task, or NULL if there's no unused slot.
  *
- * If task_id is >= 0, avoid fetching tasks whose task_id equals to this
- * argument.
+ * The index in the task array is returned in *task_idx.
  */
-static int
-get_unused_task_slot_id(int task_id)
+static WorkerTask *
+get_unused_task(int *task_idx)
 {
 	int		i;
-	WorkerTask	*task;
-	int		res = -1;
+	WorkerTask	*result = NULL;
 
 	for (i = 0; i < NUM_WORKER_TASKS; i++)
 	{
+		WorkerTask	*task;
+
 		task = &workerData->tasks[i];
 		SpinLockAcquire(&task->mutex);
 		/*
 		 * If slot is valid, the worker is still working on an earlier task,
 		 * although the backend that assigned the task already exited.
 		 */
-		if (res < 0 && !task->assigned && task->slot == NULL)
+		if (!task->assigned && task->slot == NULL)
 		{
 			/* Make sure that no other backend can use the task. */
 			task->assigned = true;
-			task->task_id = task_id;
+
 			task->error_msg[0] = '\0';
-			res = i;
+			result = task;
+			*task_idx = i;
 		}
 		SpinLockRelease(&task->mutex);
 
-		if (res >= 0)
+		if (result)
 			break;
 	}
 
-	/* No slot found? */
-	if (res < 0)
-		return res;
-
-	/* No need to check for a duplicate task_id? */
-	if (task_id < 0)
-		return res;
-
-	/*
-	 * Check if another worker is already working on this task_id.
-	 *
-	 * It's possible that both callers of this function cancel the task here,
-	 * but in such a case the scheduler worker should assign it to a worker
-	 * again. (Anyway, taks_id>=0 only if assigned by the scheduler worker,
-	 * and there's only 1 scheduler worker per database, so the duplicate
-	 * task_id is quite unlikely.)
-	 */
-	for (i = 0; i < NUM_WORKER_TASKS; i++)
-	{
-		task = &workerData->tasks[i];
-		SpinLockAcquire(&task->mutex);
-
-		/*
-		 * Check if an existing task, other than the one we picked above,
-		 * already has the same task_id.
-		 */
-		if (task_id == task->task_id && i != res)
-		{
-			/* Undo the assignment if made one above. */
-			task->assigned = false;
-			res = -1;
-		}
-		SpinLockRelease(&task->mutex);
-
-		if (res < 0)
-			/* No point in checking further. */
-			break;
-	}
-
-	return res;
+	return result;
 }
 
 /*
- * Fill-in "user data" of WorkerTask.
+ * Fill-in "user data" of WorkerTask. task_id should already be set.
  */
 static void
-initialize_worker_task(WorkerTask *task, int id, Name relschema, Name relname,
-				 Name indname, Name tbspname, ArrayType *ind_tbsps,
-				 bool last_try, bool skip_analyze)
+initialize_worker_task(WorkerTask *task, int task_id, Name relschema,
+					   Name relname, Name indname, Name tbspname,
+					   ArrayType *ind_tbsps, bool last_try, bool skip_analyze)
 {
 	StringInfoData	buf;
 
 	initStringInfo(&buf);
 
-	task->task_id = id;
+	task->task_id = task_id;
 	namestrcpy(&task->relschema, NameStr(*relschema));
 	namestrcpy(&task->relname, NameStr(*relname));
 	appendStringInfo(&buf,
@@ -1109,18 +1069,17 @@ scheduler_worker_loop(void)
 			ExecStoreTuple(tup, slot, InvalidBuffer, true);
 #endif
 
-			datum = slot_getattr(slot, 1, &isnull);
-			Assert(!isnull);
-			task_id = DatumGetInt32(datum);
-
 			/*
 			 * No point in fetching the remaining columns if all the tasks are
 			 * already used.
 			 */
-			id = get_unused_task_slot_id(task_id);
-			if (id < 0)
+			task = get_unused_task(&id);
+			if (task == NULL)
 				break;
-			task = &workerData->tasks[id];
+
+			datum = slot_getattr(slot, 1, &isnull);
+			Assert(!isnull);
+			task_id = DatumGetInt32(datum);
 
 			datum = slot_getattr(slot, 2, &isnull);
 			Assert(!isnull);
@@ -1193,13 +1152,13 @@ scheduler_worker_loop(void)
 			foreach(lc, ids)
 			{
 				SqueezeWorker	*worker;
-				int	task_id;
+				int	task_idx;
 				bool	not_registered;
 
 				worker = &squeezeWorkers[i];
 				worker->handle = NULL;
-				task_id = lfirst_int(lc);
-				worker->task = &workerData->tasks[task_id];
+				task_idx = lfirst_int(lc);
+				worker->task = &workerData->tasks[task_idx];
 				worker->task->repl_slot = squeezeWorkerSlots[i];
 
 				SetCurrentStatementStartTimestamp();
@@ -1210,7 +1169,7 @@ scheduler_worker_loop(void)
 				 * the current transaction.
 				 */
 				old_cxt = MemoryContextSwitchTo(sched_cxt);
-				not_registered = !start_worker_internal(false, task_id,
+				not_registered = !start_worker_internal(false, task_idx,
 														&worker->handle);
 				MemoryContextSwitchTo(old_cxt);
 
@@ -1652,11 +1611,12 @@ process_task_internal(MemoryContext task_cxt)
 	}
 	if (found)
 	{
-		/* XXX The scheduler should not allow this? */
-		ereport(DEBUG1,
+		LWLockRelease(workerData->lock);
+
+		/* The scheduler should not allow this, but squeeze_table() does. */
+		ereport(ERROR,
 				(errmsg("task for table %s.%s is being processed by another worker",
 						NameStr(*relschema), NameStr(*relname))));
-		LWLockRelease(workerData->lock);
 		return;
 	}
 	/* Declare that this worker takes care of the relation. */
