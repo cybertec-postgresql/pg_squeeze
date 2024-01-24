@@ -146,8 +146,12 @@ typedef struct SqueezeWorker
 
 static SqueezeWorker	*squeezeWorkers = NULL;
 static int	squeezeWorkerCount = 0;
-/* One slot per worker. */
+/*
+ * One slot per worker, but the count is stored separately because cleanup is
+ * also done separately.
+ */
 static ReplSlotStatus	*squeezeWorkerSlots = NULL;
+static int	squeezeWorkerSlotCount = 0;
 
 #define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
@@ -977,6 +981,7 @@ scheduler_worker_loop(void)
 			release_task(worker->task, false);
 		}
 
+		squeezeWorkerCount = 0;
 		if (squeezeWorkers)
 		{
 			pfree(squeezeWorkers);
@@ -984,9 +989,8 @@ scheduler_worker_loop(void)
 		}
 
 		/* Drop the replication slots. */
-		if (squeezeWorkerCount > 0)
+		if (squeezeWorkerSlotCount > 0)
 			drop_replication_slots();
-		squeezeWorkerCount = 0;
 
 		/* Free other memory allocated for the just-stopped workers. */
 		MemoryContextReset(sched_cxt);
@@ -1136,7 +1140,7 @@ scheduler_worker_loop(void)
 		CommitTransactionCommand();
 
 		/* Initialize the array to track the workers we start. */
-		squeezeWorkerCount = list_length(ids);
+		squeezeWorkerCount = squeezeWorkerSlotCount = list_length(ids);
 
 		if (squeezeWorkerCount > 0)
 		{
@@ -1255,7 +1259,7 @@ create_replication_slots(void)
 	ReplSlotStatus	*res_ptr;
 	MemoryContext	old_cxt;
 
-	Assert(squeezeWorkerSlots == NULL && squeezeWorkerCount > 0);
+	Assert(squeezeWorkerSlots == NULL && squeezeWorkerSlotCount > 0);
 
 	/*
 	 * Use a transaction so that all the slot related locks are freed on ERROR
@@ -1273,7 +1277,7 @@ create_replication_slots(void)
 	 * transaction commit.
 	 */
 	old_cxt = MemoryContextSwitchTo(TopMemoryContext);
-	squeezeWorkerSlots = (ReplSlotStatus *) palloc0(squeezeWorkerCount *
+	squeezeWorkerSlots = (ReplSlotStatus *) palloc0(squeezeWorkerSlotCount *
 													sizeof(ReplSlotStatus));
 
 	res_ptr = squeezeWorkerSlots;
@@ -1284,7 +1288,7 @@ create_replication_slots(void)
 	 * not present in PG 11. Moreover, it passes need_full_snapshot=false to
 	 * CreateInitDecodingContext().
 	 */
-	for (i = 0; i < squeezeWorkerCount; i++)
+	for (i = 0; i < squeezeWorkerSlotCount; i++)
 	{
 		char	name[NAMEDATALEN];
 		LogicalDecodingContext *ctx;
@@ -1301,7 +1305,7 @@ create_replication_slots(void)
 			 * tables), so make sure that each call generates an unique slot
 			 * name.
 			 */
-			Assert(squeezeWorkerCount == 1);
+			Assert(squeezeWorkerSlotCount == 1);
 			slot_nr = MyProcPid;
 		}
 		else
@@ -1431,7 +1435,10 @@ drop_replication_slots(void)
 	 * worker_shmem_shutdown callback?
 	 */
 	if (squeezeWorkerSlots == NULL)
+	{
+		Assert(squeezeWorkerSlotCount == 0);
 		return;
+	}
 
 	/*
 	 * ERROR in create_replication_slots() can leave us with one of the slots
@@ -1440,7 +1447,7 @@ drop_replication_slots(void)
 	if (MyReplicationSlot)
 		ReplicationSlotRelease();
 
-	for (i = 0; i < squeezeWorkerCount; i++)
+	for (i = 0; i < squeezeWorkerSlotCount; i++)
 	{
 		ReplSlotStatus	*slot;
 
@@ -1452,9 +1459,12 @@ drop_replication_slots(void)
 		}
 	}
 
+	squeezeWorkerSlotCount = 0;
 	if (squeezeWorkerSlots)
+	{
 		pfree(squeezeWorkerSlots);
-	squeezeWorkerSlots = NULL;
+		squeezeWorkerSlots = NULL;
+	}
 }
 
 /*
@@ -1560,7 +1570,7 @@ process_task_internal(MemoryContext task_cxt)
 
 	if (am_i_standalone)
 	{
-		squeezeWorkerCount = 1;
+		squeezeWorkerSlotCount = 1;
 		create_replication_slots();
 		task->repl_slot = squeezeWorkerSlots[0];
 	}
@@ -1848,7 +1858,10 @@ release_task(WorkerTask *task, bool worker)
 		if (task->repl_slot.snap_private)
 		{
 			Assert(am_i_standalone);
-			pfree(task->repl_slot.snap_private);
+			/*
+			 * Do not call pfree() when holding spinlock. The worker should
+			 * only process a single task anyway, so it's not a real leak.
+			 */
 			task->repl_slot.snap_private = NULL;
 		}
 		/*

@@ -1016,6 +1016,15 @@ setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 		ereport(ERROR,
 				(errmsg("replication slot \"%s\" has incorrect confirm position",
 						NameStr(repl_slot->name))));
+	/*
+	 * Wasn't effective_xmin lost due to releasing and re-acquiring the slot?
+	 * (ReplicationSlotRelease() does clear it in some cases. We try to avoid
+	 * that, but checking makes sense as this slot field is critical.).
+	 */
+	if (!TransactionIdIsValid(MyReplicationSlot->effective_xmin))
+		ereport(ERROR,
+				(errmsg("replication slot \"%s\" has invalid effective_xmin",
+						NameStr(MyReplicationSlot->data.name))));
 
 	restart_lsn = MyReplicationSlot->data.restart_lsn;
 
