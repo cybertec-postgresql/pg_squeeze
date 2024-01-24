@@ -174,7 +174,7 @@ static void worker_sigterm(SIGNAL_ARGS);
 
 static void scheduler_worker_loop(void);
 static void process_task(int task_id);
-static void create_replication_slots(void);
+static void create_replication_slots(int nslots);
 static void drop_replication_slots(void);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void process_task_internal(MemoryContext task_cxt);
@@ -933,6 +933,7 @@ scheduler_worker_loop(void)
 		TupleTableSlot *slot;
 		List	*ids;
 		ListCell	*lc;
+		int		nslots;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, delay,
@@ -1140,7 +1141,7 @@ scheduler_worker_loop(void)
 		CommitTransactionCommand();
 
 		/* Initialize the array to track the workers we start. */
-		squeezeWorkerCount = squeezeWorkerSlotCount = list_length(ids);
+		squeezeWorkerCount = nslots = list_length(ids);
 
 		if (squeezeWorkerCount > 0)
 		{
@@ -1148,7 +1149,7 @@ scheduler_worker_loop(void)
 													   sizeof(SqueezeWorker));
 
 			/* Create and initialize the replication slot for each worker. */
-			create_replication_slots();
+			create_replication_slots(nslots);
 
 			/*
 			 * Now that the transaction has committed, we can start the
@@ -1253,13 +1254,13 @@ process_task(int task_id)
  * some time), so the workers wouldn't actually do their work in parallel.
  */
 static void
-create_replication_slots(void)
+create_replication_slots(int nslots)
 {
 	uint32		i;
 	ReplSlotStatus	*res_ptr;
 	MemoryContext	old_cxt;
 
-	Assert(squeezeWorkerSlots == NULL && squeezeWorkerSlotCount > 0);
+	Assert(squeezeWorkerSlots == NULL && squeezeWorkerSlotCount == 0);
 
 	/*
 	 * Use a transaction so that all the slot related locks are freed on ERROR
@@ -1277,7 +1278,7 @@ create_replication_slots(void)
 	 * transaction commit.
 	 */
 	old_cxt = MemoryContextSwitchTo(TopMemoryContext);
-	squeezeWorkerSlots = (ReplSlotStatus *) palloc0(squeezeWorkerSlotCount *
+	squeezeWorkerSlots = (ReplSlotStatus *) palloc0(nslots *
 													sizeof(ReplSlotStatus));
 
 	res_ptr = squeezeWorkerSlots;
@@ -1288,7 +1289,7 @@ create_replication_slots(void)
 	 * not present in PG 11. Moreover, it passes need_full_snapshot=false to
 	 * CreateInitDecodingContext().
 	 */
-	for (i = 0; i < squeezeWorkerSlotCount; i++)
+	for (i = 0; i < nslots; i++)
 	{
 		char	name[NAMEDATALEN];
 		LogicalDecodingContext *ctx;
@@ -1305,7 +1306,7 @@ create_replication_slots(void)
 			 * tables), so make sure that each call generates an unique slot
 			 * name.
 			 */
-			Assert(squeezeWorkerSlotCount == 1);
+			Assert(nslots == 1);
 			slot_nr = MyProcPid;
 		}
 		else
@@ -1326,6 +1327,7 @@ create_replication_slots(void)
 		 * below throw ERROR.
 		 */
 		namestrcpy(&res_ptr->name, slot->data.name.data);
+		squeezeWorkerSlotCount++;
 
 		/*
 		 * Neither prepare_write nor do_write callback nor update_progress is
@@ -1419,6 +1421,8 @@ create_replication_slots(void)
 
 	MemoryContextSwitchTo(old_cxt);
 	CommitTransactionCommand();
+
+	Assert(squeezeWorkerSlotCount == nslots);
 }
 
 /*
@@ -1570,8 +1574,7 @@ process_task_internal(MemoryContext task_cxt)
 
 	if (am_i_standalone)
 	{
-		squeezeWorkerSlotCount = 1;
-		create_replication_slots();
+		create_replication_slots(1);
 		task->repl_slot = squeezeWorkerSlots[0];
 	}
 
