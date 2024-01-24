@@ -24,9 +24,7 @@
 
 #include "pg_squeeze.h"
 
-#if PG_VERSION_NUM >= 120000
 #include "access/heapam.h"
-#endif
 #include "access/visibilitymap.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -41,9 +39,6 @@
 #include "storage/procarray.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
-#if PG_VERSION_NUM < 120000
-#include "utils/tqual.h"
-#endif
 #include "commands/vacuum.h"
 
 PG_FUNCTION_INFO_V1(squeeze_pgstattuple_approx);
@@ -292,11 +287,9 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel))));
 #endif
 
-#if PG_VERSION_NUM >= 120000
 	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("only heap AM is supported")));
-#endif
 
 	statapprox_heap(rel, &stat);
 

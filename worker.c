@@ -31,14 +31,7 @@
 #include "utils/memutils.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
-#if PG_VERSION_NUM < 120000
-#include "utils/rel.h"
-#endif
 #include "utils/snapmgr.h"
-
-#if PG_VERSION_NUM < 120000
-#include "utils/tqual.h"
-#endif
 
 #include "pg_squeeze.h"
 
@@ -1043,11 +1036,7 @@ scheduler_worker_loop(void)
 		if (ntask > 0)
 		{
 			tupdesc = CreateTupleDescCopy(SPI_tuptable->tupdesc);
-#if PG_VERSION_NUM >= 120000
 			slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
-#else
-			slot = MakeSingleTupleTableSlot(tupdesc);
-#endif
 		}
 
 		/* Initialize the task slots. */
@@ -1071,11 +1060,7 @@ scheduler_worker_loop(void)
 			/* Retrieve the tuple attributes and use them to fill the task. */
 			tup = heap_copytuple(SPI_tuptable->vals[i]);
 			ExecClearTuple(slot);
-#if PG_VERSION_NUM >= 120000
 			ExecStoreHeapTuple(tup, slot, true);
-#else
-			ExecStoreTuple(tup, slot, InvalidBuffer, true);
-#endif
 
 			/*
 			 * No point in fetching the remaining columns if all the tasks are
@@ -1341,9 +1326,7 @@ create_replication_slots(int nslots)
 		ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
 										NIL,
 										true,
-#if PG_VERSION_NUM >= 120000
 										InvalidXLogRecPtr,
-#endif
 #if PG_VERSION_NUM >= 130000
 										XL_ROUTINE(.page_read = read_local_xlog_page,
 												   .segment_open = wal_segment_open,
@@ -1517,19 +1500,6 @@ build_historic_snapshot(SnapBuild *builder)
 	MyPgXact->xmin = xmin_save;
 #endif
 
-	/*
-	 * Fix the "satisfies" function that PG core incorrectly sets to
-	 * HeapTupleSatisfiesHistoricMVCC.
-	 *
-	 * https://www.postgresql.org/message-id/23215.1527665193%40localhost
-	 *
-	 * XXX Remove this assignment as soon as all the supported PG versions
-	 * have the problem fixed.
-	 */
-#if PG_VERSION_NUM < 120000
-	result->satisfies = HeapTupleSatisfiesMVCC;
-#endif
-
 	return result;
 }
 
@@ -1612,15 +1582,9 @@ process_task_internal(MemoryContext task_cxt)
 	/* Retrieve relid of the table. */
 	StartTransactionCommand();
 	relrv = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
-#if PG_VERSION_NUM >= 120000
 	rel = table_openrv(relrv, AccessShareLock);
 	relid = RelationGetRelid(rel);
 	table_close(rel, AccessShareLock);
-#else
-	rel = heap_openrv(relrv, AccessShareLock);
-	relid = RelationGetRelid(rel);
-	heap_close(rel, AccessShareLock);
-#endif
 	CommitTransactionCommand();
 
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);

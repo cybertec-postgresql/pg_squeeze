@@ -203,9 +203,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 						 ScanKey key, int nkeys, IndexInsertState *iistate)
 {
 	TupleTableSlot *slot;
-#if PG_VERSION_NUM >= 120000
 	TupleTableSlot *ind_slot;
-#endif
 	Form_pg_index ident_form;
 	int2vector *ident_indkey;
 	HeapTuple	tup_old = NULL;
@@ -219,17 +217,11 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	ident_indkey = &ident_form->indkey;
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
-#if PG_VERSION_NUM >= 120000
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
-#else
-	slot = MakeSingleTupleTableSlot(dstate->tupdesc);
-#endif
 	iistate->econtext->ecxt_scantuple = slot;
 
-#if PG_VERSION_NUM >= 120000
 	/* A slot to fetch tuples from identity index. */
 	ind_slot = table_slot_create(relation, NULL);
-#endif
 
 	/*
 	 * In case functions in the index need the active snapshot and caller
@@ -240,9 +232,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	while (tuplestore_gettupleslot(dstate->tstore, true, false,
 								   dstate->tsslot))
 	{
-#if PG_VERSION_NUM >= 120000
 		bool		shouldFree;
-#endif
 		HeapTuple	tup_change,
 					tup,
 					tup_exist;
@@ -252,11 +242,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		Datum		values[1];
 
 		/* Get the change from the single-column tuple. */
-#if PG_VERSION_NUM >= 120000
 		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
-#else
-		tup_change = ExecFetchSlotTuple(dstate->tsslot);
-#endif
 		heap_deform_tuple(tup_change, dstate->tupdesc_change, values, isnull);
 		Assert(!isnull[0]);
 
@@ -298,19 +284,12 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			heap_insert(relation, tup, GetCurrentCommandId(true), 0, bistate);
 
 			/* Update indexes. */
-#if PG_VERSION_NUM >= 120000
 			ExecStoreHeapTuple(tup, slot, false);
-#else
-			ExecStoreTuple(tup, slot, InvalidBuffer, false);
-#endif
 			recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 											iistate->rri,
 #endif
 											slot,
-#if PG_VERSION_NUM < 120000
-											&(tup->t_self),
-#endif
 											iistate->estate,
 #if PG_VERSION_NUM >= 140000
 											false,	/* update */
@@ -385,7 +364,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 												  &isnull);
 				Assert(!isnull);
 			}
-#if PG_VERSION_NUM >= 120000
 			if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
 			{
 				bool		shouldFreeInd;
@@ -397,9 +375,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			}
 			else
 				tup_exist = NULL;
-#else
-			tup_exist = index_getnext(scan, ForwardScanDirection);
-#endif
+
 			if (tup_exist == NULL)
 				elog(ERROR, "Failed to find target tuple");
 			ItemPointerCopy(&tup_exist->t_self, &ctid);
@@ -421,11 +397,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 				{
 					List	   *recheck;
 
-#if PG_VERSION_NUM >= 120000
 					ExecStoreHeapTuple(tup, slot, false);
-#else
-					ExecStoreTuple(tup, slot, InvalidBuffer, false);
-#endif
 
 					/*
 					 * XXX Consider passing update=true, however it requires
@@ -437,9 +409,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 													iistate->rri,
 #endif
 													slot,
-#if PG_VERSION_NUM < 120000
-													&(tup->t_self),
-#endif
 													iistate->estate,
 #if PG_VERSION_NUM >= 140000
 													false,	/* update */
@@ -489,11 +458,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			UpdateActiveSnapshotCommandId();
 		}
 
-#if PG_VERSION_NUM >= 120000
 		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
 		Assert(shouldFree);
 		pfree(tup_change);
-#endif
 	}
 
 	tuplestore_clear(dstate->tstore);
@@ -505,9 +472,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 	ExecDropSingleTupleTableSlot(slot);
-#if PG_VERSION_NUM >= 120000
 	ExecDropSingleTupleTableSlot(ind_slot);
-#endif
 }
 
 static bool
