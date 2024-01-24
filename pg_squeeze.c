@@ -2693,6 +2693,9 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		text	   *reloptions = NULL;
 		bits16		flags;
 		XLogRecPtr	end_of_wal;
+#if PG_VERSION_NUM >= 170000
+		Datum		*opclassOptions;
+#endif
 
 		ind_oid = indexes_src[i];
 		ind = index_open(ind_oid, AccessShareLock);
@@ -2854,6 +2857,12 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		reloptions = !isnull ? DatumGetTextPCopy(d) : NULL;
 		ReleaseSysCache(tup);
 
+#if PG_VERSION_NUM >= 170000
+		opclassOptions = palloc0(sizeof(Datum) * ind_info->ii_NumIndexAttrs);
+		for (j = 0; j < ind_info->ii_NumIndexAttrs; j++)
+			opclassOptions[i] = get_attoptions(ind_oid, j + 1);
+#endif
+
 		/*
 		 * Publish information on what we're going to do. This is especially
 		 * important if parallel workers are used to build the index.
@@ -2878,6 +2887,9 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   tbsp_oid,
 								   collations,
 								   opclasses,
+#if PG_VERSION_NUM >= 170000
+								   opclassOptions,
+#endif
 								   indoptions,
 								   PointerGetDatum(reloptions),
 								   flags,	/* flags */
