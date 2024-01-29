@@ -56,8 +56,8 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-#if PG_VERSION_NUM < 100000
-#error "PostgreSQL version 10 or higher is required"
+#if PG_VERSION_NUM < 120000
+#error "PostgreSQL version 12 or higher is required"
 #endif
 
 PG_MODULE_MAGIC;
