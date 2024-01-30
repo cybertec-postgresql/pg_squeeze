@@ -951,6 +951,13 @@ squeeze_worker_main(Datum main_arg)
 		process_task(task_id);
 
 done:
+	if (task_id >= 0)
+	{
+		/* Make sure that worker_shmem_shutdown() releases the task. */
+		Assert(task_id < NUM_WORKER_TASKS);
+		MyWorkerTask = &workerData->tasks[task_id];
+	}
+
 	proc_exit(0);
 }
 
