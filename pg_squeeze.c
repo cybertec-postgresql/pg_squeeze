@@ -2711,7 +2711,7 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 #if PG_VERSION_NUM >= 170000
 		opclassOptions = palloc0(sizeof(Datum) * ind_info->ii_NumIndexAttrs);
 		for (j = 0; j < ind_info->ii_NumIndexAttrs; j++)
-			opclassOptions[i] = get_attoptions(ind_oid, j + 1);
+			opclassOptions[j] = get_attoptions(ind_oid, j + 1);
 #endif
 
 		/*
