@@ -108,6 +108,9 @@ typedef struct WorkerData
 	/*
 	 * A lock to synchronize access to slots. Lock in exclusive mode to add /
 	 * remove workers, in shared mode to find information on them.
+	 *
+	 * It's also used to synchronize task creation, so that we don't have more
+	 * than one task per table.
 	 */
 	LWLock	   *lock;
 
@@ -154,9 +157,9 @@ static void release_task(WorkerTask *task, bool worker);
 static void reset_progress(WorkerProgress *progress);
 static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
 
-static WorkerTask *get_unused_task(int *task_idx);
-static void initialize_worker_task(WorkerTask *task, int task_id,
-								   Name relschema, Name relname, Name indname,
+static WorkerTask *get_unused_task(Oid dbid, Name relschema, Name relname,
+								   int *task_idx, bool *duplicate);
+static void initialize_worker_task(WorkerTask *task, int task_id, Name indname,
 								   Name tbspname, ArrayType *ind_tbsps,
 								   bool last_try, bool skip_analyze);
 static bool start_worker_internal(bool scheduler, int task_id,
@@ -223,10 +226,13 @@ squeeze_worker_shmem_startup(void)
 			WorkerTask *task;
 
 			task = &workerData->tasks[i];
-			task->assigned = false;
+			task->in_use = false;
 			task->exit_requested = false;
-			task->slot = NULL;
+			task->worker_state = WTS_UNUSED;
 			task->error_msg[0] = '\0';
+			task->dbid = InvalidOid;
+			NameStr(task->relschema)[0] = '\0';
+			NameStr(task->relname)[0] = '\0';
 			SpinLockInit(&task->mutex);
 		}
 
@@ -308,7 +314,6 @@ worker_shmem_shutdown(int code, Datum arg)
 	 */
 	if (am_i_scheduler || am_i_standalone)
 		drop_replication_slots();
-
 }
 
 /*
@@ -391,6 +396,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
 	char	*error_msg = NULL;
+	bool	task_exists;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -418,13 +424,21 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	}
 
 	/* Find free task structure. */
-	task = get_unused_task(&task_idx);
+	task = get_unused_task(MyDatabaseId, relschema, relname, &task_idx,
+						   &task_exists);
 	if (task == NULL)
-		ereport(ERROR, (errmsg("too many concurrent tasks in progress")));
+	{
+		if (task_exists)
+			ereport(ERROR,
+					(errmsg("task for relation \"%s\".\"%s\" already exists",
+							NameStr(*relschema), NameStr(*relname))));
+		else
+			ereport(ERROR, (errmsg("too many concurrent tasks in progress")));
+	}
 
 	/* Fill-in the remaining task information. */
-	initialize_worker_task(task, -1, relschema, relname, indname, tbspname,
-						   ind_tbsps, false, true);
+	initialize_worker_task(task, -1, indname, tbspname, ind_tbsps, false,
+						   true);
 	/*
 	 * Unlike scheduler_worker_loop() we cannot build the snapshot here, the
 	 * worker will do. (It will also create the replication slot.) This is
@@ -495,59 +509,114 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 }
 
 /*
- * Returns a newly assigned task, or NULL if there's no unused slot.
+ * Returns a newly assigned task. Return NULL if there's no unused slot or a
+ * task already exists for given relation.
  *
  * The index in the task array is returned in *task_idx.
+ *
+ * The returned task ahs 'dbid', 'relschema' and 'relname' fields initialized.
+ *
+ * If NULL is returned, *duplicate tells whether it's due to an existing task
+ * for given relation.
  */
 static WorkerTask *
-get_unused_task(int *task_idx)
+get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
+				bool *duplicate)
 {
 	int		i;
+	WorkerTask	*task;
 	WorkerTask	*result = NULL;
+	int			res_idx = -1;
 
+	*duplicate = false;
+
+	/*
+	 * Find an unused task and make sure that a valid task does not exist for
+	 * the same relation.
+	 */
+	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < NUM_WORKER_TASKS; i++)
 	{
-		WorkerTask	*task;
+		bool	needs_check = false;
 
 		task = &workerData->tasks[i];
 		SpinLockAcquire(&task->mutex);
-		/*
-		 * If slot is valid, the worker is still working on an earlier task,
-		 * although the backend that assigned the task already exited.
-		 */
-		if (!task->assigned && task->slot == NULL)
+		if (task->in_use || task->worker_state != WTS_UNUSED)
 		{
-			/* Make sure that no other backend can use the task. */
-			task->assigned = true;
-
-			task->error_msg[0] = '\0';
-			result = task;
-			*task_idx = i;
+			/*
+			 * Consider tasks which might be in progress possible duplicates
+			 * of the task we're going to submit.
+			 */
+			needs_check = true;
 		}
+		else if (result == NULL)
+		{
+			/* Result candidate */
+			result = task;
+			res_idx = i;
+		}
+		/*
+		 * String comparisons shouldn't take place under spinlock. (Those
+		 * fields aren't protected by the spinlock anyway.)
+		 */
 		SpinLockRelease(&task->mutex);
 
-		if (result)
-			break;
-	}
+		if (needs_check)
+		{
+			/*
+			 * The strings are only set while workerData->lock is held in
+			 * exclusive mode (see below), so we can safely check them here.
+			 */
+			if (task->dbid == dbid &&
+				strcmp(NameStr(task->relschema), NameStr(*relschema)) == 0 &&
+				strcmp(NameStr(task->relname), NameStr(*relname)) == 0)
+			{
+				result = NULL;
+				res_idx = -1;
+				*duplicate = true;
 
+				goto done;
+			}
+		}
+	}
+	if (result == NULL)
+		goto done;
+
+	/*
+	 * No one else should be interested in this task, so don't use spinlock
+	 * below.
+	 *
+	 * Make sure that no other backend can use the task.
+	 */
+	result->in_use = true;
+	/* Set the initial state for the worker. */
+	result->worker_state = WTS_INIT;
+
+	/* Initialize the fields we use to check uniqueness of the task. */
+	result->dbid = dbid;
+	namestrcpy(&result->relschema, NameStr(*relschema));
+	namestrcpy(&result->relname, NameStr(*relname));
+
+done:
+	LWLockRelease(workerData->lock);
+	*task_idx = res_idx;
 	return result;
 }
 
 /*
- * Fill-in "user data" of WorkerTask. task_id should already be set.
+ * Fill-in "user data" of WorkerTask. task_id, dbid, relschema and relname
+ * should already be set.
  */
 static void
-initialize_worker_task(WorkerTask *task, int task_id, Name relschema,
-					   Name relname, Name indname, Name tbspname,
-					   ArrayType *ind_tbsps, bool last_try, bool skip_analyze)
+initialize_worker_task(WorkerTask *task, int task_id, Name indname,
+					   Name tbspname, ArrayType *ind_tbsps, bool last_try,
+					   bool skip_analyze)
 {
 	StringInfoData	buf;
 
 	initStringInfo(&buf);
 
 	task->task_id = task_id;
-	namestrcpy(&task->relschema, NameStr(*relschema));
-	namestrcpy(&task->relname, NameStr(*relname));
 	appendStringInfo(&buf,
 					 "squeeze worker task: id=%d, relschema=%s, relname=%s",
 					 task->task_id, NameStr(task->relschema),
@@ -579,6 +648,7 @@ initialize_worker_task(WorkerTask *task, int task_id, Name relschema,
 	ereport(DEBUG1, (errmsg("%s", buf.data)));
 	pfree(buf.data);
 
+	task->error_msg[0] = '\0';
 	task->last_try = last_try;
 	task->skip_analyze = skip_analyze;
 }
@@ -1052,6 +1122,7 @@ scheduler_worker_loop(void)
 			ArrayType *ind_tbsps;
 			bool		last_try;
 			bool		skip_analyze;
+			bool		task_exists = false;
 
 			cl_index = NULL;
 			rel_tbsp = NULL;
@@ -1061,14 +1132,6 @@ scheduler_worker_loop(void)
 			tup = heap_copytuple(SPI_tuptable->vals[i]);
 			ExecClearTuple(slot);
 			ExecStoreHeapTuple(tup, slot, true);
-
-			/*
-			 * No point in fetching the remaining columns if all the tasks are
-			 * already used.
-			 */
-			task = get_unused_task(&id);
-			if (task == NULL)
-				break;
 
 			datum = slot_getattr(slot, 1, &isnull);
 			Assert(!isnull);
@@ -1081,6 +1144,30 @@ scheduler_worker_loop(void)
 			datum = slot_getattr(slot, 3, &isnull);
 			Assert(!isnull);
 			relname = DatumGetName(datum);
+
+			task = get_unused_task(MyDatabaseId, relschema, relname, &id,
+								   &task_exists);
+			if (task == NULL)
+			{
+				if (task_exists)
+				{
+					/* Already in progress, go for the next one. */
+					ereport(WARNING,
+							(errmsg("task already exists for table \"%s\".\"%s\"",
+									NameStr(*relschema), NameStr(*relname))));
+					continue;
+				}
+				else
+				{
+					/*
+					 * No point in fetching the remaining columns if all the
+					 * tasks are already used.
+					 */
+					ereport(WARNING,
+							(errmsg("the task queue is currently full")));
+					break;
+				}
+			}
 
 			datum = slot_getattr(slot, 4, &isnull);
 			if (!isnull)
@@ -1103,9 +1190,8 @@ scheduler_worker_loop(void)
 			skip_analyze = DatumGetBool(datum);
 
 			/* Fill the task. */
-			initialize_worker_task(task, task_id, relschema, relname,
-								   cl_index, rel_tbsp, ind_tbsps, last_try,
-								   skip_analyze);
+			initialize_worker_task(task, task_id, cl_index, rel_tbsp,
+								   ind_tbsps, last_try, skip_analyze);
 
 			/* The list must survive SPI_finish(). */
 			old_cxt = MemoryContextSwitchTo(sched_cxt);
@@ -1515,7 +1601,6 @@ build_historic_snapshot(SnapBuild *builder)
 static void
 process_task_internal(MemoryContext task_cxt)
 {
-	int			i;
 	Name		relschema,
 		relname;
 	Name		cl_index = NULL;
@@ -1528,7 +1613,6 @@ process_task_internal(MemoryContext task_cxt)
 	RangeVar   *relrv;
 	Relation	rel;
 	Oid			relid;
-	bool		found;
 	ErrorData  *edata;
 
 	task = MyWorkerTask;
@@ -1549,11 +1633,11 @@ process_task_internal(MemoryContext task_cxt)
 	}
 
 	/*
-	 * Once the backend sets "assigned" and the worker is launched, only the
+	 * Once the backend sets "in_use" and the worker is launched, only the
 	 * worker is expected to change the task, so access it w/o locking.
 	 */
-	Assert(task->assigned && task->slot == NULL);
-	task->slot = MyWorkerSlot;
+	Assert(task->in_use && task->worker_state == WTS_INIT);
+	task->worker_state = WTS_IN_PROGRESS;
 
 	relschema = &task->relschema;
 	relname = &task->relname;
@@ -1563,15 +1647,13 @@ process_task_internal(MemoryContext task_cxt)
 		rel_tbsp = &task->tbspname;
 
 	/*
-	 * Now that we're in the suitable memory context, we can copy the
-	 * tablespace mapping array, if one is passed.
+	 * Copy the tablespace mapping array, if one is passed.
 	 */
 	arr_size = VARSIZE(task->ind_tbsps);
 	if (arr_size > 0)
 	{
 		Assert(arr_size <= IND_TABLESPACES_ARRAY_SIZE);
-		ind_tbsps = palloc(arr_size);
-		memcpy(ind_tbsps, task->ind_tbsps, arr_size);
+		ind_tbsps = (ArrayType *) task->ind_tbsps;
 	}
 
 	/* Now process the task. */
@@ -1587,46 +1669,15 @@ process_task_internal(MemoryContext task_cxt)
 	table_close(rel, AccessShareLock);
 	CommitTransactionCommand();
 
-	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
-	found = false;
-	for (i = 0; i < workerData->nslots; i++)
-	{
-		WorkerSlot *slot = &workerData->slots[i];
-
-		if (slot->dbid == MyDatabaseId &&
-			slot->relid == relid)
-		{
-			found = true;
-			break;
-		}
-	}
-	if (found)
-	{
-		LWLockRelease(workerData->lock);
-
-		/* The scheduler should not allow this, but squeeze_table() does. */
-		ereport(ERROR,
-				(errmsg("task for table %s.%s is being processed by another worker",
-						NameStr(*relschema), NameStr(*relname))));
-		return;
-	}
 	/* Declare that this worker takes care of the relation. */
 	Assert(MyWorkerSlot->dbid == MyDatabaseId);
 	MyWorkerSlot->relid = relid;
 	reset_progress(&MyWorkerSlot->progress);
-	LWLockRelease(workerData->lock);
-	/*
-	 * The table can be dropped now, created again (with a different OID),
-	 * scheduled for processing and picked by another worker. The worst case
-	 * is that the table will be squeezed twice, so the time spent by the
-	 * worker that finished first will be wasted. However such a situation is
-	 * not really likely to happen.
-	 */
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
 	 * pg_squeeze extension itself so that they can be skipped easily during
-	 * decoded. (We avoid the decoding for performance reasons. Even if those
+	 * decoding. (We avoid the decoding for performance reasons. Even if those
 	 * changes were decoded, our output plugin should not apply them because
 	 * squeeze_table_impl() exits before its transaction commits.)
 	 *
@@ -1815,7 +1866,7 @@ release_task(WorkerTask *task, bool worker)
 	if (worker)
 	{
 		/* Called from squeeze worker. */
-		task->slot = NULL;
+		task->worker_state = WTS_UNUSED;
 		Assert(task == MyWorkerTask);
 		task->exit_requested = false;
 		/*
@@ -1842,8 +1893,8 @@ release_task(WorkerTask *task, bool worker)
 	else
 	{
 		/* Called from backend or from the scheduler worker. */
-		Assert(task->assigned);
-		task->assigned = false;
+		Assert(task->in_use);
+		task->in_use = false;
 		if (task->repl_slot.snap_seg)
 		{
 			dsm_detach(task->repl_slot.snap_seg);

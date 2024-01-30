@@ -315,27 +315,47 @@ typedef struct ReplSlotStatus
 	char	*snap_private;
 } ReplSlotStatus;
 
+/* Life cycle of the task from the perspective of the worker. */
+typedef enum
+{
+	WTS_UNUSED,			/* processing not yet requested by backend or
+						 * scheduler worker */
+	WTS_INIT,			/* processing requested but task not yet picked by a
+						 * worker */
+	WTS_IN_PROGRESS,	/* worker is working on the task */
+} WorkerTaskState;
+
 /*
  * This structure represents a task assigned to the worker via shared memory.
  */
 typedef struct WorkerTask
 {
-	/* Backend that assigned the task both sets and clears this field. */
-	bool		assigned;
+	/*
+	 * State from the perspective of the requesting backend or scheduler
+	 * worker.
+	 */
+	bool		in_use;
 	/* See the comments of exit_if_requested(). */
 	bool	exit_requested;
-	/* Worker that performs the task both sets and clears this field. */
-	WorkerSlot	*slot;
+	/* Worker that performs the task sets this field. */
+	WorkerTaskState	worker_state;
 
 	/*
-	 * Use this when setting / clearing the fields above. Once "assigned" is
-	 * set, the task belongs to the backend that set it, so the other fields
-	 * may be assigned w/o the lock.
+	 * Use this when setting / clearing the fields above.
+	 *
+	 * Note that, when setting "in_use" to true or "worker_state" to WTS_INIT,
+	 * workerData->lock in exclusive mode must be held in addition. This is to
+	 * ensure that at most one task exists per table. On the other hand, the
+	 * spinlock is sufficient both to clear "in_use" and to adjust
+	 * "worker_state" to states other than INIT.
 	 */
 	slock_t		mutex;
 
+	/* Change of these requires workerData->lock in exclusive mode. */
+	Oid			dbid;
 	NameData	relschema;
 	NameData	relname;
+
 	NameData	indname;		/* clustering index */
 	NameData	tbspname;		/* destination tablespace */
 
