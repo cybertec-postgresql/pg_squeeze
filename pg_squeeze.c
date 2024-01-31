@@ -2287,9 +2287,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 						bistate);
 
 			/* Update the progress information. */
-			SpinLockAcquire(&MyWorkerProgress->mutex);
-			MyWorkerProgress->ins_initial += 1;
-			SpinLockRelease(&MyWorkerProgress->mutex);
+			SpinLockAcquire(&MyWorkerSlot->mutex);
+			MyWorkerSlot->progress.ins_initial += 1;
+			SpinLockRelease(&MyWorkerSlot->mutex);
 
 			if (!use_sort)
 				pfree(tup_out);

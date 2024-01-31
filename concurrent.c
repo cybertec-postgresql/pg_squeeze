@@ -313,9 +313,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			pfree(tup);
 
 			/* Update the progress information. */
-			SpinLockAcquire(&MyWorkerProgress->mutex);
-			MyWorkerProgress->ins += 1;
-			SpinLockRelease(&MyWorkerProgress->mutex);
+			SpinLockAcquire(&MyWorkerSlot->mutex);
+			MyWorkerSlot->progress.ins += 1;
+			SpinLockRelease(&MyWorkerSlot->mutex);
 		}
 		else if (change->kind == PG_SQUEEZE_CHANGE_UPDATE_NEW ||
 				 change->kind == PG_SQUEEZE_CHANGE_DELETE)
@@ -426,18 +426,18 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 				}
 
 				/* Update the progress information. */
-				SpinLockAcquire(&MyWorkerProgress->mutex);
-				MyWorkerProgress->upd += 1;
-				SpinLockRelease(&MyWorkerProgress->mutex);
+				SpinLockAcquire(&MyWorkerSlot->mutex);
+				MyWorkerSlot->progress.upd += 1;
+				SpinLockRelease(&MyWorkerSlot->mutex);
 			}
 			else
 			{
 				simple_heap_delete(relation, &ctid);
 
 				/* Update the progress information. */
-				SpinLockAcquire(&MyWorkerProgress->mutex);
-				MyWorkerProgress->del += 1;
-				SpinLockRelease(&MyWorkerProgress->mutex);
+				SpinLockAcquire(&MyWorkerSlot->mutex);
+				MyWorkerSlot->progress.del += 1;
+				SpinLockRelease(&MyWorkerSlot->mutex);
 			}
 
 			if (tup_old != NULL)

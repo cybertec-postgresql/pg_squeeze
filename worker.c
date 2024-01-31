@@ -121,13 +121,10 @@ typedef struct WorkerData
 static WorkerData *workerData = NULL;
 
 /* Local pointer to the slot in the shared memory. */
-static WorkerSlot *MyWorkerSlot = NULL;
+WorkerSlot *MyWorkerSlot = NULL;
 
 /* Local pointer to the task in the shared memory. */
 WorkerTask *MyWorkerTask = NULL;
-
-/* Local pointer to the progress information. */
-WorkerProgress *MyWorkerProgress = NULL;
 
 /*
  * The "squeeze worker" (i.e. one that performs the actual squeezing, as
@@ -154,7 +151,6 @@ static int	squeezeWorkerSlotCount = 0;
 
 static void interrupt_worker(WorkerTask *task);
 static void release_task(WorkerTask *task, bool worker);
-static void reset_progress(WorkerProgress *progress);
 static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
 
 static WorkerTask *get_unused_task(Oid dbid, Name relschema, Name relname,
@@ -245,8 +241,8 @@ squeeze_worker_shmem_startup(void)
 
 			slot->dbid = InvalidOid;
 			slot->relid = InvalidOid;
-			SpinLockInit(&slot->progress.mutex);
-			reset_progress(&slot->progress);
+			SpinLockInit(&slot->mutex);
+			MemSet(&slot->progress, 0, sizeof(WorkerProgress));
 			slot->pid = InvalidPid;
 		}
 	}
@@ -261,17 +257,20 @@ worker_shmem_shutdown(int code, Datum arg)
 	/* exiting before the slot was initialized? */
 	if (MyWorkerSlot)
 	{
-		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+		/*
+		 * Use spinlock to make sure that invalid dbid implies that the
+		 * clearing is done.
+		 */
+		SpinLockAcquire(&MyWorkerSlot->mutex);
 		Assert(MyWorkerSlot->dbid != InvalidOid);
 		MyWorkerSlot->dbid = InvalidOid;
 		MyWorkerSlot->relid = InvalidOid;
-		reset_progress(&MyWorkerSlot->progress);
 		MyWorkerSlot->pid = InvalidPid;
-		LWLockRelease(workerData->lock);
+		MemSet(&MyWorkerSlot->progress, 0, sizeof(WorkerProgress));
+		SpinLockRelease(&MyWorkerSlot->mutex);
 
 		/* This shouldn't be necessary, but ... */
 		MyWorkerSlot = NULL;
-		MyWorkerProgress = NULL;
 	}
 
 	if (MyWorkerTask)
@@ -353,12 +352,18 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to stop squeeze worker"))));
 
-	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
 		WorkerSlot *slot = &workerData->slots[i];
+		Oid		dbid;
+		bool	scheduler;
 
-		if (slot->dbid == MyDatabaseId && slot->scheduler)
+		SpinLockAcquire(&slot->mutex);
+		dbid = slot->dbid;
+		scheduler = slot->scheduler;
+		SpinLockRelease(&slot->mutex);
+
+		if (dbid == MyDatabaseId && scheduler)
 		{
 			kill(slot->pid, SIGTERM);
 
@@ -369,7 +374,6 @@ squeeze_stop_worker(PG_FUNCTION_ARGS)
 			break;
 		}
 	}
-	LWLockRelease(workerData->lock);
 
 	PG_RETURN_VOID();
 }
@@ -829,7 +833,7 @@ squeeze_worker_main(Datum main_arg)
 {
 	Datum		arg;
 	int			i;
-	bool		found;
+	bool		found_scheduler;
 	int			nworkers;
 	int			task_id = -1;
 
@@ -866,18 +870,36 @@ squeeze_worker_main(Datum main_arg)
 		task_id = con.task_id;
 	}
 
-	/*
-	 * Make sure that there is no more than one scheduler and no more than
-	 * squeeze_workers_per_database workers running on this database.
-	 */
-	found = false;
+	found_scheduler = false;
 	nworkers = 0;
+	/*
+	 * Find and initialize a slot for this worker.
+	 *
+	 * While doing that, make sure that there is no more than one scheduler
+	 * and no more than squeeze_workers_per_database workers running on this
+	 * database.
+	 *
+	 * Exclusive lock is needed to make sure that the maximum number of
+	 * workers is not exceeded due to race conditions.
+	 */
+	Assert(MyWorkerSlot == NULL);
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
 	for (i = 0; i < workerData->nslots; i++)
 	{
 		WorkerSlot *slot = &workerData->slots[i];
+		Oid		dbid;
 
-		if (slot->dbid == MyDatabaseId)
+		/*
+		 * The spinlock might seem unnecessary, but w/o that it could happen
+		 * that we saw 'dbid' invalid (i.e. ready to use) while another worker
+		 * is still clearing the other fields (before exit) and thus it can
+		 * overwrite our settings - see worker_shmem_shutdown().
+		 */
+		SpinLockAcquire(&slot->mutex);
+		dbid = slot->dbid;
+		SpinLockRelease(&slot->mutex);
+
+		if (dbid == MyDatabaseId)
 		{
 			if (am_i_scheduler && slot->scheduler)
 			{
@@ -885,7 +907,7 @@ squeeze_worker_main(Datum main_arg)
 					 "one scheduler worker already running on database oid=%u",
 					 MyDatabaseId);
 
-				found = true;
+				found_scheduler = true;
 				break;
 			}
 			else if (!am_i_scheduler && !slot->scheduler)
@@ -899,38 +921,40 @@ squeeze_worker_main(Datum main_arg)
 				}
 			}
 		}
+		else if (dbid == InvalidOid && MyWorkerSlot == NULL)
+			MyWorkerSlot = slot;
 	}
 
-	if (found || (nworkers >= squeeze_workers_per_database))
+	if (found_scheduler || (nworkers >= squeeze_workers_per_database))
 	{
 		LWLockRelease(workerData->lock);
 		goto done;
 	}
 
-	/* Find and initialize a slot for this worker. */
-	Assert(MyWorkerSlot == NULL);
-	for (i = 0; i < workerData->nslots; i++)
+	/*
+	 * Fill-in all the information we have. (relid will be set in
+	 * process_task() unless this worker is a scheduler.)
+	 */
+	if (MyWorkerSlot)
 	{
-		WorkerSlot *slot = &workerData->slots[i];
+		WorkerSlot *slot = MyWorkerSlot;
 
-		if (slot->dbid == InvalidOid)
-		{
-			slot->dbid = MyDatabaseId;
-			Assert(slot->relid == InvalidOid);
-			Assert(slot->pid == InvalidPid);
-			slot->pid = MyProcPid;
-			slot->scheduler = am_i_scheduler;
-
-			MyWorkerSlot = slot;
-			MyWorkerProgress = &slot->progress;
-			reset_progress(MyWorkerProgress);
-
-			found = true;
-			break;
-		}
+		/*
+		 * The spinlock is probably not necessary here (no one else should be
+		 * interested in this slot).
+		 */
+		SpinLockAcquire(&slot->mutex);
+		slot->dbid = MyDatabaseId;
+		Assert(slot->relid == InvalidOid);
+		Assert(slot->pid == InvalidPid);
+		slot->pid = MyProcPid;
+		slot->scheduler = am_i_scheduler;
+		MemSet(&slot->progress, 0, sizeof(WorkerProgress));
+		SpinLockRelease(&slot->mutex);
 	}
 	LWLockRelease(workerData->lock);
-	if (!found)
+
+	if (MyWorkerSlot == NULL)
 	{
 		/*
 		 * This should never happen (i.e. we should always have
@@ -1677,9 +1701,11 @@ process_task_internal(MemoryContext task_cxt)
 	CommitTransactionCommand();
 
 	/* Declare that this worker takes care of the relation. */
+	SpinLockAcquire(&MyWorkerSlot->mutex);
 	Assert(MyWorkerSlot->dbid == MyDatabaseId);
 	MyWorkerSlot->relid = relid;
-	reset_progress(&MyWorkerSlot->progress);
+	MemSet(&MyWorkerSlot->progress, 0, sizeof(WorkerProgress));
+	SpinLockRelease(&MyWorkerSlot->mutex);
 
 	/*
 	 * The session origin will be used to mark WAL records produced by the
@@ -1758,10 +1784,10 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 						 NameStr(*relschema),
 						 NameStr(*relname),
 						 start_ts_str,
-						 MyWorkerProgress->ins_initial,
-						 MyWorkerProgress->ins,
-						 MyWorkerProgress->upd,
-						 MyWorkerProgress->del);
+						 MyWorkerSlot->progress.ins_initial,
+						 MyWorkerSlot->progress.ins,
+						 MyWorkerSlot->progress.upd,
+						 MyWorkerSlot->progress.del);
 		run_command(query.data, SPI_OK_INSERT);
 
 		if (task->task_id >= 0)
@@ -1799,10 +1825,10 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 	}
 
 	/* Clear the relid field of this worker's slot. */
-	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+	SpinLockAcquire(&MyWorkerSlot->mutex);
 	MyWorkerSlot->relid = InvalidOid;
-	reset_progress(&MyWorkerSlot->progress);
-	LWLockRelease(workerData->lock);
+	MemSet(&MyWorkerSlot->progress, 0, sizeof(WorkerProgress));
+	SpinLockRelease(&MyWorkerSlot->mutex);
 }
 
 /*
@@ -1851,10 +1877,10 @@ VALUES ('%s', '%s', '%s', %s, %s)",
 		}
 
 		/* Clear the relid field of this worker's slot. */
-		LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+		SpinLockAcquire(&MyWorkerSlot->mutex);
 		MyWorkerSlot->relid = InvalidOid;
-		reset_progress(&MyWorkerSlot->progress);
-		LWLockRelease(workerData->lock);
+		MemSet(&MyWorkerSlot->progress, 0, sizeof(WorkerProgress));
+		SpinLockRelease(&MyWorkerSlot->mutex);
 	}
 }
 
@@ -1910,17 +1936,6 @@ release_task(WorkerTask *task, bool worker)
 		}
 	}
 	SpinLockRelease(&task->mutex);
-}
-
-static void
-reset_progress(WorkerProgress *progress)
-{
-	SpinLockAcquire(&progress->mutex);
-	progress->ins_initial = 0;
-	progress->ins = 0;
-	progress->upd = 0;
-	progress->del = 0;
-	SpinLockRelease(&progress->mutex);
 }
 
 /*

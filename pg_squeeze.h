@@ -268,8 +268,6 @@ typedef struct WorkerConInteractive
 /* Progress tracking. */
 typedef struct WorkerProgress
 {
-	slock_t		mutex;
-
 	/* Tuples inserted during the initial load. */
 	int64		ins_initial;
 
@@ -289,10 +287,30 @@ typedef struct WorkerSlot
 {
 	Oid			dbid;			/* database the worker is connected to */
 	Oid			relid;			/* relation the worker is working on */
+
 	int			pid;			/* the PID */
 	bool		scheduler;		/* true if scheduler, false if the "squeeze
 								 * worker" */
 	WorkerProgress progress;	/* progress tracking information */
+
+	/*
+	 * Use this when setting / clearing the fields above.
+	 *
+	 * Note that, when setting, workerData->lock in exclusive mode must be
+	 * held in addition. This is to ensure the maximum number of workers is
+	 * not exceeded when multiple workers search for a slot concurrently. On
+	 * the other hand, the spinlock is sufficient to clear the fields.
+	 *
+	 * Note that we use MemSet() to reset 'progress', which is hopefully
+	 * o.k. to do under spinlock. XXX Consider using atomics for the
+	 * 'progress' counters rather than the spinlock. In theory, the absence of
+	 * spinlock could allow the new worker to see the values not yet cleared
+	 * by the old worker (or cleared after the new worker already had
+	 * increased the counters), but not sure if this a serious issue.
+	 * (Likewise: is it a problem if the monitoring functions get an
+	 * inconsistent view of the counters?)
+	 */
+	slock_t		mutex;
 } WorkerSlot;
 
 /*
@@ -388,8 +406,8 @@ typedef struct WorkerTask
 	char		error_msg[];
 } WorkerTask;
 
+extern WorkerSlot *MyWorkerSlot;
 extern WorkerTask *MyWorkerTask;
-extern WorkerProgress *MyWorkerProgress;
 
 extern WorkerConInit *allocate_worker_con_info(char *dbname,
 											   char *rolename);
