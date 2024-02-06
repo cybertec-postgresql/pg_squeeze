@@ -403,7 +403,7 @@ typedef struct WorkerTask
 	ReplSlotStatus	repl_slot;
 
 #define ERROR_MESSAGE_MAX_SIZE		1024
-	char		error_msg[];
+	char		error_msg[ERROR_MESSAGE_MAX_SIZE];
 } WorkerTask;
 
 extern WorkerSlot *MyWorkerSlot;
