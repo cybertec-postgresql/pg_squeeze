@@ -223,11 +223,6 @@ extern bool decode_concurrent_changes(LogicalDecodingContext *ctx,
 									  struct timeval *must_complete);
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
 
-#if PG_VERSION_NUM >= 150000
-extern shmem_request_hook_type prev_shmem_request_hook;
-#endif
-extern shmem_startup_hook_type prev_shmem_startup_hook;
-
 extern int	squeeze_workers_per_database;
 
 /*
@@ -416,7 +411,11 @@ extern void squeeze_initialize_bgworker(BackgroundWorker *worker,
 										WorkerConInteractive *con_interactive,
 										pid_t notify_pid);
 
+#if PG_VERSION_NUM >= 150000
+extern void squeeze_save_prev_shmem_request_hook(void);
+#endif
 extern void squeeze_worker_shmem_request(void);
+extern void squeeze_save_prev_shmem_startup_hook(void);
 extern void squeeze_worker_shmem_startup(void);
 
 extern PGDLLEXPORT void squeeze_worker_main(Datum main_arg);

@@ -159,11 +159,6 @@ char	   *squeeze_worker_role = NULL;
 /* The number of squeeze workers per database. */
 int			squeeze_workers_per_database = 1;
 
-#if PG_VERSION_NUM >= 150000
-shmem_request_hook_type prev_shmem_request_hook = NULL;
-#endif
-shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-
 void
 _PG_init(void)
 {
@@ -172,13 +167,13 @@ _PG_init(void)
 				(errmsg("pg_squeeze must be loaded via shared_preload_libraries")));
 
 #if PG_VERSION_NUM >= 150000
-	prev_shmem_request_hook = shmem_request_hook;
+	squeeze_save_prev_shmem_request_hook();
 	shmem_request_hook = squeeze_worker_shmem_request;
 #else
 	squeeze_worker_shmem_request();
 #endif
 
-	prev_shmem_startup_hook = shmem_startup_hook;
+	squeeze_save_prev_shmem_startup_hook();
 	shmem_startup_hook = squeeze_worker_shmem_startup;
 
 	DefineCustomStringVariable(

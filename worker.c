@@ -186,6 +186,17 @@ worker_shmem_size(void)
 	return size;
 }
 
+
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+void
+squeeze_save_prev_shmem_request_hook(void)
+{
+	prev_shmem_request_hook = shmem_request_hook;
+}
+#endif
+
 void
 squeeze_worker_shmem_request(void)
 {
@@ -197,6 +208,14 @@ squeeze_worker_shmem_request(void)
 
 	RequestAddinShmemSpace(worker_shmem_size());
 	RequestNamedLWLockTranche("pg_squeeze", 1);
+}
+
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+void
+squeeze_save_prev_shmem_startup_hook(void)
+{
+	prev_shmem_startup_hook = shmem_startup_hook;
 }
 
 void
