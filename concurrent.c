@@ -19,6 +19,10 @@
 #include "replication/decode.h"
 #include "utils/rel.h"
 
+#if PG_VERSION_NUM < 150000
+extern PGDLLIMPORT int wal_segment_size;
+#endif
+
 static void apply_concurrent_changes(DecodingOutputState *dstate,
 									 Relation relation, ScanKey key,
 									 int nkeys, IndexInsertState *iistate);
