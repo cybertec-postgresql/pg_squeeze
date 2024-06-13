@@ -157,7 +157,8 @@ static WorkerTask *get_unused_task(Oid dbid, Name relschema, Name relname,
 								   int *task_idx, bool *duplicate);
 static void initialize_worker_task(WorkerTask *task, int task_id, Name indname,
 								   Name tbspname, ArrayType *ind_tbsps,
-								   bool last_try, bool skip_analyze);
+								   bool last_try, bool skip_analyze,
+								   int max_xlock_time);
 static bool start_worker_internal(bool scheduler, int task_idx,
 								  BackgroundWorkerHandle **handle);
 
@@ -440,7 +441,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 
 	/* Fill-in the remaining task information. */
 	initialize_worker_task(task, -1, indname, tbspname, ind_tbsps, false,
-						   true);
+						   true, squeeze_max_xlock_time);
 	/*
 	 * Unlike scheduler_worker_loop() we cannot build the snapshot here, the
 	 * worker will do. (It will also create the replication slot.) This is
@@ -608,7 +609,7 @@ done:
 static void
 initialize_worker_task(WorkerTask *task, int task_id, Name indname,
 					   Name tbspname, ArrayType *ind_tbsps, bool last_try,
-					   bool skip_analyze)
+					   bool skip_analyze, int max_xlock_time)
 {
 	StringInfoData	buf;
 
@@ -649,6 +650,7 @@ initialize_worker_task(WorkerTask *task, int task_id, Name indname,
 	task->error_msg[0] = '\0';
 	task->last_try = last_try;
 	task->skip_analyze = skip_analyze;
+	task->max_xlock_time = max_xlock_time;
 }
 
 /*
@@ -1146,7 +1148,10 @@ scheduler_worker_loop(void)
 
 			/* Fill the task. */
 			initialize_worker_task(task, task_id, cl_index, rel_tbsp,
-								   ind_tbsps, last_try, skip_analyze);
+								   ind_tbsps, last_try, skip_analyze,
+								   /* XXX Should max_xlock_time be added to
+									* squeeze.tables ? */
+								   0);
 
 			/* The list must survive SPI_finish(). */
 			old_cxt = MemoryContextSwitchTo(sched_cxt);
@@ -1352,6 +1357,8 @@ process_task(int task_id)
 
 	Assert(task_id < NUM_WORKER_TASKS);
 	MyWorkerTask = &workerData->tasks[task_id];
+
+	squeeze_max_xlock_time = MyWorkerTask->max_xlock_time;
 
 	/* Process the assigned task. */
 	PG_TRY();

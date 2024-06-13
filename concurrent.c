@@ -25,7 +25,8 @@ extern PGDLLIMPORT int wal_segment_size;
 
 static void apply_concurrent_changes(DecodingOutputState *dstate,
 									 Relation relation, ScanKey key,
-									 int nkeys, IndexInsertState *iistate);
+									 int nkeys, IndexInsertState *iistate,
+									 struct timeval *must_complete);
 static bool processing_time_elapsed(struct timeval *utmost);
 
 static void plugin_startup(LogicalDecodingContext *ctx,
@@ -64,6 +65,16 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 	bool		done;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	/*
+	 * If some changes could not be applied due to time constraint, make sure
+	 * the tuplestore is empty before we insert new tuples into it.
+	 */
+	if (dstate->nchanges > 0)
+		apply_concurrent_changes(dstate, rel_dst, ident_key,
+								 ident_key_nentries, iistate, NULL);
+	Assert(dstate->nchanges == 0);
+
 	done = false;
 	while (!done)
 	{
@@ -87,7 +98,11 @@ process_concurrent_changes(LogicalDecodingContext *ctx,
 		 * non-trivial.
 		 */
 		apply_concurrent_changes(dstate, rel_dst, ident_key,
-								 ident_key_nentries, iistate);
+								 ident_key_nentries, iistate, must_complete);
+
+		if (processing_time_elapsed(must_complete))
+			/* Like above. */
+			return false;
 	}
 
 	return true;
@@ -204,7 +219,8 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
  */
 static void
 apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
-						 ScanKey key, int nkeys, IndexInsertState *iistate)
+						 ScanKey key, int nkeys, IndexInsertState *iistate,
+						 struct timeval *must_complete)
 {
 	TupleTableSlot *slot;
 	TupleTableSlot *ind_slot;
@@ -244,6 +260,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		ConcurrentChange *change;
 		bool		isnull[1];
 		Datum		values[1];
+
+		Assert(dstate->nchanges > 0);
+		dstate->nchanges--;
 
 		/* Get the change from the single-column tuple. */
 		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
@@ -465,10 +484,22 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
 		Assert(shouldFree);
 		pfree(tup_change);
+
+		/*
+		 * If there is a limit on the time of completion, check it
+		 * now. However, make sure the loop does not break if tup_old was set
+		 * in the previous iteration. In such a case we could not resume the
+		 * processing in the next call.
+		 */
+		if (must_complete && tup_old == NULL &&
+			processing_time_elapsed(must_complete))
+			/* The next call will process the remaining changes. */
+			break;
 	}
 
-	tuplestore_clear(dstate->tstore);
-	dstate->nchanges = 0;
+	/* If we could not apply all the changes, the next call will do. */
+	if (dstate->nchanges == 0)
+		tuplestore_clear(dstate->tstore);
 
 	PopActiveSnapshot();
 

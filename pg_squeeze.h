@@ -39,6 +39,8 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+extern int			squeeze_max_xlock_time;
+
 typedef enum
 {
 	PG_SQUEEZE_CHANGE_INSERT,
@@ -371,6 +373,7 @@ typedef struct WorkerTask
 
 	NameData	indname;		/* clustering index */
 	NameData	tbspname;		/* destination tablespace */
+	int		max_xlock_time;
 
 	/*
 	 * Fields of the squeeze.tasks table.
