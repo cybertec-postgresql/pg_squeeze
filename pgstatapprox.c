@@ -251,10 +251,11 @@ squeeze_pgstattuple_approx(PG_FUNCTION_ARGS)
 	HeapTuple	ret;
 	int			i = 0;
 
-	if (!superuser())
+	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("must be superuser to use pgstattuple functions"))));
+				 (errmsg("must be superuser or replication role to run this function"))));
+
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
