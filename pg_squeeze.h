@@ -33,6 +33,8 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+extern int			squeeze_max_xlock_time;
+
 typedef enum
 {
 	PG_SQUEEZE_CHANGE_INSERT,

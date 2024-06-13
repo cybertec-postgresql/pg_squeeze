@@ -92,6 +92,7 @@ typedef struct WorkerTask
 	NameData	relname;
 	NameData	indname;		/* clustering index */
 	NameData	tbspname;		/* destination tablespace */
+	int			max_xlock_time;
 
 	/*
 	 * index destination tablespaces.
@@ -166,12 +167,14 @@ typedef struct TaskDetails
 	ArrayType  *ind_tbsps;
 	bool		last_try;
 	bool		skip_analyze;
+	int			max_xlock_time;
 } TaskDetails;
 
 static void init_task_details(TaskDetails *task, int32 task_id,
 							  Name relschema, Name relname, Name cl_index,
 							  Name rel_tbsp, ArrayType *ind_tbsps,
-							  bool last_try, bool skip_analyze);
+							  bool last_try, bool skip_analyze,
+							  int max_xlock_time);
 static void squeeze_handle_error_app(ErrorData *edata, TaskDetails *td);
 static void release_task(void);
 
@@ -502,6 +505,7 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 		memcpy(task->ind_tbsps, ind_tbsps, VARSIZE(ind_tbsps));
 	else
 		SET_VARSIZE(task->ind_tbsps, 0);
+	task->max_xlock_time = squeeze_max_xlock_time;
 
 	task_id = task->id;
 	LWLockRelease(task->lock);
@@ -1046,7 +1050,7 @@ restart:
 			}
 
 			init_task_details(tasks, 0, relschema, relname, cl_index, rel_tbsp,
-							  ind_tbsps, false, false);
+							  ind_tbsps, false, false, task->max_xlock_time);
 			MemoryContextSwitchTo(oldcxt);
 
 			/* No other worker should pick this task. */
@@ -1176,7 +1180,10 @@ LIMIT %d", TASK_BATCH_SIZE);
 
 			init_task_details(&tasks[i], task_id, relschema, relname,
 							  cl_index, rel_tbsp, ind_tbsps, last_try,
-							  skip_analyze);
+							  skip_analyze,
+							  /* XXX Should max_xlock_time be added to
+							   * squeeze.tables ? */
+							  0);
 
 		}
 		MemoryContextSwitchTo(oldcxt);
@@ -1292,6 +1299,8 @@ LIMIT %d", TASK_BATCH_SIZE);
 			cl_index = &td->cl_index;
 		if (strlen(NameStr(td->rel_tbsp)) > 0)
 			rel_tbsp = &td->rel_tbsp;
+
+		squeeze_max_xlock_time = td->max_xlock_time;
 
 		/* Perform the actual work. */
 		SetCurrentStatementStartTimestamp();
@@ -1529,7 +1538,8 @@ run_command(char *command, int rc)
 static void
 init_task_details(TaskDetails *task, int32 task_id, Name relschema,
 				  Name relname, Name cl_index, Name rel_tbsp,
-				  ArrayType *ind_tbsps, bool last_try, bool skip_analyze)
+				  ArrayType *ind_tbsps, bool last_try, bool skip_analyze,
+				  int max_xlock_time)
 {
 	memset(task, 0, sizeof(TaskDetails));
 	task->id = task_id;
@@ -1542,6 +1552,7 @@ init_task_details(TaskDetails *task, int32 task_id, Name relschema,
 	task->ind_tbsps = ind_tbsps;
 	task->last_try = last_try;
 	task->skip_analyze = skip_analyze;
+	task->max_xlock_time = max_xlock_time;
 }
 
 #define	ACTIVE_WORKERS_RES_ATTRS	7

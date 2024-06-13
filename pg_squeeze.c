@@ -3193,6 +3193,10 @@ perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 								   cat_state, rel_dst, ident_key,
 								   ident_key_nentries, iistate,
 								   AccessExclusiveLock, NULL);
+
+		/* No time constraint, all changes must have been processed. */
+		Assert(((DecodingOutputState *)
+				ctx->output_writer_private)->nchanges == 0);
 	}
 
 	return success;
