@@ -341,13 +341,6 @@ exit_if_requested(void)
 {
 	bool	exit_requested;
 
-	/*
-	 * This function only terminates workers launched by the squeeze_table()
-	 * function. Those launched by the scheduler worker need SIGTERM.
-	 */
-	if (MyWorkerTask == NULL)
-		return;
-
 	SpinLockAcquire(&MyWorkerTask->mutex);
 	exit_requested = MyWorkerTask->exit_requested;
 	SpinLockRelease(&MyWorkerTask->mutex);

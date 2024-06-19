@@ -97,8 +97,6 @@ statapprox_heap(Relation rel, output_type *stat)
 					maxoff;
 		Size		freespace;
 
-		exit_if_requested();
-
 		/*
 		 * If the page has only visible tuples, then we can find out the free
 		 * space from the FSM and move on.
