@@ -168,7 +168,7 @@ static void worker_sigterm(SIGNAL_ARGS);
 static void scheduler_worker_loop(void);
 static void cleanup_workers_and_tasks(bool interrupt);
 static void wait_for_worker_shutdown(SqueezeWorker *worker);
-static void process_task(int task_id);
+static void process_task(int task_idx);
 static void create_replication_slots(int nslots, MemoryContext mcxt);
 static void drop_replication_slots(void);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
@@ -687,7 +687,7 @@ start_worker_internal(bool scheduler, int task_idx,
 	con.dbid = MyDatabaseId;
 	con.roleid = GetUserId();
 	con.scheduler = scheduler;
-	con.task_id = task_idx;
+	con.task_idx = task_idx;
 	squeeze_initialize_bgworker(&worker, NULL, &con, MyProcPid);
 
 	ereport(DEBUG1, (errmsg("registering pg_squeeze %s worker", kind)));
@@ -808,7 +808,7 @@ squeeze_worker_main(Datum main_arg)
 	int			i;
 	bool		found_scheduler;
 	int			nworkers;
-	int			task_id = -1;
+	int			task_idx = -1;
 
 	/* The worker should do its cleanup when exiting. */
 	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
@@ -840,7 +840,7 @@ squeeze_worker_main(Datum main_arg)
 		am_i_scheduler = con.scheduler;
 		BackgroundWorkerInitializeConnectionByOid(con.dbid, con.roleid, 0);
 
-		task_id = con.task_id;
+		task_idx = con.task_idx;
 	}
 
 	found_scheduler = false;
@@ -939,14 +939,14 @@ squeeze_worker_main(Datum main_arg)
 	if (am_i_scheduler)
 		scheduler_worker_loop();
 	else
-		process_task(task_id);
+		process_task(task_idx);
 
 done:
-	if (task_id >= 0)
+	if (task_idx >= 0)
 	{
 		/* Make sure that worker_shmem_shutdown() releases the task. */
-		Assert(task_id < NUM_WORKER_TASKS);
-		MyWorkerTask = &workerData->tasks[task_id];
+		Assert(task_idx < NUM_WORKER_TASKS);
+		MyWorkerTask = &workerData->tasks[task_idx];
 	}
 
 	proc_exit(0);
@@ -1070,7 +1070,7 @@ scheduler_worker_loop(void)
 		/* Initialize the task slots. */
 		for (i = 0; i < ntask; i++)
 		{
-			int		id, task_id;
+			int		idx, task_id;
 			WorkerTask	*task;
 			HeapTuple	tup;
 			Datum		datum;
@@ -1102,7 +1102,7 @@ scheduler_worker_loop(void)
 			Assert(!isnull);
 			relname = DatumGetName(datum);
 
-			task = get_unused_task(MyDatabaseId, relschema, relname, &id,
+			task = get_unused_task(MyDatabaseId, relschema, relname, &idx,
 								   &task_exists);
 			if (task == NULL)
 			{
@@ -1155,7 +1155,7 @@ scheduler_worker_loop(void)
 
 			/* The list must survive SPI_finish(). */
 			old_cxt = MemoryContextSwitchTo(sched_cxt);
-			task_idxs = lappend_int(task_idxs, id);
+			task_idxs = lappend_int(task_idxs, idx);
 			MemoryContextSwitchTo(old_cxt);
 		}
 
@@ -1343,7 +1343,7 @@ wait_for_worker_shutdown(SqueezeWorker *worker)
 }
 
 static void
-process_task(int task_id)
+process_task(int task_idx)
 {
 	MemoryContext task_cxt;
 	ErrorData  *edata;
@@ -1355,8 +1355,8 @@ process_task(int task_id)
 									 "pg_squeeze task context",
 									 ALLOCSET_DEFAULT_SIZES);
 
-	Assert(task_id < NUM_WORKER_TASKS);
-	MyWorkerTask = &workerData->tasks[task_id];
+	Assert(task_idx < NUM_WORKER_TASKS);
+	MyWorkerTask = &workerData->tasks[task_idx];
 
 	squeeze_max_xlock_time = MyWorkerTask->max_xlock_time;
 

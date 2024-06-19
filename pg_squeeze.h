@@ -259,7 +259,7 @@ typedef struct WorkerConInteractive
 	Oid			roleid;
 	bool		scheduler;
 
-	int			task_id;
+	int			task_idx;
 } WorkerConInteractive;
 
 /* Progress tracking. */
