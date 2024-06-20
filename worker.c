@@ -1106,6 +1106,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 
 			PopActiveSnapshot();
 			CommitTransactionCommand();
+			pgstat_report_stat(false);
 			return;
 		}
 
@@ -1195,6 +1196,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 			ereport(ERROR, (errmsg("SPI_finish failed")));
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+		pgstat_report_stat(false);
 	}
 
 	/* Now process the tasks. */
@@ -1511,8 +1513,8 @@ run_command(char *command, int rc)
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, command);
-
 	ret = SPI_execute(command, false, 0);
+	pgstat_report_activity(STATE_IDLE, NULL);
 	if (ret != rc)
 		elog(ERROR, "command failed: %s", command);
 
@@ -1528,9 +1530,7 @@ run_command(char *command, int rc)
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
-
 	pgstat_report_stat(false);
-	pgstat_report_activity(STATE_IDLE, NULL);
 
 	return ntup;
 }
