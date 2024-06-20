@@ -3628,7 +3628,7 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	FlushErrorState();
 
 	/*
-	 * Abort the transaction as we do not call PG_RETHROW() below in this
+	 * Abort the transaction as we do not call PG_RE_THROW() below in this
 	 * case.
 	 */
 	AbortOutOfAnyTransaction();
