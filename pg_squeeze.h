@@ -39,6 +39,13 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+/*
+ * No underscore, names starting with "pg_" are reserved. See
+ * pg_replication_origin_create().
+ */
+#define REPLORIGIN_NAME_PREFIX		"pgsqueeze_"
+#define REPLORIGIN_NAME_PATTERN		REPLORIGIN_NAME_PREFIX "%u_%u"
+
 extern int			squeeze_max_xlock_time;
 
 typedef enum

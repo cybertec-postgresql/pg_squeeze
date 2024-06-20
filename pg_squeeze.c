@@ -307,8 +307,6 @@ _PG_init(void)
 							NULL, NULL, NULL);
 }
 
-#define REPLORIGIN_NAME_PATTERN		"pg_squeeze_%u_%u"
-
 /*
  * The original implementation would certainly fail on PG 16 and higher, due
  * to the commit 240e0dbacd (in the master branch). It's not worth supporting

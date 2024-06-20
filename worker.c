@@ -106,6 +106,12 @@ typedef struct WorkerData
 	WorkerTask	tasks[NUM_WORKER_TASKS];
 
 	/*
+	 * Has cleanup after restart completed? The first worker launched after
+	 * server restart should set this flag.
+	 */
+	bool		cleanup_done;
+
+	/*
 	 * A lock to synchronize access to slots. Lock in exclusive mode to add /
 	 * remove workers, in shared mode to find information on them.
 	 *
@@ -146,7 +152,7 @@ static int	squeezeWorkerCount = 0;
 static ReplSlotStatus	*squeezeWorkerSlots = NULL;
 static int	squeezeWorkerSlotCount = 0;
 
-#define	REPL_SLOT_BASE_NAME	"pg_squeeze_slot_"
+#define	REPL_SLOT_PREFIX	"pg_squeeze_slot_"
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 static void interrupt_worker(WorkerTask *task);
@@ -171,6 +177,9 @@ static void wait_for_worker_shutdown(SqueezeWorker *worker);
 static void process_task(int task_idx);
 static void create_replication_slots(int nslots, MemoryContext mcxt);
 static void drop_replication_slots(void);
+static void cleanup_after_server_start(int task_idx);
+static void cleanup_repl_origins(void);
+static void cleanup_repl_slots(void);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void process_task_internal(MemoryContext task_cxt);
 
@@ -255,6 +264,7 @@ squeeze_worker_shmem_startup(void)
 		}
 
 		workerData->lock = &locks->lock;
+		workerData->cleanup_done = false;
 		workerData->nslots = max_squeeze_workers();
 
 		for (i = 0; i < workerData->nslots; i++)
@@ -312,6 +322,14 @@ worker_shmem_shutdown(int code, Datum arg)
 		 * to do the cleanup on its own.
 		 */
 		drop_replication_slots();
+
+	/*
+	 * Release LW locks acquired outside transaction.
+	 *
+	 * There's at least one such case: when the worker is looking for a slot
+	 * in the shared memory - see squeeze_worker_main().
+	 */
+	LWLockReleaseAll();
 }
 
 /*
@@ -857,6 +875,21 @@ squeeze_worker_main(Datum main_arg)
 	 */
 	Assert(MyWorkerSlot == NULL);
 	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+
+	/*
+	 * The first worker after restart is responsible for cleaning up
+	 * replication slots and/or origins that other workers could not remove
+	 * due to server crash. Do that while holding the exclusive lock, as
+	 * concurrency makes no sense here. That also ensures that the other
+	 * workers wait for the cleanup to finish instead of complaining about the
+	 * existing slots / origins.
+	 */
+	if (!am_i_scheduler && !workerData->cleanup_done)
+	{
+		cleanup_after_server_start(task_idx);
+		workerData->cleanup_done = true;
+	}
+
 	for (i = 0; i < workerData->nslots; i++)
 	{
 		WorkerSlot *slot = &workerData->slots[i];
@@ -1448,7 +1481,7 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		else
 			slot_nr = i;
 
-		snprintf(name, NAMEDATALEN, REPL_SLOT_BASE_NAME "%u_%u", MyDatabaseId,
+		snprintf(name, NAMEDATALEN, REPL_SLOT_PREFIX "%u_%u", MyDatabaseId,
 				 slot_nr);
 
 #if PG_VERSION_NUM >= 140000
@@ -1603,6 +1636,141 @@ drop_replication_slots(void)
 	 * called during exit.)
 	 */
 	squeezeWorkerSlots = NULL;
+}
+
+/*
+ * The first squeeze worker launched after server start calls this function to
+ * make sure that no replication slots / origins exist.
+ *
+ * task_idx is needed so that error message can be sent to the backend that
+ * launched the worker. ERROR is supposed to terminate the worker.
+ */
+static void
+cleanup_after_server_start(int task_idx)
+{
+	PG_TRY();
+	{
+		cleanup_repl_origins();
+		cleanup_repl_slots();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		Assert(task_idx >= 0);
+		MyWorkerTask = &workerData->tasks[task_idx];
+
+		/*
+		 * The worker should exit pretty soon, it's o.k. to use
+		 * TopMemoryContext (i.e. it causes no real memory leak).
+		 */
+		squeeze_handle_error_db(&edata, TopMemoryContext);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+}
+
+/*
+ * Sub-routine of cleanup_after_server_start().
+ */
+static void
+cleanup_repl_origins(void)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tuple;
+	char	*orig_name;
+	List		*origs = NIL;
+	ListCell	*lc;
+
+	StartTransactionCommand();
+
+	rel = table_open(ReplicationOriginRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_replication_origin	form;
+
+		form = (Form_pg_replication_origin) GETSTRUCT(tuple);
+		orig_name = text_to_cstring(&form->roname);
+		origs = lappend(origs, orig_name);
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	foreach(lc, origs)
+	{
+		orig_name = (char *) lfirst(lc);
+
+		/* Drop the origin iff it looks like one created by pg_squeeze. */
+		if (strncmp(orig_name, REPLORIGIN_NAME_PREFIX,
+					strlen(REPLORIGIN_NAME_PREFIX)) == 0)
+		{
+			ereport(DEBUG1,
+					(errmsg("cleaning up replication origin \"%s\"",
+							orig_name)));
+			/* nowait=true because no one should be using the origin. */
+			replorigin_drop_by_name(orig_name, false, true);
+		}
+	}
+	list_free(origs);
+
+	CommitTransactionCommand();
+}
+
+/*
+ * Sub-routine of cleanup_after_server_start().
+ */
+static void
+cleanup_repl_slots(void)
+{
+	int		slotno;
+	List	*slot_names = NIL;
+
+	ereport(ERROR, (errmsg("test")));
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (slotno = 0; slotno < max_replication_slots; slotno++)
+	{
+		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[slotno];
+		ReplicationSlot	slot_contents;
+		char	*name;
+
+		if (!slot->in_use)
+			continue;
+
+		SpinLockAcquire(&slot->mutex);
+		slot_contents = *slot;
+		SpinLockRelease(&slot->mutex);
+
+		name = NameStr(slot_contents.data.name);
+
+		if (strncmp(name, REPL_SLOT_PREFIX, strlen(REPL_SLOT_PREFIX)) == 0)
+			slot_names = lappend(slot_names, pstrdup(name));
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (list_length(slot_names) > 0)
+	{
+		ListCell	*lc;
+
+		/*
+		 * XXX Is transaction needed here? We do not access system catalogs
+		 * and LW locks are released by the worker on exit anyway.
+		 */
+		foreach(lc, slot_names)
+		{
+			char	*slot_name = (char *) lfirst(lc);
+
+			ereport(DEBUG1,
+					(errmsg("cleaning up replication slot \"%s\"",
+							slot_name)));
+			ReplicationSlotDrop(slot_name, true);
+		}
+
+		list_free_deep(slot_names);
+	}
 }
 
 /*
