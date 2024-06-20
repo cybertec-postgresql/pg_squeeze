@@ -3363,17 +3363,13 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	MemoryContextSwitchTo(old_context);
 
 	/*
-	 * Send the message to the server log, as well as to the process that
-	 * assigned the task.
+	 * Send the message to the process that assigned the task.
 	 */
-	EmitErrorReport();
 	strlcpy(MyWorkerTask->error_msg, (*edata_p)->message,
 			ERROR_MESSAGE_MAX_SIZE);
 
-	FlushErrorState();
-
 	/*
-	 * Abort the transaction as we do not call PG_RETHROW() below in this
+	 * Abort the transaction as we do not call PG_RE_THROW() below in this
 	 * case.
 	 */
 	if (IsTransactionState())
