@@ -301,9 +301,10 @@ typedef struct WorkerSlot
 	 * Use this when setting / clearing the fields above.
 	 *
 	 * Note that, when setting, workerData->lock in exclusive mode must be
-	 * held in addition. This is to ensure the maximum number of workers is
-	 * not exceeded when multiple workers search for a slot concurrently. On
-	 * the other hand, the spinlock is sufficient to clear the fields.
+	 * held in addition. This is to ensure the maximum number of workers per
+	 * database is not exceeded when multiple workers search for a slot
+	 * concurrently. On the other hand, the spinlock is sufficient to clear
+	 * the fields.
 	 *
 	 * Note that we use MemSet() to reset 'progress', which is hopefully
 	 * o.k. to do under spinlock. XXX Consider using atomics for the
@@ -353,27 +354,38 @@ typedef enum
 typedef struct WorkerTask
 {
 	/*
-	 * State from the perspective of the requesting backend or scheduler
-	 * worker.
+	 * State of the task.
+	 *
+	 * The "requester" (i.e. regular backend or squeeze scheduler) sets the
+	 * state to WTS_INIT, the scheduler worker then sets it to WTS_IN_PROGRESS
+	 * and eventually to WTS_UNUSED. However, in order to avoid leak, the
+	 * requester can set it to WTS_UNUSED too, if it's sure that the worker
+	 * failed to start.
 	 */
-	bool		in_use;
+	WorkerTaskState	worker_state;
+
 	/* See the comments of exit_if_requested(). */
 	bool	exit_requested;
-	/* Worker that performs the task sets this field. */
-	WorkerTaskState	worker_state;
 
 	/*
 	 * Use this when setting / clearing the fields above.
 	 *
-	 * Note that, when setting "in_use" to true or "worker_state" to WTS_INIT,
-	 * workerData->lock in exclusive mode must be held in addition. This is to
-	 * ensure that at most one task exists per table. On the other hand, the
-	 * spinlock is sufficient both to clear "in_use" and to adjust
-	 * "worker_state" to states other than INIT.
+	 * Note that, when setting "worker_state" to WTS_INIT, workerData->lock
+	 * must be held in exclusive mode in addition. This is because, when
+	 * "allocating" the task using this status, we need to check if no other
+	 * task exists for the same database and relation.
 	 */
 	slock_t		mutex;
 
-	/* Change of these requires workerData->lock in exclusive mode. */
+	/*
+	 * Details of the task.
+	 *
+	 * Only the requester should change these fields, after he has "allocated"
+	 * the task by setting the state to WTS_INIT. Therefore, no locking is
+	 * required, except for "dbid", "relschema" and "relname" - those require
+	 * workerData->lock in exclusive mode because they are used to check task
+	 * uniqueness (i.e. no more than one worker per table).
+	 */
 	Oid			dbid;
 	NameData	relschema;
 	NameData	relname;
