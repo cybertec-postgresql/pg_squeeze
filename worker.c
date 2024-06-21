@@ -1743,8 +1743,17 @@ cleanup_repl_origins(void)
 			ereport(DEBUG1,
 					(errmsg("cleaning up replication origin \"%s\"",
 							orig_name)));
+#if PG_VERSION_NUM >= 140000
 			/* nowait=true because no one should be using the origin. */
 			replorigin_drop_by_name(orig_name, false, true);
+#else
+			{
+				Oid		originid;
+
+				originid = replorigin_by_name(orig_name, false);
+				replorigin_drop(originid, true);
+			}
+#endif
 		}
 	}
 	list_free(origs);
