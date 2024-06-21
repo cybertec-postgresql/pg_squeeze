@@ -329,12 +329,14 @@ typedef struct ReplSlotStatus
 	/* A copy of the same field of ReplicationSlotPersistentData. */
 	XLogRecPtr	confirmed_flush;
 
-	/* Shared memory to pass the initial snapshot to the worker. */
+	/*
+	 * Shared memory to pass the initial snapshot to the worker. Only needed
+	 * by the scheduler.
+	 */
 	dsm_handle	snap_handle;
-	/* Only needed by the scheduler. */
 	dsm_segment	*snap_seg;
 
-	/* The snapshot in the backend private memory. */
+	/* The snapshot in the squeeze worker private memory. */
 	char	*snap_private;
 } ReplSlotStatus;
 
