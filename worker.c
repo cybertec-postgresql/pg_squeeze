@@ -160,7 +160,7 @@ static void initialize_task(WorkerTask *task);
 static void release_task(WorkerTask *task);
 static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
 
-static WorkerTask *get_unused_task(Oid dbid, Name relschema, Name relname,
+static WorkerTask *get_unused_task(Oid dbid, char *relschema, char *relname,
 								   int *task_idx, bool *duplicate);
 static void initialize_worker_task(WorkerTask *task, int task_id, Name indname,
 								   Name tbspname, ArrayType *ind_tbsps,
@@ -181,6 +181,7 @@ static void drop_replication_slots(void);
 static void cleanup_after_server_start(void);
 static void cleanup_repl_origins(void);
 static void cleanup_repl_slots(void);
+static void start_cleanup_worker(MemoryContext task_cxt);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void process_task_internal(MemoryContext task_cxt);
 
@@ -439,8 +440,8 @@ squeeze_table_new(PG_FUNCTION_ARGS)
 	}
 
 	/* Find free task structure. */
-	task = get_unused_task(MyDatabaseId, relschema, relname, &task_idx,
-						   &task_exists);
+	task = get_unused_task(MyDatabaseId, NameStr(*relschema),
+						   NameStr(*relname), &task_idx, &task_exists);
 	if (task == NULL)
 	{
 		if (task_exists)
@@ -519,19 +520,26 @@ squeeze_table_new(PG_FUNCTION_ARGS)
  *
  * The index in the task array is returned in *task_idx.
  *
- * The returned task ahs 'dbid', 'relschema' and 'relname' fields initialized.
+ * The returned task has 'dbid', 'relschema' and 'relname' fields initialized.
  *
  * If NULL is returned, *duplicate tells whether it's due to an existing task
  * for given relation.
+ *
+ * If 'dbid' is invalid, (i.e. caller is requesting a "cleanup only task"), do
+ * not check for duplicates.
  */
 static WorkerTask *
-get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
+get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 				bool *duplicate)
 {
 	int		i;
 	WorkerTask	*task;
 	WorkerTask	*result = NULL;
 	int			res_idx = -1;
+	bool		cleanup_only = !OidIsValid(dbid);
+
+	Assert(!cleanup_only && relschema && relname ||
+		   cleanup_only && relschema == NULL && relname == NULL);
 
 	*duplicate = false;
 
@@ -569,8 +577,15 @@ get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
 				/*
 				 * Consider tasks which might be in progress for possible
 				 * duplicates of the task we're going to submit.
+				 *
+				 * No need to check if the task should only do the initial
+				 * cleanup - this task is only created by the scheduler during
+				 * the startup. Even if a duplicate was created somehow, it
+				 * will make the worker exit too early to waste much CPU time
+				 * or to cause ERROR(s).
 				 */
-				needs_check = true;
+				if (!cleanup_only)
+					needs_check = true;
 			}
 			else if (result == NULL)
 			{
@@ -590,8 +605,8 @@ get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
 			 * never change it (even when exiting).
 			 */
 			if (task->dbid == dbid &&
-				strcmp(NameStr(task->relschema), NameStr(*relschema)) == 0 &&
-				strcmp(NameStr(task->relname), NameStr(*relname)) == 0)
+				strcmp(NameStr(task->relschema), relschema) == 0 &&
+				strcmp(NameStr(task->relname), relname) == 0)
 			{
 				result = NULL;
 				res_idx = -1;
@@ -604,7 +619,7 @@ get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
 		 * information because the worker only sets the status when exiting.
 		 * (This clean-up shouldn't be necessary because the caller will
 		 * initialize it when we return it next time, but it seems a good
-		 * practice.)
+		 * practice, e.g. for debugging.)
 		 */
 		if (worker_state == WTS_UNUSED && OidIsValid(task->dbid))
 		{
@@ -616,6 +631,14 @@ get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
 			 */
 			initialize_task(task);
 		}
+
+		/*
+		 * Exit early if there's no need to check for duplicates. (That might
+		 * also imply missed opportunities to reset tasks that became UNUSED
+		 * recently. We'll do that later when looking for regular tasks.)
+		 */
+		if (result && cleanup_only)
+			break;
 	}
 	if (result == NULL || *duplicate)
 		goto done;
@@ -633,8 +656,16 @@ get_unused_task(Oid dbid, Name relschema, Name relname, int *task_idx,
 	 * uniqueness of the task.
 	 */
 	result->dbid = dbid;
-	namestrcpy(&result->relschema, NameStr(*relschema));
-	namestrcpy(&result->relname, NameStr(*relname));
+	if (!cleanup_only)
+	{
+		namestrcpy(&result->relschema, relschema);
+		namestrcpy(&result->relname, relname);
+	}
+	else
+	{
+		NameStr(result->relschema)[0] = '\0';
+		NameStr(result->relname)[0] = '\0';
+	}
 done:
 	LWLockRelease(workerData->lock);
 	*task_idx = res_idx;
@@ -920,6 +951,14 @@ squeeze_worker_main(Datum main_arg)
 	{
 		cleanup_after_server_start();
 		workerData->cleanup_done = true;
+
+		/* Are we assigned a "cleanup-only" task? */
+		if (!OidIsValid(MyWorkerTask->dbid))
+		{
+			LWLockRelease(workerData->lock);
+			ereport(DEBUG1, (errmsg("cleanup-only task completed")));
+			goto done;
+		}
 	}
 
 	for (i = 0; i < workerData->nslots; i++)
@@ -1038,12 +1077,27 @@ scheduler_worker_loop(void)
 	long		delay = 0L;
 	int		i;
 	MemoryContext	sched_cxt, old_cxt;
-	List	*task_idxs = NIL;
+	bool	cleanup_done;
 
 	/* Context for allocations which cannot be freed too early. */
 	sched_cxt = AllocSetContextCreate(TopMemoryContext,
 									  "pg_squeeze scheduler context",
 									  ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * This lock does not eliminate all the possible race conditions: e.g. if
+	 * multiple schedulers (one per database) are launched at the same time,
+	 * multiple clean-up workers can be launched. Nevertheless, it makes sense
+	 * as the worker also uses this lock to examine and set the field.
+	 */
+	LWLockAcquire(workerData->lock, LW_EXCLUSIVE);
+	cleanup_done = workerData->cleanup_done;
+	LWLockRelease(workerData->lock);
+
+	/* Do we need to do cleanup first? */
+	if (!cleanup_done)
+		start_cleanup_worker(sched_cxt);
+
 	while (!got_sigterm)
 	{
 		StringInfoData	query;
@@ -1053,6 +1107,7 @@ scheduler_worker_loop(void)
 		TupleTableSlot *slot;
 		ListCell	*lc;
 		int		nslots;
+		List	*task_idxs = NIL;
 
 		/*
 		 * Make sure all the workers we launched in the previous loop and
@@ -1161,8 +1216,8 @@ scheduler_worker_loop(void)
 			Assert(!isnull);
 			relname = DatumGetName(datum);
 
-			task = get_unused_task(MyDatabaseId, relschema, relname, &idx,
-								   &task_exists);
+			task = get_unused_task(MyDatabaseId, NameStr(*relschema),
+								   NameStr(*relname), &idx, &task_exists);
 			if (task == NULL)
 			{
 				if (task_exists)
@@ -1315,9 +1370,7 @@ scheduler_worker_loop(void)
 
 				}
 
-
 				CommitTransactionCommand();
-
 				i++;
 			}
 		}
@@ -1357,7 +1410,7 @@ cleanup_workers_and_tasks(bool interrupt)
 	{
 		worker = &squeezeWorkers[i];
 
-		/* Not even started or already stopped? */
+		/* Not even start or already stopped? */
 		if (worker->handle == NULL)
 			continue;
 
@@ -1804,6 +1857,78 @@ cleanup_repl_slots(void)
 
 		list_free_deep(slot_names);
 	}
+}
+
+static void
+start_cleanup_worker(MemoryContext task_cxt)
+{
+	WorkerTask	*task;
+	bool	task_exists;
+	int		task_idx;
+	NameData	dummy_name;
+	SqueezeWorker	*worker;
+	MemoryContext	old_cxt;
+	bool	registered;
+
+	/*
+	 * Create a worker to perform the initial cleanup.
+	 *
+	 * We must be sure that the cleanup has finished before we start to create
+	 * replication slots for other workers, otherwise the "cleanup worker"
+	 * could drop them too.
+	 */
+	squeezeWorkerCount = 1;
+	squeezeWorkers = (SqueezeWorker *) MemoryContextAllocZero(task_cxt,
+															  squeezeWorkerCount *
+															  sizeof(SqueezeWorker));
+	task = get_unused_task(InvalidOid, NULL, NULL, &task_idx, &task_exists);
+	Assert(!task_exists);
+	if (task == NULL)
+		/*
+		 * This is unlikely to happen, but possible if too many "standalone"
+		 * workers have been started after our check of the 'cleanup_done'
+		 * flag.
+		 */
+		ereport(ERROR,
+				(errmsg("the task queue is currently full")));
+
+	/*
+	 * No specific information needed here. Setting dummy values explicitly
+	 * seem a good practice though.
+	 */
+	NameStr(dummy_name)[0] = '\0';
+	initialize_worker_task(task, -1, &dummy_name, &dummy_name, NULL,
+						   false, false, 0);
+
+	worker = squeezeWorkers;
+	StartTransactionCommand();
+	/*
+	 * The handle (and possibly other allocations) must survive the current
+	 * transaction.
+	 */
+	old_cxt = MemoryContextSwitchTo(task_cxt);
+	registered = start_worker_internal(false, task_idx, &worker->handle);
+	MemoryContextSwitchTo(old_cxt);
+	if (!registered)
+	{
+		/*
+		 * The worker could not even get registered, so it won't set its
+		 * status to WTS_UNUSED. Make sure the task does not leak.
+		 */
+		release_task(worker->task);
+
+		ereport(ERROR,
+				(errmsg("squeeze worker could not start")),
+				(errhint("consider increasing \"max_worker_processes\" or decreasing \"squeeze.workers_per_database\"")));
+
+	}
+	CommitTransactionCommand();
+
+	/* Wait until the cleanup is done. */
+	cleanup_workers_and_tasks(false);
+
+	if (!workerData->cleanup_done)
+		ereport(ERROR, (errmsg("failed to perform the initial cleanup")));
 }
 
 /*
