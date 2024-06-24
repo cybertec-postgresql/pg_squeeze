@@ -156,7 +156,7 @@ static int	squeezeWorkerSlotCount = 0;
 #define	REPL_PLUGIN_NAME	"pg_squeeze"
 
 static void interrupt_worker(WorkerTask *task);
-static void initialize_task(WorkerTask *task);
+static void clear_task(WorkerTask *task);
 static void release_task(WorkerTask *task);
 static void squeeze_handle_error_app(ErrorData *edata, WorkerTask *task);
 
@@ -257,7 +257,7 @@ squeeze_worker_shmem_startup(void)
 			task = &workerData->tasks[i];
 			SpinLockInit(&task->mutex);
 
-			initialize_task(task);
+			clear_task(task);
 		}
 
 		workerData->lock = &locks->lock;
@@ -629,7 +629,7 @@ get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 			 * drop_replication_slots(). (The "standalone" worker should not
 			 * have set it.)
 			 */
-			initialize_task(task);
+			clear_task(task);
 		}
 
 		/*
@@ -2260,7 +2260,7 @@ interrupt_worker(WorkerTask *task)
 }
 
 static void
-initialize_task(WorkerTask *task)
+clear_task(WorkerTask *task)
 {
 	task->worker_state = WTS_UNUSED;
 	task->exit_requested = false;
