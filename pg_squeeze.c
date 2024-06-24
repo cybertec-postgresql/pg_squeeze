@@ -971,6 +971,15 @@ setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 	ReplicationSlotAcquire(NameStr(repl_slot->name), true);
 
 	/*
+	 * This should not really happen, but if it did, the initial load could
+	 * miss some data.
+	 */
+	if (!TransactionIdIsValid(MyReplicationSlot->effective_xmin))
+		ereport(ERROR,
+				(errmsg("replication slot \"%s\" has invalid effective_xmin",
+						NameStr(repl_slot->name))));
+
+	/*
 	 * It's pretty unlikely for some client to have consumed data changes
 	 * (accidentally?)  before this worker could acquire the slot, but it's
 	 * easy enough to check.

@@ -1598,13 +1598,6 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		 */
 		Assert(!ctx->fast_forward);
 
-		SpinLockAcquire(&slot->mutex);
-		Assert(TransactionIdIsValid(slot->effective_xmin) &&
-			   !TransactionIdIsValid(slot->data.xmin));
-		/* Prevent ReplicationSlotRelease() from clearing effective_xmin. */
-		slot->data.xmin = slot->effective_xmin;
-		SpinLockRelease(&slot->mutex);
-
 		/*
 		 * Bring the snapshot builder into the SNAPBUILD_CONSISTENT state so
 		 * that the worker can get its snapshot and start decoding
@@ -1654,6 +1647,14 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		 * Done for now, the worker will have to setup the context on its own.
 		 */
 		FreeDecodingContext(ctx);
+
+		/* Prevent ReplicationSlotRelease() from clearing effective_xmin. */
+		SpinLockAcquire(&slot->mutex);
+		Assert(TransactionIdIsValid(slot->effective_xmin) &&
+			   !TransactionIdIsValid(slot->data.xmin));
+		slot->data.xmin = slot->effective_xmin;
+		SpinLockRelease(&slot->mutex);
+
 		ReplicationSlotRelease();
 	}
 
