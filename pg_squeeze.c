@@ -15,6 +15,7 @@
 #include "access/multixact.h"
 #include "access/sysattr.h"
 #if PG_VERSION_NUM >= 130000
+#include "access/toast_internals.h"
 #include "access/xlogutils.h"
 #endif
 #if PG_VERSION_NUM >= 150000
@@ -136,7 +137,9 @@ static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
+#if PG_VERSION_NUM < 130000
 static Oid	get_toast_index(Oid toastrelid);
+#endif
 
 /*
  * The maximum time to hold AccessExclusiveLock during the final
@@ -3059,6 +3062,7 @@ swap_relation_files(Oid r1, Oid r2)
 		relform2->reltablespace = swaptemp;
 
 		Assert(relform1->relpersistence == relform2->relpersistence);
+		Assert(relform1->relam == relform2->relam);
 
 		swaptemp = relform1->reltoastrelid;
 		relform1->reltoastrelid = relform2->reltoastrelid;
@@ -3207,23 +3211,19 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 
 	/*
 	 * Added underscore should be enough to keep names unique (at least within
-	 * the pg_toast tablespace). This assumption makes name retrieval
+	 * the pg_toast namespace). This assumption makes name retrieval
 	 * unnecessary.
 	 */
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_", relid1);
 	RenameRelationInternal(toastrelid2, name, true, false);
 
-	/*
-	 * XXX While toast_open_indexes (PG core) can retrieve multiple indexes,
-	 * get_toast_index() expects exactly one. If this restriction should be
-	 * released someday, either generate the underscore-terminated names as
-	 * above or copy names of the indexes of toastrel1 (the number of indexes
-	 * should be identical). Order should never be important, as toastrel2
-	 * will eventually be dropped.
-	 */
-	toastidxid = get_toast_index(toastrelid2);
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
-
+#if PG_VERSION_NUM < 130000
+	toastidxid = get_toast_index(toastrelid2);
+#else
+	/* NoLock as RenameRelationInternal() did not release its lock. */
+	toastidxid = toast_get_valid_index(toastrelid2, NoLock);
+#endif
 	/*
 	 * Pass is_index=false so that even the index is locked in
 	 * AccessExclusiveLock mode. ShareUpdateExclusiveLock mode (allowing
@@ -3238,12 +3238,18 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	/* Now set the desired names on the TOAST stuff of relid1. */
 	snprintf(name, NAMEDATALEN, "pg_toast_%u", relid1);
 	RenameRelationInternal(toastrelid1, name, true, false);
+	/* NoLock as RenameRelationInternal() did not release its lock. */
+#if PG_VERSION_NUM < 130000
 	toastidxid = get_toast_index(toastrelid1);
+#else
+	toastidxid = toast_get_valid_index(toastrelid1, NoLock);
+#endif
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index", relid1);
 	RenameRelationInternal(toastidxid, name, true, false);
 	CommandCounterIncrement();
 }
 
+#if PG_VERSION_NUM < 130000
 /*
  * The function is called after RenameRelationInternal() which does not
  * release the lock it acquired.
@@ -3266,6 +3272,7 @@ get_toast_index(Oid toastrelid)
 
 	return result;
 }
+#endif
 
 /*
  * Retrieve the "fillfactor" storage option in a convenient way, so we don't
