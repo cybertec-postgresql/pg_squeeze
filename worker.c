@@ -538,8 +538,8 @@ get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 	int			res_idx = -1;
 	bool		cleanup_only = !OidIsValid(dbid);
 
-	Assert(!cleanup_only && relschema && relname ||
-		   cleanup_only && relschema == NULL && relname == NULL);
+	Assert((!cleanup_only && relschema && relname) ||
+		   (cleanup_only && relschema == NULL && relname == NULL));
 
 	*duplicate = false;
 
