@@ -3197,49 +3197,44 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	Oid			toastidxid;
 
 	/*
-	 * As we haven't changed tuple descriptor, both relation do or both do not
-	 * have TOAST - see toasting.c:needs_toast_table().
+	 * If relid1 no longer needs TOAST, we don't even rename that of relid2.
 	 */
 	if (!OidIsValid(toastrelid1))
-	{
-		if (OidIsValid(toastrelid2))
-			elog(ERROR, "Unexpected TOAST relation exists");
 		return;
-	}
-	if (!OidIsValid(toastrelid2))
-		elog(ERROR, "Missing TOAST relation");
 
-	/*
-	 * Added underscore should be enough to keep names unique (at least within
-	 * the pg_toast namespace). This assumption makes name retrieval
-	 * unnecessary.
-	 */
-	snprintf(name, NAMEDATALEN, "pg_toast_%u_", relid1);
-	RenameRelationInternal(toastrelid2, name, true, false);
+	if (OidIsValid(toastrelid2))
+	{
+		/*
+		 * Added underscore should be enough to keep names unique (at least
+		 * within the pg_toast namespace). This assumption makes name
+		 * retrieval unnecessary.
+		 */
+		snprintf(name, NAMEDATALEN, "pg_toast_%u_", relid1);
+		RenameRelationInternal(toastrelid2, name, true, false);
 
-	snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
+		snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
 #if PG_VERSION_NUM < 130000
-	/* NoLock as RenameRelationInternal() did not release its lock. */
-	toastidxid = get_toast_index(toastrelid2);
+		/* NoLock as RenameRelationInternal() did not release its lock. */
+		toastidxid = get_toast_index(toastrelid2);
 #else
-	/* TOAST relation is locked, but not its indexes. */
-	toastidxid = toast_get_valid_index(toastrelid2, AccessExclusiveLock);
+		/* TOAST relation is locked, but not its indexes. */
+		toastidxid = toast_get_valid_index(toastrelid2, AccessExclusiveLock);
 #endif
-	/*
-	 * Pass is_index=false so that even the index is locked in
-	 * AccessExclusiveLock mode. ShareUpdateExclusiveLock mode (allowing
-	 * concurrent read / write access to the index or even its renaming)
-	 * should not be a problem at this stage of table squeezing, but it'd also
-	 * bring little benefit (the table is locked exclusively, so no one should
-	 * need read / write access to the TOAST indexes).
-	 */
-	RenameRelationInternal(toastidxid, name, true, false);
-	CommandCounterIncrement();
+		/*
+		 * Pass is_index=false so that even the index is locked in
+		 * AccessExclusiveLock mode. ShareUpdateExclusiveLock mode (allowing
+		 * concurrent read / write access to the index or even its renaming)
+		 * should not be a problem at this stage of table squeezing, but it'd
+		 * also bring little benefit (the table is locked exclusively, so no
+		 * one should need read / write access to the TOAST indexes).
+		 */
+		RenameRelationInternal(toastidxid, name, true, false);
+		CommandCounterIncrement();
+	}
 
 	/* Now set the desired names on the TOAST stuff of relid1. */
 	snprintf(name, NAMEDATALEN, "pg_toast_%u", relid1);
 	RenameRelationInternal(toastrelid1, name, true, false);
-	/* NoLock as RenameRelationInternal() did not release its lock. */
 #if PG_VERSION_NUM < 130000
 	/* NoLock as RenameRelationInternal() did not release its lock. */
 	toastidxid = get_toast_index(toastrelid1);
