@@ -3219,10 +3219,11 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
 #if PG_VERSION_NUM < 130000
+	/* NoLock as RenameRelationInternal() did not release its lock. */
 	toastidxid = get_toast_index(toastrelid2);
 #else
-	/* NoLock as RenameRelationInternal() did not release its lock. */
-	toastidxid = toast_get_valid_index(toastrelid2, NoLock);
+	/* TOAST relation is locked, but not its indexes. */
+	toastidxid = toast_get_valid_index(toastrelid2, AccessExclusiveLock);
 #endif
 	/*
 	 * Pass is_index=false so that even the index is locked in
@@ -3240,9 +3241,11 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	RenameRelationInternal(toastrelid1, name, true, false);
 	/* NoLock as RenameRelationInternal() did not release its lock. */
 #if PG_VERSION_NUM < 130000
+	/* NoLock as RenameRelationInternal() did not release its lock. */
 	toastidxid = get_toast_index(toastrelid1);
 #else
-	toastidxid = toast_get_valid_index(toastrelid1, NoLock);
+	/* TOAST relation is locked, but not its indexes. */
+	toastidxid = toast_get_valid_index(toastrelid1, AccessExclusiveLock);
 #endif
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index", relid1);
 	RenameRelationInternal(toastidxid, name, true, false);
