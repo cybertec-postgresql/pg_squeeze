@@ -1547,7 +1547,11 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 			 * name.
 			 */
 			Assert(nslots == 1);
-			slot_nr = MyProcPid;
+			/*
+			 * Try to minimize the probability of collision with a
+			 * "non-standalone" worker.
+			 */
+			slot_nr = Min(MyProcPid, MyProcPid + 1024);
 		}
 		else
 			slot_nr = i;
