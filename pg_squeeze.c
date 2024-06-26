@@ -2191,14 +2191,13 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			{
 				HeapTuple	tup_orig = tup_in;
 				TupleDesc	tup_desc = RelationGetDescr(rel_src);
-				int			i;
 
 				heap_deform_tuple(tup_in, tup_desc, values, isnull);
 
-				for (i = 0; i < tup_desc->natts; i++)
+				for (int j = 0; j < tup_desc->natts; j++)
 				{
-					if (TupleDescAttr(tup_desc, i)->attisdropped)
-						isnull[i] = true;
+					if (TupleDescAttr(tup_desc, j)->attisdropped)
+						isnull[j] = true;
 				}
 
 				tup_in = heap_form_tuple(tup_desc, values, isnull);
