@@ -2237,10 +2237,13 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 					/*
 					 * Besides being of valid size, the new array should allow
 					 * for storing some data w/o exceeding
-					 * maintenance_work_mem. XXX Consider tuning the portion
-					 * of maintenance_work_mem that the array can use.
+					 * maintenance_work_mem. Check also batch_max_size_new for
+					 * overflow although AllocSizeIsValid() probably should
+					 * detect a problem much earlier. XXX Consider tuning the
+					 * portion of maintenance_work_mem that the array can use.
 					 */
 					if (!AllocSizeIsValid(tuple_array_size_new) ||
+						batch_max_size_new < 0 ||
 						tuple_array_size_new / 1024 >=
 						maintenance_work_mem / 16)
 						tuple_array_can_expand = false;
