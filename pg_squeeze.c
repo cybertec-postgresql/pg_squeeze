@@ -928,6 +928,18 @@ check_prerequisites(Relation rel)
 				 errmsg("\"%s\" is shared relation",
 						RelationGetRelationName(rel))));
 
+	if (IsCatalogRelation(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is a catalog relation",
+						RelationGetRelationName(rel))));
+
+	/*
+	 * We cannot simply replace the storage of a mapped relation.
+	 *
+	 * The previous check should have caught them, but let's try hard to be
+	 * safe.
+	 */
 	if (RelationIsMapped(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
