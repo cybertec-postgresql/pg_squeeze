@@ -197,6 +197,11 @@ Sample execution:
 SELECT squeeze.squeeze_table('public', 'pgbench_accounts');
 ```
 
+Note that the function is not transactional: it only starts a background
+worker, tells it which table it should process and exits. Rollback of the
+transaction the function was called in does not revert the changes done by the
+worker.
+
 # Enable / disable table processing
 
 To enable processing of bloated tables, run this statement as superuser:
