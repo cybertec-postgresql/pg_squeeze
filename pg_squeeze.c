@@ -119,6 +119,7 @@ static void resolve_index_tablepaces(TablespaceInfo *tbsp_info,
 static void perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 								 Snapshot snap_hist, Relation rel_dst,
 								 LogicalDecodingContext *ctx);
+static bool has_dropped_attribute(Relation rel);
 static Oid	create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 								   Oid tablespace, Oid relowner);
 static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
@@ -895,6 +896,13 @@ static void
 check_prerequisites(Relation rel)
 {
 	Form_pg_class form = RelationGetForm(rel);
+
+	/*
+	 * The extension is not generic enough to handle AMs other than "heap".
+	 */
+	if (form->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errmsg("pg_squeeze only supports the \"heap\" access method")));
 
 	/* Check the relation first. */
 	if (form->relkind == RELKIND_PARTITIONED_TABLE)
@@ -1970,6 +1978,10 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 				old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
 	DecodingOutputState *dstate;
+	bool	has_dropped_attr;
+	Datum		values[MaxTupleAttributeNumber];
+	bool		isnull[MaxTupleAttributeNumber];
+
 
 	/*
 	 * Also remember that the WAL records created during the load should not
@@ -2058,6 +2070,9 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	/* Expect many insertions. */
 	bistate = GetBulkInsertState();
 
+	/* Has the relation at least one dropped attribute? */
+	has_dropped_attr = has_dropped_attribute(rel_src);
+
 	/*
 	 * The processing can take many iterations. In case any data manipulation
 	 * below leaked, try to defend against out-of-memory conditions by using a
@@ -2078,7 +2093,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		/* Sorting cannot be split into batches. */
 		for (i = 0;; i++)
 		{
-			bool		flattened = false;
+			bool		have_tup_copy = false;
 
 			/*
 			 * While tuplesort is responsible for not exceeding
@@ -2150,15 +2165,43 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 			{
 				tup_in = toast_flatten_tuple(tup_in,
 											 RelationGetDescr(rel_src));
-				flattened = true;
+				have_tup_copy = true;
+			}
+
+			/*
+			 * If at least one attribute has been dropped, we need to deform /
+			 * form the tuple to make sure that set the values of the dropped
+			 * attribute(s) are NULL. (Unfortunately we don't know if the
+			 * table was already squeezed since the last ALTER TABLE ... DROP
+			 * COLUMN ... command.)
+			 */
+			if (has_dropped_attr)
+			{
+				HeapTuple	tup_orig = tup_in;
+				TupleDesc	tup_desc = RelationGetDescr(rel_src);
+				int			i;
+
+				heap_deform_tuple(tup_in, tup_desc, values, isnull);
+
+				for (i = 0; i < tup_desc->natts; i++)
+				{
+					if (TupleDescAttr(tup_desc, i)->attisdropped)
+						isnull[i] = true;
+				}
+
+				tup_in = heap_form_tuple(tup_desc, values, isnull);
+				if (have_tup_copy)
+					/* tup_in is a flat copy. We do not want two copies. */
+					heap_freetuple(tup_orig);
+				have_tup_copy = true;
 			}
 
 			if (use_sort)
 			{
 				tuplesort_putheaptuple(tuplesort, tup_in);
 				/* tuplesort should have copied the tuple. */
-				if (flattened)
-					pfree(tup_in);
+				if (have_tup_copy)
+					heap_freetuple(tup_in);
 			}
 			else
 			{
@@ -2204,7 +2247,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 					}
 				}
 
-				if (!flattened)
+				if (!have_tup_copy)
 					tup_in = heap_copytuple(tup_in);
 
 				/*
@@ -2366,6 +2409,24 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	elog(DEBUG1, "pg_squeeze: the initial load completed");
 }
 
+/*
+ * Check if relation has at least one dropped attribute.
+ */
+static bool
+has_dropped_attribute(Relation rel)
+{
+	TupleDesc	tup_desc = RelationGetDescr(rel);
+
+	for (int i = 0; i < tup_desc->natts; i++)
+	{
+		Form_pg_attribute attr = &tup_desc->attrs[i];
+
+		if (attr->attisdropped)
+			return true;
+	}
+
+	return false;
+}
 
 /*
  * Create a table into which we'll copy the contents of the source table, as
