@@ -1,3 +1,58 @@
+Release 1.7.0
+=============
+
+New features
+------------
+
+1. Make the code compatible with PostgreSQL server version 17.
+
+2. Do not copy the values of dropped columns into the new table storage
+   (file).
+
+   So far, only the whole rows (the deleted ones) were considered to
+   contribute to the table bloat. Now we also reclaim the space occupied by
+   dropped columns.
+
+3. Let the squeeze.squeeze_table function raise ERROR.
+
+   So far, the function only inserted record into the squeeze.log table if the
+   processing was successful, and into squeeze.errors if it failed. Now, in
+   the case of failure, the function also prints out the error message into
+   the console.
+
+4. Do not let the squeeze workers run if there is currently no work for them.
+
+   For automatic processing, one scheduler worker per database needs to run,
+   but the actual squeeze worker is only started if particular table appears
+   to be bloated. Once done with the processing, the squeeze worker exits
+   instead of waiting for another task.
+
+5. Improved parallelism of the squeeze workers.
+
+   Multiple worker processes (one per table) can be used since the release
+   1.6, but so far it was still possible that the work gets serialized due to
+   the logical decoding setup. Those limitations have been relaxed in 1.7.
+
+Bug fixes
+---------
+
+1. Fixed broken setup of "shared memory hooks".
+
+   This could cause server crash if other extensions installed their hooks as
+   well. (https://github.com/cybertec-postgresql/pg_squeeze/issues/68)
+
+2. Fixed evaluation of the squeeze.max_xlock_time configuration variable.
+
+   Due to this bug, pg_squeeze behaved as if the timeout was set to much lower
+   value. (The bug had no effect if the variable was set to 0, which is the
+   default.)
+
+3. Fixed permissions checks for the squeeze.pgstattuple_approx() function.q
+
+   Like with other functions of this extension, the SUPERUSER role attribute
+   is not needed for execution. The REPLICATION attribute is sufficient.
+
+
 Release 1.6.1
 =============
 
