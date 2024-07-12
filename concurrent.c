@@ -416,7 +416,21 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 								   &update_indexes
 #endif
 					);
+				/*
+				 * In PG < 16, change of any indexed attribute makes HOT
+				 * impossible, Therefore HOT update implies that no index
+				 * needs to be updated.
+				 *
+				 * In PG >= 16, if only attributes of "summarizing indexes"
+				 * change, HOT update is still possible. Therefore HOT update
+				 * might still require some indexes (in particular, the
+				 * summarizing ones) to be updated.
+				 */
+#if PG_VERSION_NUM >= 160000
+				if (update_indexes != TU_None)
+#else
 				if (!HeapTupleIsHeapOnly(tup))
+#endif
 				{
 					List	   *recheck;
 

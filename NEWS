@@ -52,6 +52,14 @@ Bug fixes
    Like with other functions of this extension, the SUPERUSER role attribute
    is not needed for execution. The REPLICATION attribute is sufficient.
 
+4. Update BRIN indexes when appropriate.
+
+   If a row was updated during the table processing and only the attributes of
+   "summarizing" (BRIN) indexes changed, pg_squeeze might fail to update those
+   indexes.
+
+   This bug only affects pg_squeeze on PostgreSQL 16.
+
 
 Release 1.6.1
 =============
