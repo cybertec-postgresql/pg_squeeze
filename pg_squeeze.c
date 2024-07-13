@@ -2820,6 +2820,14 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 								   opclassOptions,
 #endif
 								   indoptions,
+#if PG_VERSION_NUM >= 170000
+								   /*
+									* stattargets not needed for the transient
+									* index, the value of the source index
+									* will remain (we only swap the storage).
+									*/
+								   NULL,
+#endif
 								   PointerGetDatum(reloptions),
 								   flags,	/* flags */
 								   0,	/* constr_flags */
@@ -3251,8 +3259,10 @@ swap_relation_files(Oid r1, Oid r2)
 
 	table_close(relRelation, RowExclusiveLock);
 
+#if PG_VERSION_NUM < 170000
 	RelationCloseSmgrByOid(r1);
 	RelationCloseSmgrByOid(r2);
+#endif
 }
 
 /*

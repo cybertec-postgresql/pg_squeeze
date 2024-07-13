@@ -674,7 +674,11 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				HeapTuple	newtuple;
 
 				newtuple = change->data.tp.newtuple != NULL ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.newtuple : NULL;
+#else
 					&change->data.tp.newtuple->tuple : NULL;
+#endif
 
 				/*
 				 * Identity checks in the main function should have made this
@@ -692,9 +696,17 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 							newtuple;
 
 				oldtuple = change->data.tp.oldtuple != NULL ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.oldtuple : NULL;
+#else
 					&change->data.tp.oldtuple->tuple : NULL;
+#endif
 				newtuple = change->data.tp.newtuple != NULL ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.newtuple : NULL;
+#else
 					&change->data.tp.newtuple->tuple : NULL;
+#endif
 
 				if (newtuple == NULL)
 					elog(ERROR, "Incomplete update info.");
@@ -710,7 +722,11 @@ plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				HeapTuple	oldtuple;
 
 				oldtuple = change->data.tp.oldtuple ?
+#if PG_VERSION_NUM >= 170000
+					change->data.tp.oldtuple : NULL;
+#else
 					&change->data.tp.oldtuple->tuple : NULL;
+#endif
 
 				if (oldtuple == NULL)
 					elog(ERROR, "Incomplete delete info.");

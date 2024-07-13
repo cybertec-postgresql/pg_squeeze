@@ -1559,7 +1559,9 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		snprintf(name, NAMEDATALEN, REPL_SLOT_PREFIX "%u_%u", MyDatabaseId,
 				 slot_nr);
 
-#if PG_VERSION_NUM >= 140000
+#if PG_VERSION_NUM >= 170000
+		ReplicationSlotCreate(name, true, RS_PERSISTENT, false, false, false);
+#elif PG_VERSION_NUM >= 140000
 		ReplicationSlotCreate(name, true, RS_PERSISTENT, false);
 #else
 		ReplicationSlotCreate(name, true, RS_PERSISTENT);
