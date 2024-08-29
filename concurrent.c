@@ -4,7 +4,7 @@
  *	  Module to handle changes that took place while new table was being
  *	  created
  *
- * Copyright (c) 2016-2023, CYBERTEC PostgreSQL International GmbH
+ * Copyright (c) 2016-2024, CYBERTEC PostgreSQL International GmbH
  *
  *-----------------------------------------------------------------------------------
  */
