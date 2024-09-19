@@ -37,23 +37,12 @@
 
 /*
  * There are 2 kinds of worker: 1) scheduler, which creates new tasks, 2) the
- * actual "squeeze worker" which calls the squeeze_table() function. With
- * scheduling independent from the actual table processing we check the table
- * status exactly (with the granularity of one minute) at the scheduled
- * time. This way we avoid the tricky question how long should particular
- * schedule stay valid and thus we can use equality operator to check if the
- * scheduled time is there.
- *
- * There are 2 alternatives to the equality test: 1) schedule is valid for
- * some time interval which is hard to define, 2) the schedule is valid
- * forever - this is bad because it allows table processing even hours after
- * the schedule if the table happens to get bloated some time after the
- * schedule.
- *
- * If the squeeze_table() function makes the following tasks delayed, it's
- * another problem that we can address by increasing the number of "squeeze
- * workers". (In that case we'd have to adjust the replication slot naming
- * scheme so that there are no conflicts.)
+ * actual "squeeze worker" which calls the squeeze_table() function.  It's
+ * simpler to have a separate worker that checks the schedules every
+ * minute. If there was a single worker that checks the schedules among the
+ * calls of squeeze_table(), it'd be harder to handle the cases where the call
+ * of squeeze_table() took too much time to complete (i.e. the worker could
+ * miss some schedule(s)).
  */
 static bool am_i_scheduler = false;
 
@@ -64,14 +53,17 @@ static bool am_i_scheduler = false;
 static bool	am_i_standalone = false;
 
 /*
- * The shmem_request_hook_type hook was introduced in PG 15. Since the number
- * of slots depends on the max_worker_processes GUC, the maximum number of
- * squeeze workers must be a compile time constant for PG < 15.
+ * As long as the number of slots depends on the max_worker_processes GUC (it
+ * just makes sense not to allocate more slots for our workers than this
+ * value), we should not use this GUC before the other libraries have been
+ * loaded: those libraries might, at least in theory, adjust
+ * max_worker_processes.
  *
- * XXX Regarding PG < 15: maybe we don't need to worry about dependency on an
- * in-core GUC - the value should be known at load time and no other loadable
- * module should be able to change it before we start the shared memory
- * allocation.
+ * In PG >= 15, this function is called from squeeze_worker_shmem_request(),
+ * after all the related GUCs have been set. In earlier versions (which do not
+ * have the hook), the function is called while our library is being loaded,
+ * and some other libraries might follow. Therefore we prefer a compile time
+ * constant to a (possibly) not-yet-finalized GUC.
  */
 static int
 max_squeeze_workers(void)
@@ -209,6 +201,10 @@ squeeze_save_prev_shmem_request_hook(void)
 }
 #endif
 
+/*
+ * The shmem_request_hook hook was introduced in PG 15. In earlier versions we
+ * call it directly from _PG_init().
+ */
 void
 squeeze_worker_shmem_request(void)
 {
@@ -914,7 +910,8 @@ squeeze_worker_main(Datum main_arg)
 
 	/*
 	 * Initialize MyWorkerTask as soon as possible so that
-	 * worker_shmem_shutdown() can release it in case of ERROR.
+	 * worker_shmem_shutdown() can clean it up in the shared memory in case of
+	 * ERROR.
 	 */
 	if (task_idx >= 0)
 	{
@@ -942,10 +939,9 @@ squeeze_worker_main(Datum main_arg)
 	/*
 	 * The first worker after restart is responsible for cleaning up
 	 * replication slots and/or origins that other workers could not remove
-	 * due to server crash. Do that while holding the exclusive lock, as
-	 * concurrency makes no sense here. That also ensures that the other
-	 * workers wait for the cleanup to finish instead of complaining about the
-	 * existing slots / origins.
+	 * due to server crash. Do that while holding the exclusive lock - that
+	 * also ensures that the other workers wait for the cleanup to finish
+	 * instead of complaining about the existing slots / origins.
 	 */
 	if (!am_i_scheduler && !workerData->cleanup_done)
 	{
@@ -1352,7 +1348,8 @@ scheduler_worker_loop(void)
 				 * the current transaction.
 				 */
 				old_cxt = MemoryContextSwitchTo(sched_cxt);
-				registered = start_worker_internal(false, task_idx, &worker->handle);
+				registered = start_worker_internal(false, task_idx,
+												   &worker->handle);
 				MemoryContextSwitchTo(old_cxt);
 
 				if (!registered)
@@ -2322,7 +2319,7 @@ release_task(WorkerTask *task)
 	 */
 
 	MyWorkerTask = NULL;
-	/* Let others to see the WTS_UNUSED state. */
+	/* Let others see the WTS_UNUSED state. */
 	SpinLockRelease(&task->mutex);
 }
 
