@@ -519,9 +519,6 @@ squeeze_table_new(PG_FUNCTION_ARGS)
  *
  * If NULL is returned, *duplicate tells whether it's due to an existing task
  * for given relation.
- *
- * If 'dbid' is invalid, (i.e. caller is requesting a "cleanup only task"), do
- * not check for duplicates.
  */
 static WorkerTask *
 get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
@@ -531,10 +528,6 @@ get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 	WorkerTask	*task;
 	WorkerTask	*result = NULL;
 	int			res_idx = -1;
-	bool		cleanup_only = !OidIsValid(dbid);
-
-	Assert((!cleanup_only && relschema && relname) ||
-		   (cleanup_only && relschema == NULL && relname == NULL));
 
 	*duplicate = false;
 
@@ -572,15 +565,8 @@ get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 				/*
 				 * Consider tasks which might be in progress for possible
 				 * duplicates of the task we're going to submit.
-				 *
-				 * No need to check if the task should only do the initial
-				 * cleanup - this task is only created by the scheduler during
-				 * the startup. Even if a duplicate was created somehow, it
-				 * will make the worker exit too early to waste much CPU time
-				 * or to cause ERROR(s).
 				 */
-				if (!cleanup_only)
-					needs_check = true;
+				needs_check = true;
 			}
 			else if (result == NULL)
 			{
@@ -626,14 +612,6 @@ get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 			 */
 			clear_task(task);
 		}
-
-		/*
-		 * Exit early if there's no need to check for duplicates. (That might
-		 * also imply missed opportunities to reset tasks that became UNUSED
-		 * recently. We'll do that later when looking for regular tasks.)
-		 */
-		if (result && cleanup_only)
-			break;
 	}
 	if (result == NULL || *duplicate)
 		goto done;
@@ -651,16 +629,8 @@ get_unused_task(Oid dbid, char *relschema, char *relname, int *task_idx,
 	 * uniqueness of the task.
 	 */
 	result->dbid = dbid;
-	if (!cleanup_only)
-	{
-		namestrcpy(&result->relschema, relschema);
-		namestrcpy(&result->relname, relname);
-	}
-	else
-	{
-		NameStr(result->relschema)[0] = '\0';
-		NameStr(result->relname)[0] = '\0';
-	}
+	namestrcpy(&result->relschema, relschema);
+	namestrcpy(&result->relname, relname);
 done:
 	LWLockRelease(workerData->lock);
 	*task_idx = res_idx;
@@ -1936,7 +1906,7 @@ process_task_internal(MemoryContext task_cxt)
 	{
 		/*
 		 * TopMemoryContext is o.k. here, this worker only processes a single
-		 * task and then exists.
+		 * task and then exits.
 		 */
 		create_replication_slots(1, TopMemoryContext);
 		task->repl_slot = squeezeWorkerSlots[0];
