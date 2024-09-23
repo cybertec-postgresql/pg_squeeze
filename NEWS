@@ -47,7 +47,7 @@ Bug fixes
    value. (The bug had no effect if the variable was set to 0, which is the
    default.)
 
-3. Fixed permissions checks for the squeeze.pgstattuple_approx() function.q
+3. Fixed permissions checks for the squeeze.pgstattuple_approx() function.
 
    Like with other functions of this extension, the SUPERUSER role attribute
    is not needed for execution. The REPLICATION attribute is sufficient.
@@ -55,7 +55,7 @@ Bug fixes
 4. Update BRIN indexes when appropriate.
 
    If a row was updated during the table processing and only the attributes of
-   "summarizing" (BRIN) indexes changed, pg_squeeze might fail to update those
+   "summarizing" (BRIN) indexes changed, pg_squeeze could fail to update those
    indexes.
 
    This bug only affects pg_squeeze on PostgreSQL 16.

@@ -2182,7 +2182,7 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 
 			/*
 			 * If at least one attribute has been dropped, we need to deform /
-			 * form the tuple to make sure that set the values of the dropped
+			 * form the tuple to make sure that the values of the dropped
 			 * attribute(s) are NULL. (Unfortunately we don't know if the
 			 * table was already squeezed since the last ALTER TABLE ... DROP
 			 * COLUMN ... command.)
