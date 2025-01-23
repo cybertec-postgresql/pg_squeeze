@@ -1560,6 +1560,8 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		 * transactions to finish, so it should not be done by the workers.
 		 */
 		DecodingContextFindStartpoint(ctx);
+		/* The call above could have changed the memory context.*/
+		MemoryContextSwitchTo(mcxt);
 
 		/* Get the values the caller is interested int. */
 		res_ptr->confirmed_flush = slot->data.confirmed_flush;
@@ -1588,7 +1590,8 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		{
 			res_ptr->snap_seg = NULL;
 			res_ptr->snap_handle = DSM_HANDLE_INVALID;
-			snap_dst = res_ptr->snap_private = (char *) palloc(snap_size);
+			snap_dst = (char *) MemoryContextAlloc(mcxt, snap_size);
+			res_ptr->snap_private = snap_dst;
 		}
 		/*
 		 * XXX Should we care about alignment? The function doesn't seem to
