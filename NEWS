@@ -1,3 +1,15 @@
+Release 1.8.0
+=============
+
+This release fixes a bug in the squeeze.squeeze_table() function, which can
+cause data corruption. The problem can occur if other clients run DDL
+statements or squeeze other tables around the time the function starts its
+execution.
+
+Automatic launching by the scheduler worker (as described in the "Register
+table for regular processing" section of README) is not affected.
+
+
 Release 1.7.0
 =============
 
