@@ -34,8 +34,13 @@ parser.add_argument("--test-duration", type=int, default=5,
 parser.add_argument("--test-iterations", type=int, default=1,
                     help="How many times should the test be executed")
 parser.add_argument("--no-verification", action="store_true",
-                    help="Sikp verification of result, i.e. only test stability")
+                    help="Skip verification of result, i.e. only test stability")
 args = parser.parse_args()
+
+# TODO Turn these into a command line options.
+test_instances = 5
+test_schema = "public"
+verification_schema = "expected"
 
 test_succeeded = True
 
@@ -43,7 +48,7 @@ def get_connection():
     return psycopg.connect(host=args.host, port=args.port,
                            dbname=args.database, user=args.user)
 
-def start_single_test():
+def start_tests():
     d = globals()
     # All threads should check this variable and stop as soon as it becomes
     # True.
@@ -56,25 +61,25 @@ def start_single_test():
     # test duration in seconds
     d['timer_max_executions'] = args.test_duration
 
-def stop_single_test(success):
+def stop_tests(success):
     d = globals()
     d['test_done'] = True
     if not success:
         d['test_succeeded'] = False
 
 # Stop if the required number of executions elapsed.
-def maybe_stop_single_test():
+def maybe_stop_tests():
     d = globals()
     d['timer_executions'] = d['timer_executions'] + 1
     if timer_executions >= timer_max_executions:
-        stop_single_test(True)
+        stop_tests(True)
 
-def check(cur):
-    # Check the pg_squeeze extension.
+def setup_database(cur):
     cur.execute("SELECT extversion FROM pg_extension WHERE extname='pg_squeeze'")
     if cur.rowcount == 0:
-        raise Exception("pg_squeeze is not installed")
-    ext_row = cur.fetchone()
+        cur.execute("CREATE EXTENSION pg_squeeze")
+    cur.execute("CREATE SCHEMA IF NOT EXISTS %s" % test_schema)
+    cur.execute("CREATE SCHEMA IF NOT EXISTS %s" % verification_schema)
 
 class CommandThread(Thread):
     def __init__(self, cmds, cmds_executed):
@@ -100,7 +105,7 @@ class CommandThread(Thread):
             con.close()
         except Exception as e:
             print(e)
-            stop_single_test(False)
+            stop_tests(False)
 
 class SqueezeParams(object):
     def __init__(self, table, index):
@@ -129,15 +134,15 @@ class SqueezeThread(Thread):
         self.con.close()
         self.done = True
 
-    # Each call processes the next item of params_array (round robin).
+    # Each call processes a random item of params_array.
     def squeeze(self):
         params = random.choice(self.params_array)
         try:
             ind = "'%s'" % params.index if params.index else "NULL"
             self.cur.execute("SET maintenance_work_mem='1MB'")
             self.cur.execute(
-                "SELECT squeeze.squeeze_table('public', '%s', %s)" %
-                (params.table, ind,))
+                "SELECT squeeze.squeeze_table('%s', '%s', %s)" %
+                (test_schema, params.table, ind,))
             self.cur.execute("SELECT count(*) FROM squeeze.errors")
             row = self.cur.fetchone()
             if row[0] > 0:
@@ -146,7 +151,7 @@ class SqueezeThread(Thread):
                 raise Exception("squeeze_table() failed")
         except Exception as e:
             print(e)
-            stop_single_test(False)
+            stop_tests(False)
 
 # cmds_setup is a list of commands to create the test table and any other
 # database objects needed. The first item must be CREATE TABLE command, and it
@@ -161,25 +166,48 @@ class SqueezeThread(Thread):
 # check_query is an SQL query that compares the data produced by the stability
 # test to the data produced by replaying the same commands and returns zero if
 # the sets are identical.
-class Test(object):
+class TestTemplate(object):
     def __init__(self, table, cmds_setup, cmds, check_query):
         self.table = table
         self.cmds_setup = cmds_setup
         self.cmds = cmds
         self.check_query = check_query
 
+class Test(object):
+    def __init__(self, template, inst):
+        self.table = template.table.format(_sch_= test_schema,
+                                           _inst_=inst)
+        self.table_verify = template.table.format(_sch_= verification_schema,
+                                                  _inst_=inst)
+        self.cmds_setup = list(c.format(_wal_="",
+                                        _sch_= test_schema,
+                                        _inst_=inst,
+                                        _table_=self.table)
+                               for c in template.cmds_setup)
+        self.cmds = list(c.format(_sch_= test_schema, _inst_=inst, _table_=self.table)
+                         for c in template.cmds)
+        self.cmds_setup_verify = list(c.format(_wal_="UNLOGGED",
+                                               _sch_= verification_schema,
+                                               _inst_=inst,
+                                               _table_=self.table_verify)
+                               for c in template.cmds_setup)
+        self.cmds_verify = list(c.format(_sch_= verification_schema,
+                                         _inst_=inst,
+                                         _table_=self.table_verify)
+                                for c in template.cmds)
+        self.check_query = template.check_query.format(_sch_= test_schema,
+                                                       _sch_verify_=verification_schema,
+                                                       _inst_=inst,
+                                                       _table_=self.table,
+                                                       _table_verify_=self.table_verify)
+
     def setup(self):
         con = get_connection()
         con.autocommit = True
         cur = con.cursor()
-        cur.execute("DROP TABLE IF EXISTS %s" % self.table)
-        first = True
+        stmt = "DROP TABLE IF EXISTS %s" % (self.table,)
+        cur.execute(stmt)
         for cmd in self.cmds_setup:
-            if first:
-                # CREATE TABLE w/o the UNLOGGED keyword and with "public" as
-                # schema name.
-                cmd = cmd % ("", "public",)
-                first = False
             cur.execute(cmd)
         con.close()
         if args.no_verification:
@@ -192,9 +220,9 @@ class Test(object):
         self.cmd_thread.start()
 
 # Execute the test suite once.
-def run_single_test(squeeze_thread):
+def run_tests(tests):
     print('Running test...')
-    start_single_test()
+    start_tests()
 
     for test in tests:
         test.setup()
@@ -207,15 +235,13 @@ def run_single_test(squeeze_thread):
     while True:
         if test_done:
             break
-        timer = Timer(1, maybe_stop_single_test)
+        timer = Timer(1, maybe_stop_tests)
         timer.start()
         timer.join()
 
-verification_schema = "expected"
-
 # Run the same SQL statements on each table again, w/o the interference with
 # squeeze_table(). The resulting tables should be identical.
-def verify_single_test(squeeze_thread, con, con_vac):
+def verify_tests(tests, squeeze_thread, con, con_vac):
     print("Verifying results...")
     cur = con.cursor()
     cur_vac = con_vac.cursor()
@@ -228,8 +254,9 @@ def verify_single_test(squeeze_thread, con, con_vac):
     con.commit()
     # Create tables to execute the queries again.
     for test in tests:
-        cur.execute("DROP TABLE IF EXISTS expected.%s" % (test.table,))
-        cur.execute(test.cmds_setup[0] % ("UNLOGGED", verification_schema,))
+        cur.execute("DROP TABLE IF EXISTS %s" % (test.table_verify,))
+        for cmd in test.cmds_setup_verify:
+            cur.execute(cmd)
         # We try to run VACUUM FULL when it seems appropriate (see below), so do
         # not let autovacuum interfere with that effort.
         cur.execute("ALTER TABLE %s SET (autovacuum_enabled=false)" %
@@ -243,8 +270,7 @@ def verify_single_test(squeeze_thread, con, con_vac):
         rows = 0.0
         rows_live = 0.0
         for i in test.cmds_executed:
-            cmd = test.cmds[i]
-            cur.execute("SET LOCAL search_path TO expected")
+            cmd = test.cmds_verify[i]
             cur.execute(cmd)
             if cmd.lower().find('insert') >= 0:
                 rows = rows + cur.rowcount
@@ -269,6 +295,8 @@ def verify_single_test(squeeze_thread, con, con_vac):
         con.commit()
         if cur.rowcount == 0:
             print('Test passed for table "%s"' % test.table)
+            cur.execute("DROP TABLE %s" % (test.table_verify,))
+            con.commit()
         else:
             print('Found difference for table "%s"' % test.table)
 
@@ -276,57 +304,73 @@ def verify_single_test(squeeze_thread, con, con_vac):
     con_vac.close()
 
 
-tests = [
-    Test(table = "a",
-         cmds_setup = [
-             "CREATE %s TABLE %s.a(i serial NOT NULL PRIMARY KEY, j int)",
-         ],
-         cmds = [
-             "INSERT INTO a(j) SELECT g.i FROM generate_series(0, 255) AS g(i)",
-             "UPDATE a SET j = j + 1 WHERE i IN (SELECT i FROM a WHERE i % 2 = 0 ORDER BY i LIMIT 256)",
-             "UPDATE a SET j = j + 1 WHERE i IN (SELECT i FROM a WHERE i % 2 = 1 ORDER BY i LIMIT 256)",
-             "DELETE FROM a WHERE i IN (SELECT i FROM a WHERE i % 2 = 0 ORDER BY i LIMIT 128)",
-             "DELETE FROM a WHERE i IN (SELECT i FROM a WHERE i % 2 = 1 ORDER BY i LIMIT 128)"
-         ],
-         check_query = "SELECT * FROM public.a AS t1 FULL JOIN expected.a AS t2 ON (t1.i, t2.j) = (t2.i, t2.j) WHERE t1.i ISNULL OR t2.i ISNULL")
+# Multiple independently running tests can be created from each
+# instance. {_inst_} in the command text stands for the instance number.
+#
+# {_wal_} is used to substitute the UNLOGGED option, which is useful during
+# verification of the test results.
+#
+# {_sch_} is used to substitute the schema the table will reside in.
+#
+# Likewise, {_sch_verify_} is a placeholder for the schema where the
+# verification of the test results is performed.
+#
+# {_table_} and {_table_verify_} are the test and verification tables with the
+# placeholders substituted.
+test_templates = [
+    TestTemplate(
+        table = "{_sch_}.a_{_inst_}",
+        cmds_setup = [
+            "CREATE {_wal_} TABLE {_table_}(i serial NOT NULL PRIMARY KEY, j int)",
+        ],
+        cmds = [
+            "INSERT INTO {_table_}(j) SELECT g.i FROM generate_series(0, 255) AS g(i)",
+            "UPDATE {_table_} SET j = j + 1 WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 0 ORDER BY i LIMIT 256)",
+            "UPDATE {_table_} SET j = j + 1 WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 1 ORDER BY i LIMIT 256)",
+            "DELETE FROM {_table_} WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 0 ORDER BY i LIMIT 128)",
+            "DELETE FROM {_table_} WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 1 ORDER BY i LIMIT 128)"
+        ],
+        check_query = "SELECT * FROM {_table_} AS t1 FULL JOIN {_table_verify_} AS t2 ON (t1.i, t2.j) = (t2.i, t2.j) WHERE t1.i ISNULL OR t2.i ISNULL")
     ,
 
     # TOAST
-    Test(table = "b",
-         cmds_setup = [
-             "CREATE %s TABLE %s.b(i serial NOT NULL PRIMARY KEY, j text)",
-             "CREATE OR REPLACE FUNCTION public.long_string() RETURNS text LANGUAGE sql AS $$ SELECT string_agg(h.x::text, ' ') FROM generate_series(0, 4095) as h(x);$$"
-         ],
-         cmds = [
-             "INSERT INTO b(j) SELECT public.long_string() FROM generate_series(0, 16) AS g(i)",
+    TestTemplate(
+        table = "{_sch_}.b_{_inst_}",
+        cmds_setup = [
+            "CREATE {_wal_} TABLE {_table_}(i serial NOT NULL PRIMARY KEY, j text)",
+            "CREATE OR REPLACE FUNCTION {_sch_}.long_string() RETURNS text LANGUAGE sql AS $$ SELECT string_agg(h.x::text, ' ') FROM generate_series(0, 4095) as h(x);$$"
+        ],
+        cmds = [
+            "INSERT INTO {_table_}(j) SELECT {_sch_}.long_string() FROM generate_series(0, 16) AS g(i)",
 
-             "UPDATE b SET j = public.long_string() WHERE i IN (SELECT i FROM b WHERE i % 2 = 0 ORDER BY i LIMIT 256)",
-             "UPDATE b SET j = public.long_string() WHERE i IN (SELECT i FROM b WHERE i % 2 = 1 ORDER BY i LIMIT 256)",
+            "UPDATE {_table_} SET j = {_sch_}.long_string() WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 0 ORDER BY i LIMIT 256)",
+            "UPDATE {_table_} SET j = {_sch_}.long_string() WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 1 ORDER BY i LIMIT 256)",
 
-             "DELETE FROM b WHERE i IN (SELECT i FROM b WHERE i % 2 = 0 ORDER BY i LIMIT 8)",
-             "DELETE FROM b WHERE i IN (SELECT i FROM b WHERE i % 2 = 1 ORDER BY i LIMIT 8)"
-         ],
-         check_query = "SELECT * FROM public.b AS t1 FULL JOIN expected.b AS t2 ON (t1.i, t2.j) = (t2.i, t2.j) WHERE t1.i ISNULL OR t2.i ISNULL")
+            "DELETE FROM {_table_} WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 0 ORDER BY i LIMIT 8)",
+            "DELETE FROM {_table_} WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 1 ORDER BY i LIMIT 8)"
+        ],
+        check_query = "SELECT * FROM {_table_} AS t1 FULL JOIN {_table_verify_} AS t2 ON (t1.i, t2.j) = (t2.i, t2.j) WHERE t1.i ISNULL OR t2.i ISNULL")
     ,
 
     # Update identity key.
-    Test(table = "c",
-         cmds_setup = [
-             "CREATE %s TABLE %s.c(i serial NOT NULL PRIMARY KEY, j real)"
-         ],
-         cmds = [
-             # The values should be sparse so that the UPDATE can increment as
-             # many values as possible.
-             "WITH tmp(i) AS (SELECT max(i) FROM (SELECT i FROM c UNION VALUES (0)) AS s) INSERT INTO c SELECT g.i FROM tmp, generate_series(tmp.i + 1, tmp.i + 256) AS g(i)",
+    TestTemplate(
+        table = "{_sch_}.c_{_inst_}",
+        cmds_setup = [
+            "CREATE {_wal_} TABLE {_table_}(i serial NOT NULL PRIMARY KEY, j real)"
+        ],
+        cmds = [
+            # The values should be sparse so that the UPDATE can increment as
+            # many values as possible.
+            "WITH tmp(i) AS (SELECT max(i) FROM (SELECT i FROM {_table_} UNION VALUES (0)) AS s) INSERT INTO {_table_} SELECT g.i FROM tmp, generate_series(tmp.i + 1, tmp.i + 256) AS g(i)",
 
-             # To avoid violation of the primary key, only update those rows
-             # for which i + 1 does not exist.
-             "UPDATE c SET i = i + 1 WHERE i IN (SELECT s1.x FROM (SELECT i, i + 1 FROM c) s1(x, y) LEFT JOIN (SELECT i FROM c) s2(x) ON s1.y = s2.x WHERE  s2.x ISNULL)",
+            # To avoid violation of the primary key, only update those rows
+            # for which i + 1 does not exist.
+             "UPDATE {_table_} SET i = i + 1 WHERE i IN (SELECT s1.x FROM (SELECT i, i + 1 FROM {_table_}) s1(x, y) LEFT JOIN (SELECT i FROM {_table_}) s2(x) ON s1.y = s2.x WHERE  s2.x ISNULL)",
 
-             "DELETE FROM c WHERE i IN (SELECT i FROM c WHERE i % 2 = 0 ORDER BY i LIMIT 128)",
-             "DELETE FROM c WHERE i IN (SELECT i FROM c WHERE i % 2 = 1 ORDER BY i LIMIT 128)",
-         ],
-         check_query = "SELECT * FROM public.c AS t1 FULL JOIN expected.c AS t2 ON t1.i = t2.i WHERE t1.i ISNULL OR t2.i ISNULL")
+            "DELETE FROM {_table_} WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 0 ORDER BY i LIMIT 128)",
+            "DELETE FROM {_table_} WHERE i IN (SELECT i FROM {_table_} WHERE i % 2 = 1 ORDER BY i LIMIT 128)",
+        ],
+        check_query = "SELECT * FROM {_table_} AS t1 FULL JOIN {_table_verify_} AS t2 ON t1.i = t2.i WHERE t1.i ISNULL OR t2.i ISNULL")
 ]
 
 con = get_connection()
@@ -334,7 +378,7 @@ con.autocommit = True
 cur = con.cursor()
 
 try:
-    check(cur)
+    setup_database(cur)
     check_ok = True
 
     # Prepare for error checking.
@@ -350,41 +394,54 @@ finally:
 if not check_ok:
     sys.exit(1)
 
+def add_squeeze_params(params, tabname_template):
+    for i in range(test_instances):
+        tabname = tabname_template.format(_inst_=i)
+        indname = tabname + "_pkey"
+        params.append(SqueezeParams(tabname, None)),
+        params.append(SqueezeParams(tabname, indname)),
+
 for i in range(args.test_iterations):
     con = get_connection()
     con.autocommit = False
 
     # An extra connection for VACUUM because it cannot run inside transaction
     # block.
-    con_vac = get_connection()
-    con_vac.autocommit = True
+    if not args.no_verification:
+        con_vac = get_connection()
+        con_vac.autocommit = True
 
-    squeeze_thread = SqueezeThread(
-        [
-            SqueezeParams("a", None),
-            SqueezeParams("a", "a_pkey"),
-            SqueezeParams("b", None),
-            SqueezeParams("b", "b_pkey"),
-            SqueezeParams("c", None),
-            SqueezeParams("c", "c_pkey")
-        ],
-        1.0)
+    params = []
+    add_squeeze_params(params, "a_{_inst_}")
+    add_squeeze_params(params, "b_{_inst_}")
+    add_squeeze_params(params, "c_{_inst_}")
+
+    # TODO Multiple squeeze threads? (If so, have setup_database() check the
+    # squeeze.workers_per_database GUC.)
+    squeeze_thread = SqueezeThread(params, 1.0)
+
+    tests = []
+    for i in range(test_instances):
+        for template in test_templates:
+            test = Test(template, i)
+            tests.append(test)
 
     try:
-        run_single_test(squeeze_thread)
+        run_tests(tests)
     except KeyboardInterrupt as e:
         # Pay special attention to KeyboardInterrupt because the join() method
-        # of Timer can be interrupted, in which case maybe_stop_single_test
-        # never gets called.
+        # of Timer can be interrupted, in which case maybe_stop_tests never
+        # gets called.
         print(e)
-        stop_single_test(False)
+        stop_tests(False)
         con.close()
-        con_vac.close()
+        if not args.no_verification:
+            con_vac.close()
 
     if test_succeeded:
         if not args.no_verification:
             try:
-                verify_single_test(squeeze_thread, con, con_vac)
+                verify_tests(tests, squeeze_thread, con, con_vac)
             except Exception as e:
                 print(e)
                 con.close()
@@ -392,7 +449,8 @@ for i in range(args.test_iterations):
                 sys.exit(1)
     else:
         con.close()
-        con_vac.close()
+        if not args.no_verification:
+            con_vac.close()
         sys.exit(1)
 
 con = get_connection()
