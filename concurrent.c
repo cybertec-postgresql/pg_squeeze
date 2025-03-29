@@ -238,7 +238,6 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
-	iistate->econtext->ecxt_scantuple = slot;
 
 	/* A slot to fetch tuples from identity index. */
 	ind_slot = table_slot_create(relation, NULL);
@@ -552,7 +551,6 @@ get_index_insert_state(Relation relation, Oid ident_index_id)
 
 	result = (IndexInsertState *) palloc0(sizeof(IndexInsertState));
 	estate = CreateExecutorState();
-	result->econtext = GetPerTupleExprContext(estate);
 
 	result->rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
 	InitResultRelInfo(result->rri, relation, 0, 0, 0);
