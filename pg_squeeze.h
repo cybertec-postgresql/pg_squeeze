@@ -121,7 +121,6 @@ typedef struct IndexInsertState
 {
 	ResultRelInfo *rri;
 	EState	   *estate;
-	ExprContext *econtext;
 
 	Relation	ident_index;
 } IndexInsertState;
