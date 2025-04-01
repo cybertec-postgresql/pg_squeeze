@@ -96,8 +96,9 @@ static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc,
 											  Snapshot *snap_hist);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
-static void get_pg_class_info(Oid relid, TransactionId *xmin,
-							  Form_pg_class *form_p, TupleDesc *desc_p);
+static void get_pg_class_info(Oid relid, bool is_composite_type,
+							  TransactionId *xmin, Form_pg_class *form_p,
+							  TupleDesc *desc_p);
 static void get_attribute_info(Oid relid, int relnatts,
 							   TransactionId **xmins_p,
 							   CatalogState *cat_state);
@@ -1119,7 +1120,7 @@ get_catalog_state(Oid relid)
 	 * turned off and on. On the other hand it might restrict some concurrent
 	 * DDLs that would be safe as such.
 	 */
-	get_pg_class_info(relid, &result->rel.xmin, &result->form_class,
+	get_pg_class_info(relid, false, &result->rel.xmin, &result->form_class,
 					  &result->desc_class);
 
 	result->rel.relnatts = result->form_class->relnatts;
@@ -1149,8 +1150,8 @@ get_catalog_state(Oid relid)
  * pointers are passed.
  */
 static void
-get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
-				  TupleDesc *desc_p)
+get_pg_class_info(Oid relid, bool is_composite_type, TransactionId *xmin,
+				  Form_pg_class *form_p, TupleDesc *desc_p)
 {
 	HeapTuple	tuple;
 	Form_pg_class form_class;
@@ -1185,7 +1186,7 @@ get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
 
 	/* Invalid relfilenode indicates mapped relation. */
 	form_class = (Form_pg_class) GETSTRUCT(tuple);
-	if (form_class->relfilenode == InvalidOid)
+	if (form_class->relfilenode == InvalidOid && !is_composite_type)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 (errmsg("Mapped relation cannot be squeezed"))));
@@ -1366,8 +1367,8 @@ get_composite_type_info(TypeCatInfo *tinfo)
 	 * as the corresponding pg_attribute tuples.
 	 */
 	tinfo->rel.relid = form_type->typrelid;
-	get_pg_class_info(form_type->typrelid, &tinfo->rel.xmin, &form_class,
-					  NULL);
+	get_pg_class_info(form_type->typrelid, true, &tinfo->rel.xmin,
+					  &form_class, NULL);
 	if (form_class->relnatts > 0)
 		get_attribute_info(form_type->typrelid, form_class->relnatts,
 						   &tinfo->rel.attr_xmins, NULL);
@@ -1636,7 +1637,7 @@ check_pg_class_changes(CatalogState *cat_state)
 {
 	TransactionId xmin_current;
 
-	get_pg_class_info(cat_state->rel.relid, &xmin_current, NULL, NULL);
+	get_pg_class_info(cat_state->rel.relid, false, &xmin_current, NULL, NULL);
 
 	/*
 	 * Check if pg_class(xmin) has changed.
