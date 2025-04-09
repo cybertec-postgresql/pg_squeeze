@@ -982,26 +982,17 @@ process_tasks(MemoryContext task_cxt)
 	static int	next_task = 0;
 	WorkerTask *task;
 
-	initStringInfo(&query);
-
 restart:
+	MemoryContextReset(task_cxt);
 	cl_index = NULL;
 	rel_tbsp = NULL;
 	ind_tbsps = NULL;
-	if (tasks)
-	{
-		for (i = 0; i < ntasks; i++)
-		{
-			TaskDetails *this = &tasks[i];
-
-			if (this->ind_tbsps)
-				pfree(this->ind_tbsps);
-		}
-		pfree(tasks);
-	}
 	tasks = NULL;
 	ntasks = 0;
-	resetStringInfo(&query);
+
+	oldcxt = MemoryContextSwitchTo(task_cxt);
+	initStringInfo(&query);
+	MemoryContextSwitchTo(oldcxt);
 
 	Assert(MyWorkerTask == NULL);
 
@@ -1033,8 +1024,7 @@ restart:
 			 * Create a single-element array of tasks for further processing.
 			 */
 			ntasks = 1;
-			oldcxt = CurrentMemoryContext;
-			MemoryContextSwitchTo(task_cxt);
+			oldcxt = MemoryContextSwitchTo(task_cxt);
 			tasks = (TaskDetails *) palloc(sizeof(TaskDetails));
 
 			/*
@@ -1116,8 +1106,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 		 * Create the tuple descriptor, slot and the task details in a
 		 * separate memory context, so that it survives the SPI session.
 		 */
-		oldcxt = CurrentMemoryContext;
-		MemoryContextSwitchTo(task_cxt);
+		oldcxt = MemoryContextSwitchTo(task_cxt);
 		tupdesc = CreateTupleDescCopy(SPI_tuptable->tupdesc);
 #if PG_VERSION_NUM >= 120000
 		slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
@@ -1346,7 +1335,7 @@ LIMIT %d", TASK_BATCH_SIZE);
 			fmgr_info(outfunc, &fmgrinfo);
 			start_ts_str = OutputFunctionCall(&fmgrinfo, TimestampTzGetDatum(start_ts));
 			/* Make sure the string survives TopTransactionContext. */
-			MemoryContextSwitchTo(task_cxt);
+			oldcxt = MemoryContextSwitchTo(task_cxt);
 			start_ts_str = pstrdup(start_ts_str);
 			MemoryContextSwitchTo(oldcxt);
 			CommitTransactionCommand();
