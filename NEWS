@@ -1,3 +1,21 @@
+Release 1.6.3
+=============
+
+Bug fixes
+---------
+
+Fixed memory leak in the squeeze worker.
+
+
+Release 1.6.2
+=============
+
+Bug fixes
+---------
+
+Fixed possible error during worker startup.
+
+
 Release 1.6.1
 =============
 
