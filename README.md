@@ -50,9 +50,12 @@ the upgrade will fail.*
 
 # Register table for regular processing
 
-First, make sure that your table has either primary key or unique constraint.
-This is necessary to process changes other transactions might do while
-`pg_squeeze` is doing its work.
+First, make sure that your table has an identity index - this is necessary to
+process changes other transactions might do while `pg_squeeze` is doing its
+work. If the replica identity of the table is DEFAULT or FULL, primary key
+constraint provides the identity index. If your table has no primary key, you
+need to set the identity index explicitly using the [ALTER COMMAND ... REPLICA
+IDENTITY USING INDEX ...][7] command.
 
 To make the `pg_squeeze` extension aware of the table, you need to insert a
 record into `squeeze.tables` table. Once added, statistics of the table are
@@ -374,8 +377,9 @@ tables and indexes to be squeezed is 1GB, an additional 2GB of disk space is
 required.
 
 [1]: https://reorg.github.io/pg_repack/
-[2]: https://www.postgresql.org/docs/13/static/sql-cluster.html
-[3]: https://www.postgresql.org/docs/13/static/bgworker.html
-[4]: https://www.postgresql.org/docs/13/static/logicaldecoding.html
-[5]: https://www.postgresql.org/docs/13/static/mvcc-caveats.html
+[2]: https://www.postgresql.org/docs/17/static/sql-cluster.html
+[3]: https://www.postgresql.org/docs/17/static/bgworker.html
+[4]: https://www.postgresql.org/docs/17/static/logicaldecoding.html
+[5]: https://www.postgresql.org/docs/17/static/mvcc-caveats.html
 [6]: https://www.freebsd.org/cgi/man.cgi?query=crontab&sektion=5&apropos=0&manpath=FreeBSD+12.1-RELEASE+and+Ports
+[7]: https://www.postgresql.org/docs/17/sql-altertable.html
