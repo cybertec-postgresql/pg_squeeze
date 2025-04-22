@@ -366,8 +366,13 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			 * the reason to increment the counter). However, heap_update()
 			 * does require CommandCounterIncrement().
 			 */
+#if PG_VERSION_NUM >= 180000
+			scan = index_beginscan(relation, iistate->ident_index,
+								   GetActiveSnapshot(), NULL, nkeys, 0);
+#else
 			scan = index_beginscan(relation, iistate->ident_index,
 								   GetActiveSnapshot(), nkeys, 0);
+#endif
 
 			index_rescan(scan, key, nkeys, NULL, 0);
 

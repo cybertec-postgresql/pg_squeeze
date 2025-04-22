@@ -158,13 +158,13 @@ int			squeeze_max_xlock_time = 0;
  * way to pass list of database name w/o adding restrictions on character set
  * characters.)
  */
-char	   *squeeze_worker_autostart = NULL;
+static char	   *squeeze_worker_autostart = NULL;
 
 /*
  * Role on behalf of which automatically-started worker connects to
  * database(s).
  */
-char	   *squeeze_worker_role = NULL;
+static char	   *squeeze_worker_role = NULL;
 
 /* The number of squeeze workers per database. */
 int			squeeze_workers_per_database = 1;
@@ -2058,7 +2058,12 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
 	else
 	{
+#if PG_VERSION_NUM >= 180000
+		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, NULL, 0,
+									 0);
+#else
 		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, 0, 0);
+#endif
 		index_rescan(index_scan, NULL, 0, NULL, 0);
 	}
 
