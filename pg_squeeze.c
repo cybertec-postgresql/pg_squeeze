@@ -9,15 +9,11 @@
  */
 #include "pg_squeeze.h"
 
-#if PG_VERSION_NUM >= 130000
 #include "access/heaptoast.h"
-#endif
 #include "access/multixact.h"
 #include "access/sysattr.h"
-#if PG_VERSION_NUM >= 130000
 #include "access/toast_internals.h"
 #include "access/xlogutils.h"
-#endif
 #if PG_VERSION_NUM >= 150000
 #include "access/xloginsert.h"
 #endif
@@ -139,9 +135,6 @@ static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
 static void swap_relation_files(Oid r1, Oid r2);
 static void swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2,
 							 Oid toastrelid2);
-#if PG_VERSION_NUM < 130000
-static Oid	get_toast_index(Oid toastrelid);
-#endif
 
 /*
  * The maximum time to hold AccessExclusiveLock during the final
@@ -1032,19 +1025,13 @@ setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 	ctx = CreateDecodingContext(InvalidXLogRecPtr,
 								NIL,
 								false,
-#if PG_VERSION_NUM >= 130000
 								XL_ROUTINE(.page_read = read_local_xlog_page,
 										   .segment_open = wal_segment_open,
 										   .segment_close = wal_segment_close),
-#else
-								logical_read_local_xlog_page,
-#endif
 								NULL, NULL, NULL);
 
-#if PG_VERSION_NUM >= 130000
 	/* decode_concurrent_changes() handles the older versions. */
 	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
-#endif
 
 	XLByteToSeg(restart_lsn, squeeze_current_segment, wal_segment_size);
 
@@ -2589,8 +2576,7 @@ create_transient_table(CatalogState *cat_state, TupleDesc tup_desc,
 		 * will eventually be dropped.
 		 */
 #if (PG_VERSION_NUM >= 140000) || \
-	(PG_VERSION_NUM < 140000 && PG_VERSION_NUM > 130004) || \
-	(PG_VERSION_NUM < 130000 && PG_VERSION_NUM > 120008)
+	(PG_VERSION_NUM < 140000 && PG_VERSION_NUM > 130004)
 		NewHeapCreateToastTable(result, reloptions, AccessExclusiveLock,
 								InvalidOid);
 #else
@@ -3312,13 +3298,10 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 		RenameRelationInternal(toastrelid2, name, true, false);
 
 		snprintf(name, NAMEDATALEN, "pg_toast_%u_index_", relid1);
-#if PG_VERSION_NUM < 130000
-		/* NoLock as RenameRelationInternal() did not release its lock. */
-		toastidxid = get_toast_index(toastrelid2);
-#else
+
 		/* TOAST relation is locked, but not its indexes. */
 		toastidxid = toast_get_valid_index(toastrelid2, AccessExclusiveLock);
-#endif
+
 		/*
 		 * Pass is_index=false so that even the index is locked in
 		 * AccessExclusiveLock mode. ShareUpdateExclusiveLock mode (allowing
@@ -3334,42 +3317,14 @@ swap_toast_names(Oid relid1, Oid toastrelid1, Oid relid2, Oid toastrelid2)
 	/* Now set the desired names on the TOAST stuff of relid1. */
 	snprintf(name, NAMEDATALEN, "pg_toast_%u", relid1);
 	RenameRelationInternal(toastrelid1, name, true, false);
-#if PG_VERSION_NUM < 130000
-	/* NoLock as RenameRelationInternal() did not release its lock. */
-	toastidxid = get_toast_index(toastrelid1);
-#else
+
 	/* TOAST relation is locked, but not its indexes. */
 	toastidxid = toast_get_valid_index(toastrelid1, AccessExclusiveLock);
-#endif
+
 	snprintf(name, NAMEDATALEN, "pg_toast_%u_index", relid1);
 	RenameRelationInternal(toastidxid, name, true, false);
 	CommandCounterIncrement();
 }
-
-#if PG_VERSION_NUM < 130000
-/*
- * The function is called after RenameRelationInternal() which does not
- * release the lock it acquired.
- */
-static Oid
-get_toast_index(Oid toastrelid)
-{
-	Relation	toastrel;
-	List	   *toastidxs;
-	Oid			result;
-
-	toastrel = table_open(toastrelid, NoLock);
-	toastidxs = RelationGetIndexList(toastrel);
-
-	if (toastidxs == NIL || list_length(toastidxs) != 1)
-		elog(ERROR, "Unexpected number of TOAST indexes");
-
-	result = linitial_oid(toastidxs);
-	table_close(toastrel, NoLock);
-
-	return result;
-}
-#endif
 
 /*
  * Retrieve the "fillfactor" storage option in a convenient way, so we don't

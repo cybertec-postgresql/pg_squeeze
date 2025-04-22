@@ -12,9 +12,7 @@
 
 #include "pg_squeeze.h"
 
-#if PG_VERSION_NUM >= 130000
 #include "access/heaptoast.h"
-#endif
 #include "executor/executor.h"
 #include "replication/decode.h"
 #include "utils/rel.h"
@@ -121,11 +119,6 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 {
 	DecodingOutputState *dstate;
 	ResourceOwner resowner_old;
-#if PG_VERSION_NUM < 130000
-	/* Workaround for XLogBeginRead() in setup_decoding(). */
-	static	bool	first_time = true;
-	XLogRecPtr	startptr;
-#endif
 
 	/*
 	 * Invalidate the "present" cache before moving to "(recent) history".
@@ -153,21 +146,7 @@ decode_concurrent_changes(LogicalDecodingContext *ctx,
 			char	   *errm = NULL;
 			XLogRecPtr	end_lsn;
 
-#if PG_VERSION_NUM < 130000
-			if (first_time)
-			{
-				startptr = MyReplicationSlot->data.restart_lsn;
-				first_time = false;
-			}
-			else
-				startptr = InvalidXLogRecPtr;
-#endif
-
-			record = XLogReadRecord(ctx->reader,
-#if PG_VERSION_NUM < 130000
-									startptr,
-#endif
-									&errm);
+			record = XLogReadRecord(ctx->reader, &errm);
 			if (errm)
 				elog(ERROR, "%s", errm);
 

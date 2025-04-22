@@ -1114,11 +1114,7 @@ scheduler_worker_loop(void)
 		if (rc != SPI_OK_SELECT)
 			ereport(ERROR, (errmsg("SELECT command failed: %s", query.data)));
 
-#if PG_VERSION_NUM >= 130000
 		ntask = SPI_tuptable->numvals;
-#else
-		ntask = SPI_processed;
-#endif
 
 		ereport(DEBUG1, (errmsg("scheduler worker: %zu tasks available",
 								ntask)));
@@ -1537,13 +1533,9 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 										NIL,
 										true,
 										InvalidXLogRecPtr,
-#if PG_VERSION_NUM >= 130000
 										XL_ROUTINE(.page_read = read_local_xlog_page,
 												   .segment_open = wal_segment_open,
 												   .segment_close = wal_segment_close),
-#else
-										logical_read_local_xlog_page,
-#endif
 										NULL, NULL, NULL);
 
 
@@ -2231,13 +2223,7 @@ run_command(char *command, int rc)
 
 	if (rc == SPI_OK_SELECT || rc == SPI_OK_INSERT_RETURNING ||
 		rc == SPI_OK_DELETE_RETURNING || rc == SPI_OK_UPDATE_RETURNING)
-	{
-#if PG_VERSION_NUM >= 130000
 		ntup = SPI_tuptable->numvals;
-#else
-		ntup = SPI_processed;
-#endif
-	}
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();

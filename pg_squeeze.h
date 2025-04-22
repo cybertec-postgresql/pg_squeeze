@@ -17,21 +17,13 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/relscan.h"
-#if PG_VERSION_NUM < 130000
-#include "access/tuptoaster.h"
-#endif
 #include "access/xact.h"
-#if PG_VERSION_NUM >= 130000
 #include "access/xlogutils.h"
-#endif
 #include "access/xlog_internal.h"
 #include "catalog/pg_class.h"
 #include "nodes/execnodes.h"
 #include "postmaster/bgworker.h"
 #include "replication/logical.h"
-#if PG_VERSION_NUM < 130000
-#include "replication/logicalfuncs.h"
-#endif
 #include "replication/origin.h"
 #include "storage/ipc.h"
 #include "utils/array.h"
