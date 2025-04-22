@@ -992,7 +992,11 @@ setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 	 * Use the slot initialized by the scheduler worker (or by the backend
 	 * running the squeeze_table() function ).
 	 */
+#if PG_VERSION_NUM >= 180000
+	ReplicationSlotAcquire(NameStr(repl_slot->name), true, true);
+#else
 	ReplicationSlotAcquire(NameStr(repl_slot->name), true);
+#endif
 
 	/*
 	 * This should not really happen, but if it did, the initial load could
@@ -2434,7 +2438,11 @@ has_dropped_attribute(Relation rel)
 
 	for (int i = 0; i < tup_desc->natts; i++)
 	{
+#if PG_VERSION_NUM >= 180000
+		Form_pg_attribute attr = TupleDescAttr(tup_desc, i);
+#else
 		Form_pg_attribute attr = &tup_desc->attrs[i];
+#endif
 
 		if (attr->attisdropped)
 			return true;
