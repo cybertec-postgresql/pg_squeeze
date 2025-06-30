@@ -421,6 +421,11 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	bool		source_finalized;
 	bool		xmin_valid;
 
+	/*
+	 * Cope with commit 706054b11b in PG core.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
 	relrv_src = makeRangeVar(NameStr(*relschema), NameStr(*relname), -1);
 	rel_src = table_openrv(relrv_src, AccessShareLock);
 
@@ -863,6 +868,9 @@ squeeze_table_internal(Name relschema, Name relname, Name indname,
 	object.objectSubId = 0;
 	object.objectId = relid_dst;
 	performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+
+	/* See the top of the function. */
+	PopActiveSnapshot();
 }
 
 static int
