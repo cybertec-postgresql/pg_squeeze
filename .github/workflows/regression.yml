@@ -13,6 +13,7 @@ jobs:
     strategy:
       matrix:
         pgversion:
+          - 18
           - 17
           - 16
           - 15
