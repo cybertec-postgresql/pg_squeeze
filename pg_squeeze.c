@@ -62,7 +62,11 @@ extern PGDLLIMPORT bool FirstSnapshotSet;
 #error "PostgreSQL version 12 or higher is required"
 #endif
 
+#ifdef PG_MODULE_MAGIC_EXT
+PG_MODULE_MAGIC_EXT(.name = "pg_squeeze", .version = "1.9.1");
+#else
 PG_MODULE_MAGIC;
+#endif
 
 static void squeeze_table_internal(Name relschema, Name relname, Name indname,
 								   Name tbspname, ArrayType *ind_tbsp);

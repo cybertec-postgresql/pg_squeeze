@@ -1,3 +1,30 @@
+Release 1.9.1
+=============
+
+Bug fixes
+---------
+
+* Fix version information.
+
+Version 1.9.0 was accidentally tagged without updating the version information
+in the source code.
+
+
+Release 1.9.0
+=============
+
+New features
+------------
+
+1. Make the code compatible with PostgreSQL server version 18.
+
+Bug fixes
+---------
+
+* Do not raise ERROR if table column is of composite type
+  (https://github.com/cybertec-postgresql/pg_squeeze/issues/83)
+
+
 Release 1.8.0
 =============
 
