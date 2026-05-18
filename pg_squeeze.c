@@ -3547,3 +3547,15 @@ manage_session_origin(Oid relid)
 	}
 	CommitTransactionCommand();
 }
+
+#if PG_VERSION_NUM < 180000
+#define GUC_SAFE_SEARCH_PATH "pg_catalog, pg_temp"
+
+void
+RestrictSearchPath(void)
+{
+	if (!IsBootstrapProcessingMode())
+		set_config_option("search_path", GUC_SAFE_SEARCH_PATH, PGC_USERSET,
+						  PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+}
+#endif

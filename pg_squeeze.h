@@ -442,3 +442,7 @@ extern bool squeeze_table_impl(Name relschema, Name relname, Name indname,
 extern void squeeze_handle_error_db(ErrorData **edata_p,
 									MemoryContext edata_cxt);
 extern void manage_session_origin(Oid relid);
+
+#if PG_VERSION_NUM < 180000
+extern void RestrictSearchPath(void);
+#endif
