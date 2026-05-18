@@ -2216,6 +2216,7 @@ run_command(char *command, int rc)
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, command);
+	RestrictSearchPath();
 	ret = SPI_execute(command, false, 0);
 	pgstat_report_activity(STATE_IDLE, NULL);
 	if (ret != rc)
