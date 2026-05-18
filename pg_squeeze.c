@@ -2915,7 +2915,7 @@ build_identity_key(Oid ident_idx_oid, Relation rel_src, int *nentries)
 	Assert(OidIsValid(ident_idx_oid));
 	ident_idx_rel = index_open(ident_idx_oid, AccessShareLock);
 	ident_idx = ident_idx_rel->rd_index;
-	n = ident_idx->indnatts;
+	n = ident_idx->indnkeyatts;
 	result = (ScanKey) palloc(sizeof(ScanKeyData) * n);
 	for (i = 0; i < n; i++)
 	{
