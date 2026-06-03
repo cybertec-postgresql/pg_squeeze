@@ -1,3 +1,33 @@
+Release 1.9.2
+=============
+
+Note: To upgrade from 1.9.1 to 1.9.2, you only need to install the 1.9.2
+binary. There's no need to run
+
+    ALTER EXTENSION pg_squeeze UPDATE;
+
+Bug fixes
+---------
+
+1. Fix possible escalation of privileges
+
+One problem this release fixes is that index functions used to run as the
+superuser. If they contained malicious code, it would have the superuser
+privileges too. This is fixed by changing the current user to the table owner
+before any index function can be executed.
+
+Another problem was that pg_squeeze could use SQL operators other than the
+built-in ones when checking table metadata (i.e. when checking which table is
+bloated enough to need squeezing). This is fixed by restricting the search
+path to "pg_catalog, pg_temp" before running any SQL query.
+
+2. Fix handling of indexes with non-key columns.
+
+If the identity index (typically the index the primary key is based on)
+contains non-key column(s) (i.e. INCLUDE clause was used in the CREATE INDEX
+command), attempt to squeeze the table failed.
+
+
 Release 1.9.1
 =============
 
