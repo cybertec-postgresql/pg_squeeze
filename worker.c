@@ -1457,7 +1457,11 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 #if PG_VERSION_NUM >= 150000
 	CheckSlotPermissions();
 #endif
+#if PG_VERSION_NUM >= 190000
+	CheckLogicalDecodingRequirements(false);
+#else
 	CheckLogicalDecodingRequirements();
+#endif
 
 	/*
 	 * We are in a transaction, so make sure various allocations survive the
@@ -1504,7 +1508,10 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		snprintf(name, NAMEDATALEN, REPL_SLOT_PREFIX "%u_%u", MyDatabaseId,
 				 slot_nr);
 
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 190000
+		ReplicationSlotCreate(name, true, RS_PERSISTENT, false, false, false,
+							  false);
+#elif PG_VERSION_NUM >= 170000
 		ReplicationSlotCreate(name, true, RS_PERSISTENT, false, false, false);
 #elif PG_VERSION_NUM >= 140000
 		ReplicationSlotCreate(name, true, RS_PERSISTENT, false);
@@ -1520,6 +1527,11 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		namestrcpy(&res_ptr->name, slot->data.name.data);
 		squeezeWorkerSlotCount++;
 
+#if PG_VERSION_NUM >= 190000
+		EnsureLogicalDecodingEnabled();
+		Assert(IsLogicalDecodingEnabled());
+#endif
+
 		/*
 		 * Neither prepare_write nor do_write callback nor update_progress is
 		 * useful for us.
@@ -1532,6 +1544,9 @@ create_replication_slots(int nslots, MemoryContext mcxt)
 		ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
 										NIL,
 										true,
+#if PG_VERSION_NUM >= 190000
+										false, /* for_repack */
+#endif
 										InvalidXLogRecPtr,
 										XL_ROUTINE(.page_read = read_local_xlog_page,
 												   .segment_open = wal_segment_open,
@@ -1984,7 +1999,11 @@ process_task_internal(MemoryContext task_cxt)
 		 * Now that the transaction is committed, we can run a new one to
 		 * drop the origin.
 		 */
+#if PG_VERSION_NUM >= 190000
+		Assert(replorigin_xact_state.origin != InvalidReplOriginId);
+#else
 		Assert(replorigin_session_origin != InvalidRepOriginId);
+#endif
 
 		manage_session_origin(InvalidOid);
 	}

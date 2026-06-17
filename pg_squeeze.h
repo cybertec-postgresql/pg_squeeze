@@ -98,7 +98,11 @@ typedef struct DecodingOutputState
 	 * WAL records having this origin have been created by the initial load
 	 * and should not be decoded.
 	 */
+#if PG_VERSION_NUM >= 190000
+	ReplOriginId rorigin;
+#else
 	RepOriginId rorigin;
+#endif
 
 	ResourceOwner resowner;
 } DecodingOutputState;

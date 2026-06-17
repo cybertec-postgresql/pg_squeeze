@@ -30,7 +30,11 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
+#if PG_VERSION_NUM >= 190000
+#include "commands/repack.h"
+#else
 #include "commands/cluster.h"
+#endif
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "executor/executor.h"
@@ -52,6 +56,9 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#if PG_VERSION_NUM >= 190000
+#include "utils/tuplesort.h"
+#endif
 
 #if PG_VERSION_NUM < 150000
 extern PGDLLIMPORT int wal_segment_size;
@@ -1054,6 +1061,9 @@ setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 	restart_lsn = MyReplicationSlot->data.restart_lsn;
 
 	/* Restart the decoding context at slot's confirmed_flush */
+#if PG_VERSION_NUM >= 190000
+	Assert(IsLogicalDecodingEnabled());
+#endif
 	ctx = CreateDecodingContext(InvalidXLogRecPtr,
 								NIL,
 								false,
@@ -1082,6 +1092,9 @@ setup_decoding(Oid relid, TupleDesc tup_desc, Snapshot *snap_hist)
 	dstate->tupdesc_change = CreateTemplateTupleDesc(1);
 
 	TupleDescInitEntry(dstate->tupdesc_change, 1, NULL, BYTEAOID, -1, 0);
+#if PG_VERSION_NUM >= 190000
+	TupleDescFinalize(dstate->tupdesc_change);
+#endif
 	/* ... as well as the corresponding slot. */
 	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change,
 											  &TTSOpsMinimalTuple);
@@ -2024,7 +2037,11 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+#if PG_VERSION_NUM >= 190000
+	dstate->rorigin = replorigin_xact_state.origin;
+#else
 	dstate->rorigin = replorigin_session_origin;
+#endif
 
 	if (cluster_idx_rv != NULL)
 	{
@@ -2074,10 +2091,18 @@ perform_initial_load(Relation rel_src, RangeVar *cluster_idx_rv,
 		use_sort = false;
 
 	if (use_sort || cluster_idx == NULL)
+#if PG_VERSION_NUM >= 190000
+		heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL,
+									SO_NONE);
+#else
 		heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
+#endif
 	else
 	{
-#if PG_VERSION_NUM >= 180000
+#if PG_VERSION_NUM >= 190000
+		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, NULL, 0,
+									 0, SO_NONE);
+#elif PG_VERSION_NUM >= 180000
 		index_scan = index_beginscan(rel_src, cluster_idx, snap_hist, NULL, 0,
 									 0);
 #else
@@ -2672,7 +2697,11 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 		size_t		int2_arr_size;
 		int16	   *indoptions;
 		text	   *reloptions = NULL;
+#if PG_VERSION_NUM >= 190000
+		uint16		flags;
+#else
 		bits16		flags;
+#endif
 		XLogRecPtr	end_of_wal;
 #if PG_VERSION_NUM >= 170000
 		Datum		*opclassOptions;
@@ -3479,7 +3508,11 @@ squeeze_handle_error_db(ErrorData **edata_p, MemoryContext edata_cxt)
 	 * Now that the transaction is aborted, we can run a new one to drop the
 	 * origin.
 	 */
+#if PG_VERSION_NUM >= 190000
+	if (replorigin_xact_state.origin != InvalidReplOriginId)
+#else
 	if (replorigin_session_origin != InvalidRepOriginId)
+#endif
 		manage_session_origin(InvalidOid);
 
 	/*
@@ -3525,8 +3558,14 @@ manage_session_origin(Oid relid)
 #else
 		replorigin_session_setup(origin);
 #endif
+#if PG_VERSION_NUM >= 190000
+		Assert(replorigin_xact_state.origin == InvalidReplOriginId);
+		replorigin_xact_state.origin = origin;
+#else
 		Assert(replorigin_session_origin == InvalidRepOriginId);
 		replorigin_session_origin = origin;
+#endif
+
 
 		Assert(!OidIsValid(my_relid));
 		my_relid = relid;
@@ -3540,7 +3579,11 @@ manage_session_origin(Oid relid)
 #else
 		replorigin_drop(replorigin_session_origin, false);
 #endif
+#if PG_VERSION_NUM >= 190000
+		replorigin_xact_state.origin = InvalidReplOriginId;
+#else
 		replorigin_session_origin = InvalidRepOriginId;
+#endif
 
 		Assert(OidIsValid(my_relid));
 		my_relid = InvalidOid;

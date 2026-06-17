@@ -39,7 +39,11 @@ static void plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
 static HeapTuple get_changed_tuple(ConcurrentChange *change);
+#if PG_VERSION_NUM >= 190000
+static bool plugin_filter(LogicalDecodingContext *ctx, ReplOriginId origin_id);
+#else
 static bool plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id);
+#endif
 
 /*
  * Decode and apply concurrent changes. If there are too many of them, split
@@ -286,6 +290,15 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 
 			/* Update indexes. */
 			ExecStoreHeapTuple(tup, slot, false);
+#if PG_VERSION_NUM >= 190000
+			recheck = ExecInsertIndexTuples(iistate->rri,
+											iistate->estate,
+											0,
+											slot,
+											NIL,	/* arbiterIndexes */
+											NULL	/* specConflict */
+				);
+#else
 			recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 											iistate->rri,
@@ -303,7 +316,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 											false	/* onlySummarizing */
 #endif
 				);
-
+#endif
 
 			/*
 			 * If recheck is required, it must have been preformed on the
@@ -345,7 +358,11 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 			 * the reason to increment the counter). However, heap_update()
 			 * does require CommandCounterIncrement().
 			 */
-#if PG_VERSION_NUM >= 180000
+#if PG_VERSION_NUM >= 190000
+			scan = index_beginscan(relation, iistate->ident_index,
+								   GetActiveSnapshot(), NULL, nkeys, 0,
+								   SO_NONE);
+#elif PG_VERSION_NUM >= 180000
 			scan = index_beginscan(relation, iistate->ident_index,
 								   GetActiveSnapshot(), NULL, nkeys, 0);
 #else
@@ -392,6 +409,9 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 #if PG_VERSION_NUM >= 160000
 				TU_UpdateIndexes update_indexes;
 #endif
+#if PG_VERSION_NUM >= 190000
+				uint32	flags = 0;
+#endif
 
 				simple_heap_update(relation, &ctid, tup
 #if PG_VERSION_NUM >= 160000
@@ -424,6 +444,17 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 					 * es_range_table to be initialized. Is it worth the
 					 * complexity?
 					 */
+#if PG_VERSION_NUM >= 190000
+					if (update_indexes == TU_Summarizing)
+						flags |= EIIT_ONLY_SUMMARIZING;
+					recheck = ExecInsertIndexTuples(iistate->rri,
+													iistate->estate,
+													flags,
+													slot,
+													NIL,	/* arbiterIndexes */
+													NULL	/* specConflict */
+						);
+#else
 					recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 													iistate->rri,
@@ -442,6 +473,7 @@ apply_concurrent_changes(DecodingOutputState *dstate, Relation relation,
 													(update_indexes == TU_Summarizing)
 #endif
 						);
+#endif
 					list_free(recheck);
 				}
 
@@ -578,8 +610,6 @@ free_index_insert_state(IndexInsertState *iistate)
 void
 _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
-	AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
-
 	cb->startup_cb = plugin_startup;
 	cb->begin_cb = plugin_begin_txn;
 	cb->change_cb = plugin_change;
@@ -827,14 +857,22 @@ get_changed_tuple(ConcurrentChange *change)
  * A filter that recognizes changes produced by the initial load.
  */
 static bool
+#if PG_VERSION_NUM >= 190000
+plugin_filter(LogicalDecodingContext *ctx, ReplOriginId origin_id)
+#else
 plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id)
+#endif
 {
 	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
 	/* dstate is not initialized during decoding setup - should it be? */
+#if PG_VERSION_NUM >= 190000
+	if (dstate && dstate->rorigin != InvalidReplOriginId &&
+#else
 	if (dstate && dstate->rorigin != InvalidRepOriginId &&
+#endif
 		origin_id == dstate->rorigin)
 		return true;
 
