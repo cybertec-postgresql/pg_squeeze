@@ -2043,7 +2043,7 @@ process_task_internal(MemoryContext task_cxt)
 		 */
 		appendStringInfo(&query,
 						 "INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
-VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
+VALUES (%s, %s, '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 						 quote_literal_cstr(NameStr(*relschema)),
 						 quote_literal_cstr(NameStr(*relname)),
 						 start_ts_str,
@@ -2111,7 +2111,7 @@ squeeze_handle_error_app(ErrorData *edata, WorkerTask *task)
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
-VALUES ('%s', '%s', '%s', %s, %s)",
+VALUES (%s, %s, '%s', %s, %s)",
 					 quote_literal_cstr(NameStr(task->relschema)),
 					 quote_literal_cstr(NameStr(task->relname)),
 					 unpack_sql_state(edata->sqlerrcode),
