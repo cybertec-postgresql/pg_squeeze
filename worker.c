@@ -2043,9 +2043,9 @@ process_task_internal(MemoryContext task_cxt)
 		 */
 		appendStringInfo(&query,
 						 "INSERT INTO squeeze.log(tabschema, tabname, started, finished, ins_initial, ins, upd, del) \
-VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
-						 NameStr(*relschema),
-						 NameStr(*relname),
+VALUES (%s, %s, '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
+						 quote_literal_cstr(NameStr(*relschema)),
+						 quote_literal_cstr(NameStr(*relname)),
 						 start_ts_str,
 						 MyWorkerSlot->progress.ins_initial,
 						 MyWorkerSlot->progress.ins,
@@ -2080,8 +2080,8 @@ VALUES ('%s', '%s', '%s', clock_timestamp(), %ld, %ld, %ld, %ld)",
 				 */
 				resetStringInfo(&query);
 				appendStringInfo(&query, "ANALYZE %s.%s",
-								 NameStr(*relschema),
-								 NameStr(*relname));
+								 quote_identifier(NameStr(*relschema)),
+								 quote_identifier(NameStr(*relname)));
 				run_command(query.data, SPI_OK_UTILITY);
 			}
 		}
@@ -2111,9 +2111,9 @@ squeeze_handle_error_app(ErrorData *edata, WorkerTask *task)
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "INSERT INTO squeeze.errors(tabschema, tabname, sql_state, err_msg, err_detail) \
-VALUES ('%s', '%s', '%s', %s, %s)",
-					 NameStr(task->relschema),
-					 NameStr(task->relname),
+VALUES (%s, %s, '%s', %s, %s)",
+					 quote_literal_cstr(NameStr(task->relschema)),
+					 quote_literal_cstr(NameStr(task->relname)),
 					 unpack_sql_state(edata->sqlerrcode),
 					 quote_literal_cstr(edata->message),
 					 edata->detail ? quote_literal_cstr(edata->detail) : "''");

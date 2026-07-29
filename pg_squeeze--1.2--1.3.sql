@@ -305,8 +305,8 @@ t.tried >= tb.max_retry, tb.skip_analyze
 			-- squeeze_table() function. What's the most suitable
 			-- way to wait? Asynchronous execution of the VACUUM
 			-- is probably needed in any case.
-                        v_stmt := 'ANALYZE "' || v_tabschema || '"."' ||
-                                v_tabname || '"';
+                        v_stmt := 'ANALYZE ' || quote_ident(v_tabschema) ||
+                                '.' || quote_ident(v_tabname);
 
 			EXECUTE v_stmt;
 		END IF;
