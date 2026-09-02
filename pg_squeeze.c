@@ -26,6 +26,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
@@ -139,6 +140,8 @@ static Oid *build_transient_indexes(Relation rel_dst, Relation rel_src,
 									TablespaceInfo *tbsp_info,
 									CatalogState *cat_state,
 									LogicalDecodingContext *ctx);
+static void copy_index_constraints(Relation old_index, Oid new_index_id,
+								   Oid new_heap_id);
 static ScanKey build_identity_key(Oid ident_idx_oid, Relation rel_src,
 								  int *nentries);
 static bool perform_final_merge(Oid relid_src, Oid *indexes_src, int nindexes,
@@ -2893,6 +2896,12 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 
 		debug_query_string = NULL;
 
+		/*
+		 * Copy constraints that the executor will need when opening the
+		 * index.
+		 */
+		copy_index_constraints(ind, ind_oid_new, RelationGetRelid(rel_dst));
+
 		index_close(ind, AccessShareLock);
 		list_free_deep(colnames);
 		pfree(collations);
@@ -2918,6 +2927,80 @@ build_transient_indexes(Relation rel_dst, Relation rel_src,
 	}
 
 	return result;
+}
+
+/*
+ * Create a transient copy of a constraint -- supported by a transient
+ * copy of the index that supports the original constraint.
+ *
+ * When squeezing a table that contains exclusion constraints, the executor
+ * relies on these constraints being properly catalogued.  These copies are to
+ * support that.
+ *
+ * We don't need the constraints for anything else (the original constraints
+ * will be there once squeeze completes), so we add pg_depend entries so that
+ * they are dropped when the transient table is dropped.
+ */
+static void
+copy_index_constraints(Relation old_index, Oid new_index_id, Oid new_heap_id)
+{
+	ScanKeyData skey;
+	Relation	rel;
+	TupleDesc	desc;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	ObjectAddress objrel;
+
+	rel = table_open(ConstraintRelationId, RowExclusiveLock);
+	ObjectAddressSet(objrel, RelationRelationId, new_heap_id);
+
+	/*
+	 * Retrieve the constraints supported by the old index and create an
+	 * identical one that points to the new index.
+	 */
+	ScanKeyInit(&skey,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(old_index->rd_index->indrelid));
+	scan = systable_beginscan(rel, ConstraintRelidTypidNameIndexId, true,
+							  NULL, 1, &skey);
+	desc = RelationGetDescr(rel);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint conform = (Form_pg_constraint) GETSTRUCT(tup);
+		Oid			oid;
+		Datum		values[Natts_pg_constraint] = {0};
+		bool		nulls[Natts_pg_constraint] = {0};
+		bool		replaces[Natts_pg_constraint] = {0};
+		HeapTuple	new_tup;
+		ObjectAddress objcon;
+
+		if (conform->conindid != RelationGetRelid(old_index))
+			continue;
+
+		oid = GetNewOidWithIndex(rel, ConstraintOidIndexId,
+								 Anum_pg_constraint_oid);
+		values[Anum_pg_constraint_oid - 1] = ObjectIdGetDatum(oid);
+		replaces[Anum_pg_constraint_oid - 1] = true;
+		values[Anum_pg_constraint_conrelid - 1] = ObjectIdGetDatum(new_heap_id);
+		replaces[Anum_pg_constraint_conrelid - 1] = true;
+		values[Anum_pg_constraint_conindid - 1] = ObjectIdGetDatum(new_index_id);
+		replaces[Anum_pg_constraint_conindid - 1] = true;
+
+		new_tup = heap_modify_tuple(tup, desc, values, nulls, replaces);
+
+		/* Insert it into the catalog. */
+		CatalogTupleInsert(rel, new_tup);
+
+		/* Create a dependency so it's removed when we drop the new heap. */
+		ObjectAddressSet(objcon, ConstraintRelationId, oid);
+		recordDependencyOn(&objcon, &objrel, DEPENDENCY_AUTO);
+	}
+	systable_endscan(scan);
+
+	table_close(rel, RowExclusiveLock);
+
+	CommandCounterIncrement();
 }
 
 /*
