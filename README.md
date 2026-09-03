@@ -34,6 +34,7 @@ Set the following in `postgresql.conf`:
 ```
 max_replication_slots = 1 # ... or add 1 to the current value.
 shared_preload_libraries = 'pg_squeeze' # ... or add the library to the existing ones.
+output_plugin_libraries = 'pg_squeeze' # ... or add the library to the existing ones.
 ```
 
 If the PostgreSQL server version is lower than 19, also set this one:

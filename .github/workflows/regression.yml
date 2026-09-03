@@ -39,6 +39,7 @@ jobs:
     - name: test
       run: |
         sudo pg_conftool set shared_preload_libraries pg_squeeze
+        sudo pg_conftool set output_plugin_libraries pg_squeeze
         sudo pg_conftool set wal_level logical
         sudo pg_ctlcluster $PGVERSION main restart
         make installcheck
