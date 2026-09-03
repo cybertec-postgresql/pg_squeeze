@@ -937,13 +937,6 @@ check_prerequisites(Relation rel)
 {
 	Form_pg_class form = RelationGetForm(rel);
 
-	/*
-	 * The extension is not generic enough to handle AMs other than "heap".
-	 */
-	if (form->relam != HEAP_TABLE_AM_OID)
-		ereport(ERROR,
-				(errmsg("pg_squeeze only supports the \"heap\" access method")));
-
 	/* Check the relation first. */
 	if (form->relkind == RELKIND_PARTITIONED_TABLE)
 		ereport(ERROR,
@@ -1003,6 +996,13 @@ check_prerequisites(Relation rel)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not user relation",
 						RelationGetRelationName(rel))));
+
+	/*
+	 * The extension is not generic enough to handle AMs other than "heap".
+	 */
+	if (form->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errmsg("pg_squeeze only supports the \"heap\" access method")));
 
 	/*
 	 * While AFTER trigger should not be an issue (to generate an event must
