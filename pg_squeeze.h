@@ -412,7 +412,11 @@ typedef struct WorkerTask
 	 * insert a record into the "tasks" table).
 	 */
 #define IND_TABLESPACES_ARRAY_SIZE	1024
-	char		ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
+	union
+	{
+		char	ind_tbsps[IND_TABLESPACES_ARRAY_SIZE];
+		int		force_align_int;
+	};
 
 	ReplSlotStatus	repl_slot;
 
