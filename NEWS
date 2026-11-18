@@ -1,3 +1,15 @@
+Release 1.9.5
+=============
+
+Fix compatibility with PostgreSQL 19 (broken by commit e2b2267d in PG 19rc2.)
+
+
+Release 1.9.4
+=============
+
+Properly quote schema and table names.
+
+
 Release 1.9.3
 =============
 

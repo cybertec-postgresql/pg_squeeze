@@ -1,6 +1,7 @@
 PG_CONFIG ?= pg_config
 MODULE_big = pg_squeeze
 OBJS = pg_squeeze.o concurrent.o worker.o pgstatapprox.o $(WIN32RES)
+EXTRA_CLEAN = pgstatapprox.c
 PGFILEDESC = "pg_squeeze - a tool to remove unused space from a relation."
 
 EXTENSION = pg_squeeze
@@ -14,3 +15,12 @@ REGRESS = squeeze
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+OLD := $(intcmp $(MAJORVERSION),19,y)
+
+ifeq ($(OLD),y)
+pgstatapprox.c:	pgstatapprox.in.old.c
+	cp $< $@
+else
+pgstatapprox.c:	pgstatapprox.in.c
+	cp $< $@
+endif
