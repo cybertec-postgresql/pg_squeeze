@@ -75,7 +75,7 @@ extern PGDLLIMPORT bool FirstSnapshotSet;
 #endif
 
 #ifdef PG_MODULE_MAGIC_EXT
-PG_MODULE_MAGIC_EXT(.name = "pg_squeeze", .version = "1.9.3");
+PG_MODULE_MAGIC_EXT(.name = "pg_squeeze", .version = "1.9.5");
 #else
 PG_MODULE_MAGIC;
 #endif
