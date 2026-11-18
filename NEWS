@@ -1,7 +1,16 @@
 Release 1.9.5
 =============
 
-Fix compatibility with PostgreSQL 19 (broken by commit e2b2267d in PG 19rc2.)
+1. Fix handling of exclusion constraints.
+
+2. Take the new GUC output_plugin_libraries into account.
+
+3. Postpone the check of table access method.
+
+4. Use proper alignment for the array of tablespaces.
+
+5. Fix compatibility with PostgreSQL 19 (broken by commit e2b2267d in PG
+   19rc2.)
 
 
 Release 1.9.4
