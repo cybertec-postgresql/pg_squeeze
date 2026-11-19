@@ -15,7 +15,10 @@ REGRESS = squeeze
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-OLD := $(intcmp $(MAJORVERSION),19,y)
+# TODO Use intcmp when all OSes seem to support the corresponding version of
+# make.
+#OLD := $(intcmp $(MAJORVERSION),19,y)
+OLD := $(shell test $(MAJORVERSION) -lt 19 && echo y)
 
 ifeq ($(OLD),y)
 pgstatapprox.c:	pgstatapprox.in.old.c
